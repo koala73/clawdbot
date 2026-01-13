@@ -13,6 +13,7 @@ import {
   setupTailscaleExposure,
   VoiceCallWebhookServer,
 } from "./webhook.js";
+import type { TelnyxMediaStreamHandler } from "./telnyx-media-stream.js";
 
 export type VoiceCallRuntime = {
   config: VoiceCallConfig;
@@ -34,12 +35,25 @@ type Logger = {
 function resolveProvider(config: VoiceCallConfig): VoiceCallProvider {
   switch (config.provider) {
     case "telnyx":
-      return new TelnyxProvider({
-        apiKey: config.telnyx?.apiKey ?? process.env.TELNYX_API_KEY,
-        connectionId:
-          config.telnyx?.connectionId ?? process.env.TELNYX_CONNECTION_ID,
-        publicKey: config.telnyx?.publicKey ?? process.env.TELNYX_PUBLIC_KEY,
-      });
+      return new TelnyxProvider(
+        {
+          apiKey: config.telnyx?.apiKey ?? process.env.TELNYX_API_KEY,
+          connectionId:
+            config.telnyx?.connectionId ?? process.env.TELNYX_CONNECTION_ID,
+          publicKey: config.telnyx?.publicKey ?? process.env.TELNYX_PUBLIC_KEY,
+        },
+        {
+          publicUrl: config.publicUrl,
+          streamPath: config.streaming?.enabled
+            ? config.streaming.streamPath
+            : undefined,
+          streamOnDial: config.telnyx?.streamOnDial ?? true,
+          bidirectionalMode: config.telnyx?.bidirectionalMode ?? "rtp",
+          bidirectionalCodec: config.telnyx?.bidirectionalCodec ?? "PCMU",
+          streamTrack: config.telnyx?.streamTrack ?? "both_tracks",
+          skipVerification: config.skipSignatureVerification,
+        },
+      );
     case "twilio":
       return new TwilioProvider(
         {
@@ -134,6 +148,10 @@ export async function createVoiceCallRuntime(params: {
     (provider as TwilioProvider).setPublicUrl(publicUrl);
   }
 
+  if (publicUrl && provider.name === "telnyx") {
+    (provider as TelnyxProvider).setPublicUrl(publicUrl);
+  }
+
   if (provider.name === "twilio" && config.streaming?.enabled) {
     const twilioProvider = provider as TwilioProvider;
     const openaiApiKey =
@@ -163,6 +181,42 @@ export async function createVoiceCallRuntime(params: {
     if (mediaHandler) {
       twilioProvider.setMediaStreamHandler(mediaHandler);
       log.info("[voice-call] Media stream handler wired to provider");
+    }
+  }
+
+  // Wire Telnyx OpenAI TTS + media streaming
+  if (provider.name === "telnyx" && config.streaming?.enabled) {
+    const telnyxProvider = provider as TelnyxProvider;
+    const openaiApiKey =
+      config.streaming.openaiApiKey || process.env.OPENAI_API_KEY;
+
+    if (openaiApiKey) {
+      try {
+        const ttsProvider = new OpenAITTSProvider({
+          apiKey: openaiApiKey,
+          voice: config.tts.voice,
+          model: config.tts.model,
+          instructions: config.tts.instructions,
+        });
+        telnyxProvider.setTTSProvider(ttsProvider);
+        log.info("[voice-call] Telnyx: OpenAI TTS provider configured");
+      } catch (err) {
+        log.warn(
+          `[voice-call] Telnyx: Failed to initialize OpenAI TTS: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    } else {
+      log.warn(
+        "[voice-call] Telnyx: OpenAI TTS key missing; streaming TTS disabled",
+      );
+    }
+
+    const telnyxMediaHandler = webhookServer.getTelnyxMediaStreamHandler();
+    if (telnyxMediaHandler) {
+      telnyxProvider.setMediaStreamHandler(telnyxMediaHandler);
+      log.info("[voice-call] Telnyx media stream handler wired to provider");
     }
   }
 

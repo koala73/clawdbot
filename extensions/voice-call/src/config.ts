@@ -42,6 +42,35 @@ export const TelnyxConfigSchema = z.object({
   connectionId: z.string().min(1).optional(),
   /** Public key for webhook signature verification */
   publicKey: z.string().min(1).optional(),
+  /**
+   * Request media streaming at dial time (more reliable).
+   * When true, stream_url is included in the initiateCall request.
+   * When false, streaming_start is called after call.answered.
+   * Default: true (recommended)
+   */
+  streamOnDial: z.boolean().default(true),
+  /**
+   * Bidirectional streaming mode for audio playback.
+   * - "rtp": Wrap outbound audio with RTP headers (required for some Telnyx configs)
+   * - "raw": Send raw mu-law audio
+   * Default: "rtp"
+   */
+  bidirectionalMode: z.enum(["rtp", "raw"]).default("rtp"),
+  /**
+   * Codec for bidirectional audio.
+   * - "PCMU": mu-law (default, most compatible)
+   * - "PCMA": A-law
+   */
+  bidirectionalCodec: z.enum(["PCMU", "PCMA"]).default("PCMU"),
+  /**
+   * Which track to stream.
+   * - "both_tracks": Both inbound and outbound audio
+   * - "inbound_track": Only caller's audio
+   * - "outbound_track": Only bot's audio
+   */
+  streamTrack: z
+    .enum(["inbound_track", "outbound_track", "both_tracks"])
+    .default("both_tracks"),
 });
 export type TelnyxConfig = z.infer<typeof TelnyxConfigSchema>;
 

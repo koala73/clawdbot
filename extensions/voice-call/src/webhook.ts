@@ -9,7 +9,12 @@ import type { MediaStreamConfig } from "./media-stream.js";
 import { MediaStreamHandler } from "./media-stream.js";
 import type { VoiceCallProvider } from "./providers/base.js";
 import { OpenAIRealtimeSTTProvider } from "./providers/stt-openai-realtime.js";
+import type { TelnyxProvider } from "./providers/telnyx.js";
 import type { TwilioProvider } from "./providers/twilio.js";
+import {
+  TelnyxMediaStreamHandler,
+  type TelnyxMediaStreamConfig,
+} from "./telnyx-media-stream.js";
 import type { NormalizedEvent, WebhookContext } from "./types.js";
 
 /**
@@ -23,8 +28,11 @@ export class VoiceCallWebhookServer {
   private provider: VoiceCallProvider;
   private coreConfig: CoreConfig | null;
 
-  /** Media stream handler for bidirectional audio (when streaming enabled) */
+  /** Media stream handler for bidirectional audio (Twilio) */
   private mediaStreamHandler: MediaStreamHandler | null = null;
+
+  /** Telnyx media stream handler for bidirectional audio */
+  private telnyxMediaStreamHandler: TelnyxMediaStreamHandler | null = null;
 
   constructor(
     config: VoiceCallConfig,
@@ -39,19 +47,128 @@ export class VoiceCallWebhookServer {
 
     // Initialize media stream handler if streaming is enabled
     if (config.streaming?.enabled) {
-      this.initializeMediaStreaming();
+      if (config.provider === "telnyx") {
+        this.initializeTelnyxMediaStreaming();
+      } else {
+        this.initializeMediaStreaming();
+      }
     }
   }
 
   /**
-   * Get the media stream handler (for wiring to provider).
+   * Get the media stream handler (for wiring to Twilio provider).
    */
   getMediaStreamHandler(): MediaStreamHandler | null {
     return this.mediaStreamHandler;
   }
 
   /**
-   * Initialize media streaming with OpenAI Realtime STT.
+   * Get the Telnyx media stream handler (for wiring to Telnyx provider).
+   */
+  getTelnyxMediaStreamHandler(): TelnyxMediaStreamHandler | null {
+    return this.telnyxMediaStreamHandler;
+  }
+
+  /**
+   * Initialize Telnyx media streaming with OpenAI Realtime STT.
+   */
+  private initializeTelnyxMediaStreaming(): void {
+    const apiKey =
+      this.config.streaming?.openaiApiKey || process.env.OPENAI_API_KEY;
+
+    if (!apiKey) {
+      console.warn(
+        "[voice-call] Telnyx streaming enabled but no OpenAI API key found",
+      );
+      return;
+    }
+
+    const sttProvider = new OpenAIRealtimeSTTProvider({
+      apiKey,
+      model: this.config.streaming?.sttModel,
+      silenceDurationMs: this.config.streaming?.silenceDurationMs,
+      vadThreshold: this.config.streaming?.vadThreshold,
+    });
+
+    const streamConfig: TelnyxMediaStreamConfig = {
+      sttProvider,
+      bidirectionalMode: this.config.telnyx?.bidirectionalMode ?? "rtp",
+      bidirectionalCodec: this.config.telnyx?.bidirectionalCodec ?? "PCMU",
+      onTranscript: (providerCallId, transcript) => {
+        console.log(
+          `[voice-call] Telnyx transcript for ${providerCallId}: ${transcript}`,
+        );
+
+        // Look up our internal call ID from the provider call ID
+        const call = this.manager.getCallByProviderCallId(providerCallId);
+        if (!call) {
+          console.warn(
+            `[voice-call] No active call found for Telnyx call ID: ${providerCallId}`,
+          );
+          return;
+        }
+
+        // Create a speech event and process it through the manager
+        const event: NormalizedEvent = {
+          id: `telnyx-transcript-${Date.now()}`,
+          type: "call.speech",
+          callId: call.callId,
+          providerCallId,
+          timestamp: Date.now(),
+          transcript,
+          isFinal: true,
+        };
+        this.manager.processEvent(event);
+
+        // Auto-respond in conversation mode
+        const callMode = call.metadata?.mode as string | undefined;
+        const shouldRespond =
+          call.direction === "inbound" || callMode === "conversation";
+        if (shouldRespond) {
+          this.handleInboundResponse(call.callId, transcript).catch((err) => {
+            console.warn(`[voice-call] Telnyx auto-respond failed:`, err);
+          });
+        }
+      },
+      onPartialTranscript: (callId, partial) => {
+        console.log(`[voice-call] Telnyx partial for ${callId}: ${partial}`);
+      },
+      onConnect: (callId, streamId) => {
+        console.log(
+          `[voice-call] Telnyx media stream connected: ${callId} -> ${streamId}`,
+        );
+        // Register stream with provider for TTS routing
+        if (this.provider.name === "telnyx") {
+          (this.provider as TelnyxProvider).registerCallStream(
+            callId,
+            streamId,
+          );
+        }
+
+        // Speak initial message if one was provided
+        setTimeout(() => {
+          this.manager.speakInitialMessage(callId).catch((err) => {
+            console.warn(
+              `[voice-call] Telnyx: Failed to speak initial message:`,
+              err,
+            );
+          });
+        }, 500);
+      },
+      onDisconnect: (callId) => {
+        console.log(`[voice-call] Telnyx media stream disconnected: ${callId}`);
+        if (this.provider.name === "telnyx") {
+          (this.provider as TelnyxProvider).unregisterCallStream(callId);
+        }
+      },
+    };
+
+    this.telnyxMediaStreamHandler = new TelnyxMediaStreamHandler(streamConfig);
+    console.log("[voice-call] Telnyx media streaming initialized");
+  }
+
+  /**
+   * Initialize media streaming with OpenAI Realtime STT (Twilio).
    */
   private initializeMediaStreaming(): void {
     const apiKey =
@@ -160,8 +277,8 @@ export class VoiceCallWebhookServer {
         });
       });
 
-      // Handle WebSocket upgrades for media streams
-      if (this.mediaStreamHandler) {
+      // Handle WebSocket upgrades for media streams (Twilio or Telnyx)
+      if (this.mediaStreamHandler || this.telnyxMediaStreamHandler) {
         this.server.on("upgrade", (request, socket, head) => {
           const url = new URL(
             request.url || "/",
@@ -169,8 +286,16 @@ export class VoiceCallWebhookServer {
           );
 
           if (url.pathname === streamPath) {
-            console.log("[voice-call] WebSocket upgrade for media stream");
-            this.mediaStreamHandler?.handleUpgrade(request, socket, head);
+            // Route to appropriate handler based on provider
+            if (this.telnyxMediaStreamHandler) {
+              console.log("[voice-call] WebSocket upgrade for Telnyx media stream");
+              this.telnyxMediaStreamHandler.handleUpgrade(request, socket, head);
+            } else if (this.mediaStreamHandler) {
+              console.log("[voice-call] WebSocket upgrade for Twilio media stream");
+              this.mediaStreamHandler.handleUpgrade(request, socket, head);
+            } else {
+              socket.destroy();
+            }
           } else {
             socket.destroy();
           }
@@ -182,9 +307,10 @@ export class VoiceCallWebhookServer {
       this.server.listen(port, bind, () => {
         const url = `http://${bind}:${port}${webhookPath}`;
         console.log(`[voice-call] Webhook server listening on ${url}`);
-        if (this.mediaStreamHandler) {
+        if (this.mediaStreamHandler || this.telnyxMediaStreamHandler) {
+          const providerName = this.telnyxMediaStreamHandler ? "Telnyx" : "Twilio";
           console.log(
-            `[voice-call] Media stream WebSocket on ws://${bind}:${port}${streamPath}`,
+            `[voice-call] ${providerName} media stream WebSocket on ws://${bind}:${port}${streamPath}`,
           );
         }
         resolve(url);

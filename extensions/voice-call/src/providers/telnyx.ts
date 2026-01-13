@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 
 import type { TelnyxConfig } from "../config.js";
+import type { TelnyxMediaStreamHandler } from "../telnyx-media-stream.js";
 import type {
   EndReason,
   HangupCallInput,
@@ -15,11 +16,35 @@ import type {
   WebhookVerificationResult,
 } from "../types.js";
 import type { VoiceCallProvider } from "./base.js";
+import type { OpenAITTSProvider } from "./tts-openai.js";
+import { chunkAudio } from "./tts-openai.js";
+
+/**
+ * Telnyx provider options for streaming configuration.
+ */
+export interface TelnyxProviderOptions {
+  /** Public URL for webhook callbacks */
+  publicUrl?: string;
+  /** Path for media stream WebSocket (e.g., /voice/stream) */
+  streamPath?: string;
+  /** Request streaming at dial time (more reliable) */
+  streamOnDial?: boolean;
+  /** Bidirectional streaming mode: 'rtp' or 'raw' */
+  bidirectionalMode?: "rtp" | "raw";
+  /** Codec for bidirectional audio: PCMU or PCMA */
+  bidirectionalCodec?: "PCMU" | "PCMA";
+  /** Track to stream (default: both_tracks) */
+  streamTrack?: "inbound_track" | "outbound_track" | "both_tracks";
+  /** Skip webhook signature verification (development only) */
+  skipVerification?: boolean;
+}
 
 /**
  * Telnyx Voice API provider implementation.
  *
  * Uses Telnyx Call Control API v2 for managing calls.
+ * Supports OpenAI Realtime for high-quality STT/TTS via WebSocket streaming.
+ *
  * @see https://developers.telnyx.com/docs/api/v2/call-control
  */
 export class TelnyxProvider implements VoiceCallProvider {
@@ -29,8 +54,21 @@ export class TelnyxProvider implements VoiceCallProvider {
   private readonly connectionId: string;
   private readonly publicKey: string | undefined;
   private readonly baseUrl = "https://api.telnyx.com/v2";
+  private readonly options: TelnyxProviderOptions;
 
-  constructor(config: TelnyxConfig) {
+  /** Current public webhook URL */
+  private currentPublicUrl: string | null = null;
+
+  /** Optional OpenAI TTS provider for streaming TTS */
+  private ttsProvider: OpenAITTSProvider | null = null;
+
+  /** Optional media stream handler for sending audio */
+  private mediaStreamHandler: TelnyxMediaStreamHandler | null = null;
+
+  /** Map of providerCallId to streamId for audio routing */
+  private callStreamMap = new Map<string, string>();
+
+  constructor(config: TelnyxConfig, options: TelnyxProviderOptions = {}) {
     if (!config.apiKey) {
       throw new Error("Telnyx API key is required");
     }
@@ -41,6 +79,54 @@ export class TelnyxProvider implements VoiceCallProvider {
     this.apiKey = config.apiKey;
     this.connectionId = config.connectionId;
     this.publicKey = config.publicKey;
+    this.options = options;
+
+    if (options.publicUrl) {
+      this.currentPublicUrl = options.publicUrl;
+    }
+  }
+
+  /**
+   * Set the current public webhook URL (called when tunnel starts).
+   */
+  setPublicUrl(url: string): void {
+    this.currentPublicUrl = url;
+  }
+
+  /**
+   * Get the current public webhook URL.
+   */
+  getPublicUrl(): string | null {
+    return this.currentPublicUrl;
+  }
+
+  /**
+   * Set the OpenAI TTS provider for streaming TTS.
+   * When set, playTts will use OpenAI audio via media streams.
+   */
+  setTTSProvider(provider: OpenAITTSProvider): void {
+    this.ttsProvider = provider;
+  }
+
+  /**
+   * Set the media stream handler for sending audio.
+   */
+  setMediaStreamHandler(handler: TelnyxMediaStreamHandler): void {
+    this.mediaStreamHandler = handler;
+  }
+
+  /**
+   * Register a call's stream ID for audio routing.
+   */
+  registerCallStream(providerCallId: string, streamId: string): void {
+    this.callStreamMap.set(providerCallId, streamId);
+  }
+
+  /**
+   * Unregister a call's stream ID.
+   */
+  unregisterCallStream(providerCallId: string): void {
+    this.callStreamMap.delete(providerCallId);
   }
 
   /**
@@ -76,6 +162,10 @@ export class TelnyxProvider implements VoiceCallProvider {
    * Verify Telnyx webhook signature using Ed25519.
    */
   verifyWebhook(ctx: WebhookContext): WebhookVerificationResult {
+    if (this.options.skipVerification) {
+      return { ok: true };
+    }
+
     if (!this.publicKey) {
       // No public key configured, skip verification (not recommended for production)
       return { ok: true };
@@ -223,6 +313,24 @@ export class TelnyxProvider implements VoiceCallProvider {
           digits: data.payload?.digit || "",
         };
 
+      // Streaming events (for media stream lifecycle)
+      case "streaming.started":
+        return { ...baseEvent, type: "call.streaming.started" };
+
+      case "streaming.stopped":
+        return {
+          ...baseEvent,
+          type: "call.streaming.stopped",
+          reason: data.payload?.reason || "stopped",
+        };
+
+      case "streaming.failed":
+        return {
+          ...baseEvent,
+          type: "call.streaming.failed",
+          reason: data.payload?.reason || "failed",
+        };
+
       default:
         return null;
     }
@@ -266,10 +374,36 @@ export class TelnyxProvider implements VoiceCallProvider {
   }
 
   /**
+   * Get the WebSocket URL for media streaming.
+   */
+  private getStreamUrl(): string | null {
+    if (!this.currentPublicUrl || !this.options.streamPath) {
+      return null;
+    }
+
+    const url = new URL(this.currentPublicUrl);
+    const origin = url.origin;
+
+    // Convert https:// to wss:// for WebSocket
+    const wsOrigin = origin
+      .replace(/^https:\/\//, "wss://")
+      .replace(/^http:\/\//, "ws://");
+
+    const path = this.options.streamPath.startsWith("/")
+      ? this.options.streamPath
+      : `/${this.options.streamPath}`;
+
+    return `${wsOrigin}${path}`;
+  }
+
+  /**
    * Initiate an outbound call via Telnyx API.
+   * Optionally includes stream_url for bidirectional audio at dial time.
    */
   async initiateCall(input: InitiateCallInput): Promise<InitiateCallResult> {
-    const result = await this.apiRequest<TelnyxCallResponse>("/calls", {
+    const streamUrl = this.options.streamOnDial ? this.getStreamUrl() : null;
+
+    const requestBody: Record<string, unknown> = {
       connection_id: this.connectionId,
       to: input.to,
       from: input.from,
@@ -277,7 +411,28 @@ export class TelnyxProvider implements VoiceCallProvider {
       webhook_url_method: "POST",
       client_state: Buffer.from(input.callId).toString("base64"),
       timeout_secs: 30,
-    });
+    };
+
+    // Include stream configuration at dial time if enabled
+    if (streamUrl) {
+      requestBody.stream_url = streamUrl;
+      requestBody.stream_track = this.options.streamTrack || "both_tracks";
+
+      if (this.options.bidirectionalMode) {
+        requestBody.stream_bidirectional_mode = this.options.bidirectionalMode;
+      }
+      if (this.options.bidirectionalCodec) {
+        requestBody.stream_bidirectional_codec =
+          this.options.bidirectionalCodec;
+      }
+
+      console.log(`[telnyx] Initiating call with stream_url: ${streamUrl}`);
+    }
+
+    const result = await this.apiRequest<TelnyxCallResponse>(
+      "/calls",
+      requestBody,
+    );
 
     return {
       providerCallId: result.data.call_control_id,
@@ -286,9 +441,41 @@ export class TelnyxProvider implements VoiceCallProvider {
   }
 
   /**
+   * Start media streaming on an active call.
+   * Call this after call.answered if not using streamOnDial.
+   */
+  async startStreaming(providerCallId: string): Promise<void> {
+    const streamUrl = this.getStreamUrl();
+    if (!streamUrl) {
+      throw new Error("Stream URL not configured");
+    }
+
+    const requestBody: Record<string, unknown> = {
+      stream_url: streamUrl,
+      stream_track: this.options.streamTrack || "both_tracks",
+    };
+
+    if (this.options.bidirectionalMode) {
+      requestBody.stream_bidirectional_mode = this.options.bidirectionalMode;
+    }
+    if (this.options.bidirectionalCodec) {
+      requestBody.stream_bidirectional_codec = this.options.bidirectionalCodec;
+    }
+
+    console.log(`[telnyx] Starting streaming for ${providerCallId}`);
+
+    await this.apiRequest(
+      `/calls/${providerCallId}/actions/streaming_start`,
+      requestBody,
+    );
+  }
+
+  /**
    * Hang up a call via Telnyx API.
    */
   async hangupCall(input: HangupCallInput): Promise<void> {
+    this.callStreamMap.delete(input.providerCallId);
+
     await this.apiRequest(
       `/calls/${input.providerCallId}/actions/hangup`,
       { command_id: crypto.randomUUID() },
@@ -297,9 +484,30 @@ export class TelnyxProvider implements VoiceCallProvider {
   }
 
   /**
-   * Play TTS audio via Telnyx speak action.
+   * Play TTS audio.
+   *
+   * Two modes:
+   * 1. OpenAI TTS + Media Streams: If TTS provider and media stream are available,
+   *    generates audio via OpenAI and streams it through WebSocket (preferred).
+   * 2. Native Telnyx TTS: Falls back to Telnyx's built-in speak action.
    */
   async playTts(input: PlayTtsInput): Promise<void> {
+    // Try OpenAI TTS via media stream first (if configured)
+    const streamId = this.callStreamMap.get(input.providerCallId);
+    if (this.ttsProvider && this.mediaStreamHandler && streamId) {
+      try {
+        await this.playTtsViaStream(input.text, streamId);
+        return;
+      } catch (err) {
+        console.warn(
+          `[telnyx] OpenAI TTS failed, falling back to native TTS:`,
+          err instanceof Error ? err.message : err,
+        );
+        // Fall through to native Telnyx TTS
+      }
+    }
+
+    // Fall back to native Telnyx speak action
     await this.apiRequest(`/calls/${input.providerCallId}/actions/speak`, {
       command_id: crypto.randomUUID(),
       payload: input.text,
@@ -309,9 +517,47 @@ export class TelnyxProvider implements VoiceCallProvider {
   }
 
   /**
-   * Start transcription (STT) via Telnyx.
+   * Play TTS via OpenAI and Telnyx Media Streams.
+   * Generates audio with OpenAI TTS, converts to mu-law, and streams via WebSocket.
+   */
+  private async playTtsViaStream(text: string, streamId: string): Promise<void> {
+    if (!this.ttsProvider || !this.mediaStreamHandler) {
+      throw new Error("TTS provider and media stream handler required");
+    }
+
+    // Generate audio with OpenAI TTS (returns mu-law at 8kHz)
+    const muLawAudio = await this.ttsProvider.synthesizeForTwilio(text);
+
+    // Stream audio in 20ms chunks (160 bytes at 8kHz mu-law)
+    const CHUNK_SIZE = 160;
+    const CHUNK_DELAY_MS = 20;
+
+    for (const chunk of chunkAudio(muLawAudio, CHUNK_SIZE)) {
+      this.mediaStreamHandler.sendAudio(streamId, chunk);
+
+      // Pace the audio to match real-time playback
+      await new Promise((resolve) => setTimeout(resolve, CHUNK_DELAY_MS));
+    }
+
+    // Send a mark to track when audio finishes
+    this.mediaStreamHandler.sendMark(streamId, `tts-${Date.now()}`);
+  }
+
+  /**
+   * Start transcription (STT).
+   * When using OpenAI Realtime via media streams, this is handled by the stream handler.
+   * Falls back to native Telnyx transcription.
    */
   async startListening(input: StartListeningInput): Promise<void> {
+    // If media streaming is active, STT is handled by the stream handler
+    const streamId = this.callStreamMap.get(input.providerCallId);
+    if (this.mediaStreamHandler && streamId) {
+      // STT is already running via OpenAI Realtime
+      console.log(`[telnyx] STT handled by media stream for ${streamId}`);
+      return;
+    }
+
+    // Fall back to native Telnyx transcription
     await this.apiRequest(
       `/calls/${input.providerCallId}/actions/transcription_start`,
       {
@@ -349,6 +595,7 @@ interface TelnyxEvent {
     confidence?: number;
     hangup_cause?: string;
     digit?: string;
+    reason?: string;
     [key: string]: unknown;
   };
 }
