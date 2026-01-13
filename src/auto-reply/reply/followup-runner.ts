@@ -1,17 +1,22 @@
 import crypto from "node:crypto";
+import { resolveAgentModelFallbacksOverride } from "../../agents/agent-scope.js";
 import { lookupContextTokens } from "../../agents/context.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
 import { runWithModelFallback } from "../../agents/model-fallback.js";
 import { runEmbeddedPiAgent } from "../../agents/pi-embedded.js";
 import { hasNonzeroUsage } from "../../agents/usage.js";
-import { type SessionEntry, saveSessionStore } from "../../config/sessions.js";
+import {
+  resolveAgentIdFromSessionKey,
+  type SessionEntry,
+  updateSessionStoreEntry,
+} from "../../config/sessions.js";
 import type { TypingMode } from "../../config/types.js";
 import { logVerbose } from "../../globals.js";
 import { registerAgentRunContext } from "../../infra/agent-events.js";
 import { defaultRuntime } from "../../runtime.js";
 import { stripHeartbeatToken } from "../heartbeat.js";
 import type { OriginatingChannelType } from "../templating.js";
-import { SILENT_REPLY_TOKEN } from "../tokens.js";
+import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../tokens.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
 import type { FollowupRun } from "./queue.js";
 import {
@@ -80,7 +85,7 @@ export function createFollowupRunner(params: {
         continue;
       }
       if (
-        payload.text?.trim() === SILENT_REPLY_TOKEN &&
+        isSilentReplyText(payload.text, SILENT_REPLY_TOKEN) &&
         !payload.mediaUrl &&
         !payload.mediaUrls?.length
       ) {
@@ -119,7 +124,10 @@ export function createFollowupRunner(params: {
     try {
       const runId = crypto.randomUUID();
       if (queued.run.sessionKey) {
-        registerAgentRunContext(runId, { sessionKey: queued.run.sessionKey });
+        registerAgentRunContext(runId, {
+          sessionKey: queued.run.sessionKey,
+          verboseLevel: queued.run.verboseLevel,
+        });
       }
       let autoCompactionCompleted = false;
       let runResult: Awaited<ReturnType<typeof runEmbeddedPiAgent>>;
@@ -130,6 +138,10 @@ export function createFollowupRunner(params: {
           cfg: queued.run.config,
           provider: queued.run.provider,
           model: queued.run.model,
+          fallbacksOverride: resolveAgentModelFallbacksOverride(
+            queued.run.config,
+            resolveAgentIdFromSessionKey(queued.run.sessionKey),
+          ),
           run: (provider, model) =>
             runEmbeddedPiAgent({
               sessionId: queued.run.sessionId,
@@ -192,7 +204,11 @@ export function createFollowupRunner(params: {
         (queued.run.messageProvider?.toLowerCase() as
           | OriginatingChannelType
           | undefined);
-      const replyToMode = resolveReplyToMode(queued.run.config, replyToChannel);
+      const replyToMode = resolveReplyToMode(
+        queued.run.config,
+        replyToChannel,
+        queued.originatingAccountId,
+      );
 
       const replyTaggedPayloads: ReplyPayload[] = applyReplyThreading({
         payloads: sanitizedPayloads,
@@ -229,7 +245,7 @@ export function createFollowupRunner(params: {
         }
       }
 
-      if (sessionStore && sessionKey) {
+      if (storePath && sessionKey) {
         const usage = runResult.meta.agentMeta?.usage;
         const modelUsed =
           runResult.meta.agentMeta?.model ?? fallbackModel ?? defaultModel;
@@ -240,39 +256,48 @@ export function createFollowupRunner(params: {
           DEFAULT_CONTEXT_TOKENS;
 
         if (hasNonzeroUsage(usage)) {
-          const entry = sessionStore[sessionKey];
-          if (entry) {
-            const input = usage.input ?? 0;
-            const output = usage.output ?? 0;
-            const promptTokens =
-              input + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
-            sessionStore[sessionKey] = {
-              ...entry,
-              inputTokens: input,
-              outputTokens: output,
-              totalTokens:
-                promptTokens > 0 ? promptTokens : (usage.total ?? input),
-              modelProvider: fallbackProvider ?? entry.modelProvider,
-              model: modelUsed,
-              contextTokens: contextTokensUsed ?? entry.contextTokens,
-              updatedAt: Date.now(),
-            };
-            if (storePath) {
-              await saveSessionStore(storePath, sessionStore);
-            }
+          try {
+            await updateSessionStoreEntry({
+              storePath,
+              sessionKey,
+              update: async (entry) => {
+                const input = usage.input ?? 0;
+                const output = usage.output ?? 0;
+                const promptTokens =
+                  input + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
+                return {
+                  inputTokens: input,
+                  outputTokens: output,
+                  totalTokens:
+                    promptTokens > 0 ? promptTokens : (usage.total ?? input),
+                  modelProvider: fallbackProvider ?? entry.modelProvider,
+                  model: modelUsed,
+                  contextTokens: contextTokensUsed ?? entry.contextTokens,
+                  updatedAt: Date.now(),
+                };
+              },
+            });
+          } catch (err) {
+            logVerbose(
+              `failed to persist followup usage update: ${String(err)}`,
+            );
           }
         } else if (modelUsed || contextTokensUsed) {
-          const entry = sessionStore[sessionKey];
-          if (entry) {
-            sessionStore[sessionKey] = {
-              ...entry,
-              modelProvider: fallbackProvider ?? entry.modelProvider,
-              model: modelUsed ?? entry.model,
-              contextTokens: contextTokensUsed ?? entry.contextTokens,
-            };
-            if (storePath) {
-              await saveSessionStore(storePath, sessionStore);
-            }
+          try {
+            await updateSessionStoreEntry({
+              storePath,
+              sessionKey,
+              update: async (entry) => ({
+                modelProvider: fallbackProvider ?? entry.modelProvider,
+                model: modelUsed ?? entry.model,
+                contextTokens: contextTokensUsed ?? entry.contextTokens,
+                updatedAt: Date.now(),
+              }),
+            });
+          } catch (err) {
+            logVerbose(
+              `failed to persist followup model/context update: ${String(err)}`,
+            );
           }
         }
       }

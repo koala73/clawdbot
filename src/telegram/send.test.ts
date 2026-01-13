@@ -29,7 +29,51 @@ vi.mock("grammy", () => ({
   InputFile: class {},
 }));
 
-import { reactMessageTelegram, sendMessageTelegram } from "./send.js";
+import {
+  buildInlineKeyboard,
+  reactMessageTelegram,
+  sendMessageTelegram,
+} from "./send.js";
+
+describe("buildInlineKeyboard", () => {
+  it("returns undefined for empty input", () => {
+    expect(buildInlineKeyboard()).toBeUndefined();
+    expect(buildInlineKeyboard([])).toBeUndefined();
+  });
+
+  it("builds inline keyboards for valid input", () => {
+    const result = buildInlineKeyboard([
+      [{ text: "Option A", callback_data: "cmd:a" }],
+      [
+        { text: "Option B", callback_data: "cmd:b" },
+        { text: "Option C", callback_data: "cmd:c" },
+      ],
+    ]);
+    expect(result).toEqual({
+      inline_keyboard: [
+        [{ text: "Option A", callback_data: "cmd:a" }],
+        [
+          { text: "Option B", callback_data: "cmd:b" },
+          { text: "Option C", callback_data: "cmd:c" },
+        ],
+      ],
+    });
+  });
+
+  it("filters invalid buttons and empty rows", () => {
+    const result = buildInlineKeyboard([
+      [
+        { text: "", callback_data: "cmd:skip" },
+        { text: "Ok", callback_data: "cmd:ok" },
+      ],
+      [{ text: "Missing data", callback_data: "" }],
+      [],
+    ]);
+    expect(result).toEqual({
+      inline_keyboard: [[{ text: "Ok", callback_data: "cmd:ok" }]],
+    });
+  });
+});
 
 describe("sendMessageTelegram", () => {
   beforeEach(() => {
@@ -278,6 +322,40 @@ describe("sendMessageTelegram", () => {
       reply_to_message_id: 500,
     });
     expect(sendAudio).not.toHaveBeenCalled();
+  });
+
+  it("falls back to audio when asVoice is true but media is not voice compatible", async () => {
+    const chatId = "123";
+    const sendAudio = vi.fn().mockResolvedValue({
+      message_id: 14,
+      chat: { id: chatId },
+    });
+    const sendVoice = vi.fn().mockResolvedValue({
+      message_id: 15,
+      chat: { id: chatId },
+    });
+    const api = { sendAudio, sendVoice } as unknown as {
+      sendAudio: typeof sendAudio;
+      sendVoice: typeof sendVoice;
+    };
+
+    loadWebMedia.mockResolvedValueOnce({
+      buffer: Buffer.from("audio"),
+      contentType: "audio/mpeg",
+      fileName: "clip.mp3",
+    });
+
+    await sendMessageTelegram(chatId, "caption", {
+      token: "tok",
+      api,
+      mediaUrl: "https://example.com/clip.mp3",
+      asVoice: true,
+    });
+
+    expect(sendAudio).toHaveBeenCalledWith(chatId, expect.anything(), {
+      caption: "caption",
+    });
+    expect(sendVoice).not.toHaveBeenCalled();
   });
 
   it("includes message_thread_id for forum topic messages", async () => {

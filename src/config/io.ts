@@ -1,8 +1,10 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 import JSON5 from "json5";
+
 import {
   loadShellEnvFallback,
   resolveShellEnvFallbackTimeoutMs,
@@ -20,12 +22,10 @@ import {
   applySessionDefaults,
   applyTalkApiKey,
 } from "./defaults.js";
-import { findLegacyConfigIssues } from "./legacy.js";
-import {
-  CONFIG_PATH_CLAWDBOT,
-  resolveConfigPath,
-  resolveStateDir,
-} from "./paths.js";
+import { ConfigIncludeError, resolveConfigIncludes } from "./includes.js";
+import { applyLegacyMigrations, findLegacyConfigIssues } from "./legacy.js";
+import { normalizeConfigPaths } from "./normalize-paths.js";
+import { resolveConfigPath, resolveStateDir } from "./paths.js";
 import { applyConfigOverrides } from "./runtime-overrides.js";
 import type {
   ClawdbotConfig,
@@ -35,6 +35,12 @@ import type {
 import { validateConfigObject } from "./validation.js";
 import { ClawdbotSchema } from "./zod-schema.js";
 
+// Re-export for backwards compatibility
+export {
+  CircularIncludeError,
+  ConfigIncludeError,
+} from "./includes.js";
+
 const SHELL_ENV_EXPECTED_KEYS = [
   "OPENAI_API_KEY",
   "ANTHROPIC_API_KEY",
@@ -43,6 +49,7 @@ const SHELL_ENV_EXPECTED_KEYS = [
   "ZAI_API_KEY",
   "OPENROUTER_API_KEY",
   "MINIMAX_API_KEY",
+  "SYNTHETIC_API_KEY",
   "ELEVENLABS_API_KEY",
   "TELEGRAM_BOT_TOKEN",
   "DISCORD_BOT_TOKEN",
@@ -77,6 +84,10 @@ function warnOnConfigMiskeys(
       'Config uses "gateway.token". This key is ignored; use "gateway.auth.token" instead.',
     );
   }
+}
+
+function formatLegacyMigrationLog(changes: string[]): string {
+  return `Auto-migrated config:\n${changes.map((entry) => `- ${entry}`).join("\n")}`;
 }
 
 function applyConfigEnv(cfg: ClawdbotConfig, env: NodeJS.ProcessEnv): void {
@@ -135,6 +146,53 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
   const deps = normalizeDeps(overrides);
   const configPath = resolveConfigPathForDeps(deps);
 
+  const writeConfigFileSync = (cfg: ClawdbotConfig) => {
+    const dir = path.dirname(configPath);
+    deps.fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const json = JSON.stringify(applyModelDefaults(cfg), null, 2)
+      .trimEnd()
+      .concat("\n");
+
+    const tmp = path.join(
+      dir,
+      `${path.basename(configPath)}.${process.pid}.${crypto.randomUUID()}.tmp`,
+    );
+
+    deps.fs.writeFileSync(tmp, json, { encoding: "utf-8", mode: 0o600 });
+
+    try {
+      deps.fs.copyFileSync(configPath, `${configPath}.bak`);
+    } catch {
+      // best-effort
+    }
+
+    try {
+      deps.fs.renameSync(tmp, configPath);
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (code === "EPERM" || code === "EEXIST") {
+        deps.fs.copyFileSync(tmp, configPath);
+        try {
+          deps.fs.chmodSync(configPath, 0o600);
+        } catch {
+          // best-effort
+        }
+        try {
+          deps.fs.unlinkSync(tmp);
+        } catch {
+          // best-effort
+        }
+        return;
+      }
+      try {
+        deps.fs.unlinkSync(tmp);
+      } catch {
+        // best-effort
+      }
+      throw err;
+    }
+  };
+
   function loadConfig(): ClawdbotConfig {
     try {
       if (!deps.fs.existsSync(configPath)) {
@@ -151,15 +209,35 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
       }
       const raw = deps.fs.readFileSync(configPath, "utf-8");
       const parsed = deps.json5.parse(raw);
-      warnOnConfigMiskeys(parsed, deps.logger);
-      if (typeof parsed !== "object" || parsed === null) return {};
-      const validated = ClawdbotSchema.safeParse(parsed);
+
+      // Resolve $include directives before validation
+      const resolved = resolveConfigIncludes(parsed, configPath, {
+        readFile: (p) => deps.fs.readFileSync(p, "utf-8"),
+        parseJson: (raw) => deps.json5.parse(raw),
+      });
+
+      const migrated = applyLegacyMigrations(resolved);
+      const resolvedConfig = migrated.next ?? resolved;
+      warnOnConfigMiskeys(resolvedConfig, deps.logger);
+      if (typeof resolvedConfig !== "object" || resolvedConfig === null)
+        return {};
+      const validated = ClawdbotSchema.safeParse(resolvedConfig);
       if (!validated.success) {
         deps.logger.error("Invalid config:");
         for (const iss of validated.error.issues) {
           deps.logger.error(`- ${iss.path.join(".")}: ${iss.message}`);
         }
         return {};
+      }
+      if (migrated.next && migrated.changes.length > 0) {
+        deps.logger.warn(formatLegacyMigrationLog(migrated.changes));
+        try {
+          writeConfigFileSync(resolvedConfig as ClawdbotConfig);
+        } catch (err) {
+          deps.logger.warn(
+            `Failed to write migrated config at ${configPath}: ${String(err)}`,
+          );
+        }
       }
       const cfg = applyModelDefaults(
         applyContextPruningDefaults(
@@ -170,6 +248,7 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
           ),
         ),
       );
+      normalizeConfigPaths(cfg);
 
       const duplicates = findDuplicateAgentDirs(cfg, {
         env: deps.env,
@@ -248,10 +327,18 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
         };
       }
 
-      const legacyIssues = findLegacyConfigIssues(parsedRes.parsed);
-
-      const validated = validateConfigObject(parsedRes.parsed);
-      if (!validated.ok) {
+      // Resolve $include directives
+      let resolved: unknown;
+      try {
+        resolved = resolveConfigIncludes(parsedRes.parsed, configPath, {
+          readFile: (p) => deps.fs.readFileSync(p, "utf-8"),
+          parseJson: (raw) => deps.json5.parse(raw),
+        });
+      } catch (err) {
+        const message =
+          err instanceof ConfigIncludeError
+            ? err.message
+            : `Include resolution failed: ${String(err)}`;
         return {
           path: configPath,
           exists: true,
@@ -259,9 +346,40 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
           parsed: parsedRes.parsed,
           valid: false,
           config: {},
+          issues: [{ path: "", message }],
+          legacyIssues: [],
+        };
+      }
+
+      const migrated = applyLegacyMigrations(resolved);
+      const resolvedConfigRaw = migrated.next ?? resolved;
+      const legacyIssues = findLegacyConfigIssues(resolvedConfigRaw);
+
+      const validated = validateConfigObject(resolvedConfigRaw);
+      if (!validated.ok) {
+        const resolvedConfig =
+          typeof resolvedConfigRaw === "object" && resolvedConfigRaw !== null
+            ? (resolvedConfigRaw as ClawdbotConfig)
+            : {};
+        return {
+          path: configPath,
+          exists: true,
+          raw,
+          parsed: parsedRes.parsed,
+          valid: false,
+          config: resolvedConfig,
           issues: validated.issues,
           legacyIssues,
         };
+      }
+
+      if (migrated.next && migrated.changes.length > 0) {
+        deps.logger.warn(formatLegacyMigrationLog(migrated.changes));
+        await writeConfigFile(validated.config).catch((err) => {
+          deps.logger.warn(
+            `Failed to write migrated config at ${configPath}: ${String(err)}`,
+          );
+        });
       }
 
       return {
@@ -270,10 +388,12 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
         raw,
         parsed: parsedRes.parsed,
         valid: true,
-        config: applyTalkApiKey(
-          applyModelDefaults(
-            applySessionDefaults(
-              applyLoggingDefaults(applyMessageDefaults(validated.config)),
+        config: normalizeConfigPaths(
+          applyTalkApiKey(
+            applyModelDefaults(
+              applySessionDefaults(
+                applyLoggingDefaults(applyMessageDefaults(validated.config)),
+              ),
             ),
           ),
         ),
@@ -295,13 +415,48 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
   }
 
   async function writeConfigFile(cfg: ClawdbotConfig) {
-    await deps.fs.promises.mkdir(path.dirname(configPath), {
-      recursive: true,
-    });
+    const dir = path.dirname(configPath);
+    await deps.fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
     const json = JSON.stringify(applyModelDefaults(cfg), null, 2)
       .trimEnd()
       .concat("\n");
-    await deps.fs.promises.writeFile(configPath, json, "utf-8");
+
+    const tmp = path.join(
+      dir,
+      `${path.basename(configPath)}.${process.pid}.${crypto.randomUUID()}.tmp`,
+    );
+
+    await deps.fs.promises.writeFile(tmp, json, {
+      encoding: "utf-8",
+      mode: 0o600,
+    });
+
+    await deps.fs.promises
+      .copyFile(configPath, `${configPath}.bak`)
+      .catch(() => {
+        // best-effort
+      });
+
+    try {
+      await deps.fs.promises.rename(tmp, configPath);
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      // Windows doesn't reliably support atomic replace via rename when dest exists.
+      if (code === "EPERM" || code === "EEXIST") {
+        await deps.fs.promises.copyFile(tmp, configPath);
+        await deps.fs.promises.chmod(configPath, 0o600).catch(() => {
+          // best-effort
+        });
+        await deps.fs.promises.unlink(tmp).catch(() => {
+          // best-effort
+        });
+        return;
+      }
+      await deps.fs.promises.unlink(tmp).catch(() => {
+        // best-effort
+      });
+      throw err;
+    }
   }
 
   return {
@@ -312,8 +467,21 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {
   };
 }
 
-const defaultIO = createConfigIO({ configPath: CONFIG_PATH_CLAWDBOT });
+// NOTE: These wrappers intentionally do *not* cache the resolved config path at
+// module scope. `CLAWDBOT_CONFIG_PATH` (and friends) are expected to work even
+// when set after the module has been imported (tests, one-off scripts, etc.).
+export function loadConfig(): ClawdbotConfig {
+  return createConfigIO({ configPath: resolveConfigPath() }).loadConfig();
+}
 
-export const loadConfig = defaultIO.loadConfig;
-export const readConfigFileSnapshot = defaultIO.readConfigFileSnapshot;
-export const writeConfigFile = defaultIO.writeConfigFile;
+export async function readConfigFileSnapshot(): Promise<ConfigFileSnapshot> {
+  return await createConfigIO({
+    configPath: resolveConfigPath(),
+  }).readConfigFileSnapshot();
+}
+
+export async function writeConfigFile(cfg: ClawdbotConfig): Promise<void> {
+  await createConfigIO({ configPath: resolveConfigPath() }).writeConfigFile(
+    cfg,
+  );
+}

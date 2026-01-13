@@ -48,6 +48,7 @@ export type CommandOptions = {
   cwd?: string;
   input?: string;
   env?: NodeJS.ProcessEnv;
+  windowsVerbatimArguments?: boolean;
 };
 
 export async function runCommandWithTimeout(
@@ -59,13 +60,16 @@ export async function runCommandWithTimeout(
       ? { timeoutMs: optionsOrTimeout }
       : optionsOrTimeout;
   const { timeoutMs, cwd, input, env } = options;
+  const { windowsVerbatimArguments } = options;
+  const hasInput = input !== undefined;
 
   // Spawn with inherited stdin (TTY) so tools like `pi` stay interactive when needed.
   return await new Promise((resolve, reject) => {
     const child = spawn(argv[0], argv.slice(1), {
-      stdio: [input ? "pipe" : "inherit", "pipe", "pipe"],
+      stdio: [hasInput ? "pipe" : "inherit", "pipe", "pipe"],
       cwd,
       env: env ? { ...process.env, ...env } : process.env,
+      windowsVerbatimArguments,
     });
     let stdout = "";
     let stderr = "";
@@ -74,8 +78,8 @@ export async function runCommandWithTimeout(
       child.kill("SIGKILL");
     }, timeoutMs);
 
-    if (input && child.stdin) {
-      child.stdin.write(input);
+    if (hasInput && child.stdin) {
+      child.stdin.write(input ?? "");
       child.stdin.end();
     }
 

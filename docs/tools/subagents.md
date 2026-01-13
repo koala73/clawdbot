@@ -7,7 +7,7 @@ read_when:
 
 # Sub-agents
 
-Sub-agents are background agent runs spawned from an existing agent run. They run in their own session (`agent:<agentId>:subagent:<uuid>`) and, when finished, **announce** their result back to the requester chat provider.
+Sub-agents are background agent runs spawned from an existing agent run. They run in their own session (`agent:<agentId>:subagent:<uuid>`) and, when finished, **announce** their result back to the requester chat channel.
 
 Primary goals:
 - Parallelize “research / long task / slow tool” work without blocking the main run.
@@ -19,7 +19,8 @@ Primary goals:
 
 Use `sessions_spawn`:
 - Starts a sub-agent run (`deliver: false`, global lane: `subagent`)
-- Then runs an announce step and posts the announce reply to the requester chat provider
+- Then runs an announce step and posts the announce reply to the requester chat channel
+- Default model: inherits the caller unless you set `agents.defaults.subagents.model` (or per-agent `agents.list[].subagents.model`); an explicit `sessions_spawn.model` still wins.
 
 Tool params:
 - `task` (required)
@@ -47,7 +48,7 @@ Auto-archive:
 Sub-agents report back via an announce step:
 - The announce step runs inside the sub-agent session (not the requester session).
 - If the sub-agent replies exactly `ANNOUNCE_SKIP`, nothing is posted.
-- Otherwise the announce reply is posted to the requester chat provider via the gateway `send` method.
+- Otherwise the announce reply is posted to the requester chat channel via the gateway `send` method.
 
 Announce payloads include a stats line at the end:
 - Runtime (e.g., `runtime 5m12s`)
@@ -80,7 +81,7 @@ Override via config:
         // deny wins
         deny: ["gateway", "cron"],
         // if allow is set, it becomes allow-only (deny still wins)
-        // allow: ["read", "bash", "process"]
+        // allow: ["read", "exec", "process"]
       }
     }
   }
@@ -98,3 +99,4 @@ Sub-agents use a dedicated in-process queue lane:
 - Sub-agent announce is **best-effort**. If the gateway restarts, pending “announce back” work is lost.
 - Sub-agents still share the same gateway process resources; treat `maxConcurrent` as a safety valve.
 - `sessions_spawn` is always non-blocking: it returns `{ status: "accepted", runId, childSessionKey }` immediately.
+- Sub-agent context only injects `AGENTS.md` + `TOOLS.md` (no `SOUL.md`, `IDENTITY.md`, `USER.md`, `HEARTBEAT.md`, or `BOOTSTRAP.md`).

@@ -288,9 +288,8 @@ final class TalkModeManager: NSObject {
             self.chatSubscribedSessionKeys.insert(key)
             self.logger.info("chat.subscribe ok sessionKey=\(key, privacy: .public)")
         } catch {
-            self.logger.warning(
-                "chat.subscribe failed sessionKey=\(key, privacy: .public) " +
-                    "err=\(error.localizedDescription, privacy: .public)")
+            let err = error.localizedDescription
+            self.logger.warning("chat.subscribe failed key=\(key, privacy: .public) err=\(err, privacy: .public)")
         }
     }
 
@@ -528,9 +527,8 @@ final class TalkModeManager: NSObject {
                     self.lastPlaybackWasPCM = false
                     result = await self.mp3Player.play(stream: stream)
                 }
-                self.logger.info(
-                    "elevenlabs stream finished=\(result.finished, privacy: .public) " +
-                        "dur=\(Date().timeIntervalSince(started), privacy: .public)s")
+                let duration = Date().timeIntervalSince(started)
+                self.logger.info("elevenlabs stream finished=\(result.finished, privacy: .public) dur=\(duration, privacy: .public)s")
                 if !result.finished, let interruptedAt = result.interruptedAt {
                     self.lastInterruptedAtSeconds = interruptedAt
                 }
@@ -651,8 +649,7 @@ final class TalkModeManager: NSObject {
             guard let config = json["config"] as? [String: Any] else { return }
             let talk = config["talk"] as? [String: Any]
             let session = config["session"] as? [String: Any]
-            let rawMainKey = (session?["mainKey"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            self.mainSessionKey = rawMainKey.isEmpty ? "main" : rawMainKey
+            self.mainSessionKey = SessionKey.normalizeMainKey(session?["mainKey"] as? String)
             self.defaultVoiceId = (talk?["voiceId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
             if let aliases = talk?["voiceAliases"] as? [String: Any] {
                 var resolved: [String: String] = [:]

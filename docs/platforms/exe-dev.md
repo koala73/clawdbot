@@ -96,7 +96,7 @@ It can set up:
 - `~/clawd` workspace bootstrap
 - `~/.clawdbot/clawdbot.json` config
 - model auth profiles
-- provider config/login
+- model provider config/login
 - Linux systemd **user** service (daemon)
 
 If you’re doing OAuth on a headless VM: do OAuth on a normal machine first, then copy the auth profile to the VM (see [FAQ](/start/faq)).
@@ -164,7 +164,7 @@ Control UI details: [Control UI](/web/control-ui)
 On Linux, Clawdbot uses a systemd **user** service. After `--install-daemon`, verify:
 
 ```bash
-systemctl --user status clawdbot-gateway.service
+systemctl --user status clawdbot-gateway[-<profile>].service
 ```
 
 If the service dies after logout, enable lingering:

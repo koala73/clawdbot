@@ -33,7 +33,7 @@ import type {
   LogEntry,
   LogLevel,
   PresenceEntry,
-  ProvidersStatusSnapshot,
+  ChannelsStatusSnapshot,
   SessionsListResult,
   SkillStatusReport,
   StatusSummary,
@@ -52,6 +52,7 @@ import {
 import {
   loadChatHistory,
   sendChatMessage,
+  abortChatRun,
   handleChatEvent,
   type ChatEventPayload,
 } from "./controllers/chat";
@@ -62,7 +63,7 @@ import {
   updateConfigFormValue,
 } from "./controllers/config";
 import {
-  loadProviders,
+  loadChannels,
   logoutWhatsApp,
   saveDiscordConfig,
   saveIMessageConfig,
@@ -174,6 +175,7 @@ declare global {
 const DEFAULT_CRON_FORM: CronFormState = {
   name: "",
   description: "",
+  agentId: "",
   enabled: true,
   scheduleKind: "every",
   scheduleAt: "",
@@ -186,7 +188,7 @@ const DEFAULT_CRON_FORM: CronFormState = {
   payloadKind: "systemEvent",
   payloadText: "",
   deliver: false,
-  provider: "last",
+  channel: "last",
   to: "",
   timeoutSeconds: "",
   postToMainPrefix: "",
@@ -205,6 +207,7 @@ export class ClawdbotApp extends LitElement {
   @state() eventLog: EventLogEntry[] = [];
   private eventLogBuffer: EventLogEntry[] = [];
   private toolStreamSyncTimer: number | null = null;
+  private sidebarCloseTimer: number | null = null;
 
   @state() sessionKey = this.settings.sessionKey;
   @state() chatLoading = false;
@@ -218,6 +221,11 @@ export class ClawdbotApp extends LitElement {
   @state() chatThinkingLevel: string | null = null;
   @state() chatQueue: ChatQueueItem[] = [];
   @state() toolOutputExpanded = new Set<string>();
+  // Sidebar state for tool output viewing
+  @state() sidebarOpen = false;
+  @state() sidebarContent: string | null = null;
+  @state() sidebarError: string | null = null;
+  @state() splitRatio = this.settings.splitRatio;
 
   @state() nodesLoading = false;
   @state() nodes: Array<Record<string, unknown>> = [];
@@ -239,10 +247,10 @@ export class ClawdbotApp extends LitElement {
   @state() configFormDirty = false;
   @state() configFormMode: "form" | "raw" = "form";
 
-  @state() providersLoading = false;
-  @state() providersSnapshot: ProvidersStatusSnapshot | null = null;
-  @state() providersError: string | null = null;
-  @state() providersLastSuccess: number | null = null;
+  @state() channelsLoading = false;
+  @state() channelsSnapshot: ChannelsStatusSnapshot | null = null;
+  @state() channelsError: string | null = null;
+  @state() channelsLastSuccess: number | null = null;
   @state() whatsappLoginMessage: string | null = null;
   @state() whatsappLoginQrDataUrl: string | null = null;
   @state() whatsappLoginConnected: boolean | null = null;
@@ -250,6 +258,7 @@ export class ClawdbotApp extends LitElement {
   @state() telegramForm: TelegramForm = {
     token: "",
     requireMention: true,
+    groupsWildcardEnabled: false,
     allowFrom: "",
     proxy: "",
     webhookUrl: "",
@@ -392,6 +401,7 @@ export class ClawdbotApp extends LitElement {
   private chatScrollFrame: number | null = null;
   private chatScrollTimeout: number | null = null;
   private chatHasAutoScrolled = false;
+  private chatUserNearBottom = true;
   private nodesPollInterval: number | null = null;
   private logsPollInterval: number | null = null;
   private logsScrollFrame: number | null = null;
@@ -517,10 +527,12 @@ export class ClawdbotApp extends LitElement {
         if (!target) return;
         const distanceFromBottom =
           target.scrollHeight - target.scrollTop - target.clientHeight;
-        const shouldStick = force || distanceFromBottom < 200;
+        const shouldStick =
+          force || this.chatUserNearBottom || distanceFromBottom < 200;
         if (!shouldStick) return;
         if (force) this.chatHasAutoScrolled = true;
         target.scrollTop = target.scrollHeight;
+        this.chatUserNearBottom = true;
         const retryDelay = force ? 150 : 120;
         this.chatScrollTimeout = window.setTimeout(() => {
           this.chatScrollTimeout = null;
@@ -528,8 +540,11 @@ export class ClawdbotApp extends LitElement {
           if (!latest) return;
           const latestDistanceFromBottom =
             latest.scrollHeight - latest.scrollTop - latest.clientHeight;
-          if (!force && latestDistanceFromBottom >= 250) return;
+          const shouldStickRetry =
+            force || this.chatUserNearBottom || latestDistanceFromBottom < 200;
+          if (!shouldStickRetry) return;
           latest.scrollTop = latest.scrollHeight;
+          this.chatUserNearBottom = true;
         }, retryDelay);
       });
     });
@@ -592,6 +607,14 @@ export class ClawdbotApp extends LitElement {
     });
   }
 
+  handleChatScroll(event: Event) {
+    const container = event.currentTarget as HTMLElement | null;
+    if (!container) return;
+    const distanceFromBottom =
+      container.scrollHeight - container.scrollTop - container.clientHeight;
+    this.chatUserNearBottom = distanceFromBottom < 200;
+  }
+
   handleLogsScroll(event: Event) {
     const container = event.currentTarget as HTMLElement | null;
     if (!container) return;
@@ -622,6 +645,7 @@ export class ClawdbotApp extends LitElement {
 
   resetChatScroll() {
     this.chatHasAutoScrolled = false;
+    this.chatUserNearBottom = true;
   }
 
   toggleToolOutput(id: string, expanded: boolean) {
@@ -1002,7 +1026,7 @@ export class ClawdbotApp extends LitElement {
 
   async loadOverview() {
     await Promise.all([
-      loadProviders(this, false),
+      loadChannels(this, false),
       loadPresence(this),
       loadSessions(this),
       loadCronStatus(this),
@@ -1011,7 +1035,7 @@ export class ClawdbotApp extends LitElement {
   }
 
   private async loadConnections() {
-    await Promise.all([loadProviders(this, true), loadConfig(this)]);
+    await Promise.all([loadChannels(this, true), loadConfig(this)]);
   }
 
   async loadCron() {
@@ -1020,6 +1044,26 @@ export class ClawdbotApp extends LitElement {
 
   private isChatBusy() {
     return this.chatSending || Boolean(this.chatRunId);
+  }
+
+  private isChatStopCommand(text: string) {
+    const trimmed = text.trim();
+    if (!trimmed) return false;
+    const normalized = trimmed.toLowerCase();
+    if (normalized === "/stop") return true;
+    return (
+      normalized === "stop" ||
+      normalized === "esc" ||
+      normalized === "abort" ||
+      normalized === "wait" ||
+      normalized === "exit"
+    );
+  }
+
+  async handleAbortChat() {
+    if (!this.connected) return;
+    this.chatMessage = "";
+    await abortChatRun(this);
   }
 
   private enqueueChatMessage(text: string) {
@@ -1046,14 +1090,6 @@ export class ClawdbotApp extends LitElement {
     }
     if (ok) {
       this.setLastActiveSessionKey(this.sessionKey);
-    }
-    if (ok && this.chatRunId) {
-      // chat.send returned (run finished), but we missed the chat final event.
-      this.chatRunId = null;
-      this.chatStream = null;
-      this.chatStreamStartedAt = null;
-      this.resetToolStream();
-      void loadChatHistory(this);
     }
     if (ok && opts?.restoreDraft && opts.previousDraft?.trim()) {
       this.chatMessage = opts.previousDraft;
@@ -1089,6 +1125,11 @@ export class ClawdbotApp extends LitElement {
     const message = (messageOverride ?? this.chatMessage).trim();
     if (!message) return;
 
+    if (this.isChatStopCommand(message)) {
+      await this.handleAbortChat();
+      return;
+    }
+
     if (messageOverride == null) {
       this.chatMessage = "";
     }
@@ -1106,47 +1147,78 @@ export class ClawdbotApp extends LitElement {
 
   async handleWhatsAppStart(force: boolean) {
     await startWhatsAppLogin(this, force);
-    await loadProviders(this, true);
+    await loadChannels(this, true);
   }
 
   async handleWhatsAppWait() {
     await waitWhatsAppLogin(this);
-    await loadProviders(this, true);
+    await loadChannels(this, true);
   }
 
   async handleWhatsAppLogout() {
     await logoutWhatsApp(this);
-    await loadProviders(this, true);
+    await loadChannels(this, true);
   }
 
   async handleTelegramSave() {
     await saveTelegramConfig(this);
     await loadConfig(this);
-    await loadProviders(this, true);
+    await loadChannels(this, true);
   }
 
   async handleDiscordSave() {
     await saveDiscordConfig(this);
     await loadConfig(this);
-    await loadProviders(this, true);
+    await loadChannels(this, true);
   }
 
   async handleSlackSave() {
     await saveSlackConfig(this);
     await loadConfig(this);
-    await loadProviders(this, true);
+    await loadChannels(this, true);
   }
 
   async handleSignalSave() {
     await saveSignalConfig(this);
     await loadConfig(this);
-    await loadProviders(this, true);
+    await loadChannels(this, true);
   }
 
   async handleIMessageSave() {
     await saveIMessageConfig(this);
     await loadConfig(this);
-    await loadProviders(this, true);
+    await loadChannels(this, true);
+  }
+
+  // Sidebar handlers for tool output viewing
+  handleOpenSidebar(content: string) {
+    if (this.sidebarCloseTimer != null) {
+      window.clearTimeout(this.sidebarCloseTimer);
+      this.sidebarCloseTimer = null;
+    }
+    this.sidebarContent = content;
+    this.sidebarError = null;
+    this.sidebarOpen = true;
+  }
+
+  handleCloseSidebar() {
+    this.sidebarOpen = false;
+    // Clear content after transition
+    if (this.sidebarCloseTimer != null) {
+      window.clearTimeout(this.sidebarCloseTimer);
+    }
+    this.sidebarCloseTimer = window.setTimeout(() => {
+      if (this.sidebarOpen) return;
+      this.sidebarContent = null;
+      this.sidebarError = null;
+      this.sidebarCloseTimer = null;
+    }, 200);
+  }
+
+  handleSplitRatioChange(ratio: number) {
+    const newRatio = Math.max(0.4, Math.min(0.7, ratio));
+    this.splitRatio = newRatio;
+    this.applySettings({ ...this.settings, splitRatio: newRatio });
   }
 
   render() {

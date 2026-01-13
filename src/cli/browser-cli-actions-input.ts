@@ -4,7 +4,9 @@ import {
   browserAct,
   browserArmDialog,
   browserArmFileChooser,
+  browserDownload,
   browserNavigate,
+  browserWaitForDownload,
 } from "../browser/client-actions.js";
 import type { BrowserFormField } from "../browser/client-actions-core.js";
 import { danger } from "../globals.js";
@@ -122,7 +124,7 @@ export function registerBrowserActionInputCommands(
   browser
     .command("click")
     .description("Click an element by ref from snapshot")
-    .argument("<ref>", "Ref id from ai snapshot")
+    .argument("<ref>", "Ref id from snapshot")
     .option("--target-id <id>", "CDP target id (or unique prefix)")
     .option("--double", "Double click", false)
     .option("--button <left|right|middle>", "Mouse button to use")
@@ -171,7 +173,7 @@ export function registerBrowserActionInputCommands(
   browser
     .command("type")
     .description("Type into an element by ref from snapshot")
-    .argument("<ref>", "Ref id from ai snapshot")
+    .argument("<ref>", "Ref id from snapshot")
     .argument("<text>", "Text to type")
     .option("--submit", "Press Enter after typing", false)
     .option("--slowly", "Type slowly (human-like)", false)
@@ -243,7 +245,7 @@ export function registerBrowserActionInputCommands(
   browser
     .command("hover")
     .description("Hover an element by ai ref")
-    .argument("<ref>", "Ref id from ai snapshot")
+    .argument("<ref>", "Ref id from snapshot")
     .option("--target-id <id>", "CDP target id (or unique prefix)")
     .action(async (ref: string, opts, cmd) => {
       const parent = parentOpts(cmd);
@@ -264,6 +266,50 @@ export function registerBrowserActionInputCommands(
           return;
         }
         defaultRuntime.log(`hovered ref ${ref}`);
+      } catch (err) {
+        defaultRuntime.error(danger(String(err)));
+        defaultRuntime.exit(1);
+      }
+    });
+
+  browser
+    .command("scrollintoview")
+    .description("Scroll an element into view by ref from snapshot")
+    .argument("<ref>", "Ref id from snapshot")
+    .option("--target-id <id>", "CDP target id (or unique prefix)")
+    .option(
+      "--timeout-ms <ms>",
+      "How long to wait for scroll (default: 20000)",
+      (v: string) => Number(v),
+    )
+    .action(async (ref: string | undefined, opts, cmd) => {
+      const parent = parentOpts(cmd);
+      const baseUrl = resolveBrowserControlUrl(parent?.url);
+      const profile = parent?.browserProfile;
+      const refValue = typeof ref === "string" ? ref.trim() : "";
+      if (!refValue) {
+        defaultRuntime.error(danger("ref is required"));
+        defaultRuntime.exit(1);
+        return;
+      }
+      try {
+        const result = await browserAct(
+          baseUrl,
+          {
+            kind: "scrollIntoView",
+            ref: refValue,
+            targetId: opts.targetId?.trim() || undefined,
+            timeoutMs: Number.isFinite(opts.timeoutMs)
+              ? opts.timeoutMs
+              : undefined,
+          },
+          { profile },
+        );
+        if (parent?.json) {
+          defaultRuntime.log(JSON.stringify(result, null, 2));
+          return;
+        }
+        defaultRuntime.log(`scrolled into view: ${refValue}`);
       } catch (err) {
         defaultRuntime.error(danger(String(err)));
         defaultRuntime.exit(1);
@@ -305,7 +351,7 @@ export function registerBrowserActionInputCommands(
   browser
     .command("select")
     .description("Select option(s) in a select element")
-    .argument("<ref>", "Ref id from ai snapshot")
+    .argument("<ref>", "Ref id from snapshot")
     .argument("<values...>", "Option values to select")
     .option("--target-id <id>", "CDP target id (or unique prefix)")
     .action(async (ref: string, values: string[], opts, cmd) => {
@@ -338,7 +384,7 @@ export function registerBrowserActionInputCommands(
     .command("upload")
     .description("Arm file upload for the next file chooser")
     .argument("<paths...>", "File paths to upload")
-    .option("--ref <ref>", "Ref id from ai snapshot to click after arming")
+    .option("--ref <ref>", "Ref id from snapshot to click after arming")
     .option("--input-ref <ref>", "Ref id for <input type=file> to set directly")
     .option("--element <selector>", "CSS selector for <input type=file>")
     .option("--target-id <id>", "CDP target id (or unique prefix)")
@@ -368,6 +414,76 @@ export function registerBrowserActionInputCommands(
           return;
         }
         defaultRuntime.log(`upload armed for ${paths.length} file(s)`);
+      } catch (err) {
+        defaultRuntime.error(danger(String(err)));
+        defaultRuntime.exit(1);
+      }
+    });
+
+  browser
+    .command("waitfordownload")
+    .description("Wait for the next download (and save it)")
+    .argument("[path]", "Save path (default: /tmp/clawdbot/downloads/...)")
+    .option("--target-id <id>", "CDP target id (or unique prefix)")
+    .option(
+      "--timeout-ms <ms>",
+      "How long to wait for the next download (default: 120000)",
+      (v: string) => Number(v),
+    )
+    .action(async (outPath: string | undefined, opts, cmd) => {
+      const parent = parentOpts(cmd);
+      const baseUrl = resolveBrowserControlUrl(parent?.url);
+      const profile = parent?.browserProfile;
+      try {
+        const result = await browserWaitForDownload(baseUrl, {
+          path: outPath?.trim() || undefined,
+          targetId: opts.targetId?.trim() || undefined,
+          timeoutMs: Number.isFinite(opts.timeoutMs)
+            ? opts.timeoutMs
+            : undefined,
+          profile,
+        });
+        if (parent?.json) {
+          defaultRuntime.log(JSON.stringify(result, null, 2));
+          return;
+        }
+        defaultRuntime.log(`downloaded: ${result.download.path}`);
+      } catch (err) {
+        defaultRuntime.error(danger(String(err)));
+        defaultRuntime.exit(1);
+      }
+    });
+
+  browser
+    .command("download")
+    .description("Click a ref and save the resulting download")
+    .argument("<ref>", "Ref id from snapshot to click")
+    .argument("<path>", "Save path")
+    .option("--target-id <id>", "CDP target id (or unique prefix)")
+    .option(
+      "--timeout-ms <ms>",
+      "How long to wait for the download to start (default: 120000)",
+      (v: string) => Number(v),
+    )
+    .action(async (ref: string, outPath: string, opts, cmd) => {
+      const parent = parentOpts(cmd);
+      const baseUrl = resolveBrowserControlUrl(parent?.url);
+      const profile = parent?.browserProfile;
+      try {
+        const result = await browserDownload(baseUrl, {
+          ref,
+          path: outPath,
+          targetId: opts.targetId?.trim() || undefined,
+          timeoutMs: Number.isFinite(opts.timeoutMs)
+            ? opts.timeoutMs
+            : undefined,
+          profile,
+        });
+        if (parent?.json) {
+          defaultRuntime.log(JSON.stringify(result, null, 2));
+          return;
+        }
+        defaultRuntime.log(`downloaded: ${result.download.path}`);
       } catch (err) {
         defaultRuntime.error(danger(String(err)));
         defaultRuntime.exit(1);
@@ -454,16 +570,32 @@ export function registerBrowserActionInputCommands(
 
   browser
     .command("wait")
-    .description("Wait for time or text conditions")
+    .description("Wait for time, selector, URL, load state, or JS conditions")
+    .argument("[selector]", "CSS selector to wait for (visible)")
     .option("--time <ms>", "Wait for N milliseconds", (v: string) => Number(v))
     .option("--text <value>", "Wait for text to appear")
     .option("--text-gone <value>", "Wait for text to disappear")
+    .option("--url <pattern>", "Wait for URL (supports globs like **/dash)")
+    .option("--load <load|domcontentloaded|networkidle>", "Wait for load state")
+    .option("--fn <js>", "Wait for JS condition (passed to waitForFunction)")
+    .option(
+      "--timeout-ms <ms>",
+      "How long to wait for each condition (default: 20000)",
+      (v: string) => Number(v),
+    )
     .option("--target-id <id>", "CDP target id (or unique prefix)")
-    .action(async (opts, cmd) => {
+    .action(async (selector: string | undefined, opts, cmd) => {
       const parent = parentOpts(cmd);
       const baseUrl = resolveBrowserControlUrl(parent?.url);
       const profile = parent?.browserProfile;
       try {
+        const sel = selector?.trim() || undefined;
+        const load =
+          opts.load === "load" ||
+          opts.load === "domcontentloaded" ||
+          opts.load === "networkidle"
+            ? (opts.load as "load" | "domcontentloaded" | "networkidle")
+            : undefined;
         const result = await browserAct(
           baseUrl,
           {
@@ -471,7 +603,14 @@ export function registerBrowserActionInputCommands(
             timeMs: Number.isFinite(opts.time) ? opts.time : undefined,
             text: opts.text?.trim() || undefined,
             textGone: opts.textGone?.trim() || undefined,
+            selector: sel,
+            url: opts.url?.trim() || undefined,
+            loadState: load,
+            fn: opts.fn?.trim() || undefined,
             targetId: opts.targetId?.trim() || undefined,
+            timeoutMs: Number.isFinite(opts.timeoutMs)
+              ? opts.timeoutMs
+              : undefined,
           },
           { profile },
         );
@@ -490,7 +629,7 @@ export function registerBrowserActionInputCommands(
     .command("evaluate")
     .description("Evaluate a function against the page or a ref")
     .option("--fn <code>", "Function source, e.g. (el) => el.textContent")
-    .option("--ref <id>", "ARIA ref from ai snapshot")
+    .option("--ref <id>", "Ref from snapshot")
     .option("--target-id <id>", "CDP target id (or unique prefix)")
     .action(async (opts, cmd) => {
       const parent = parentOpts(cmd);

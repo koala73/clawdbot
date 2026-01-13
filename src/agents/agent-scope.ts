@@ -3,7 +3,11 @@ import path from "node:path";
 
 import type { ClawdbotConfig } from "../config/config.js";
 import { resolveStateDir } from "../config/paths.js";
-import { DEFAULT_AGENT_ID, normalizeAgentId } from "../routing/session-key.js";
+import {
+  DEFAULT_AGENT_ID,
+  normalizeAgentId,
+  parseAgentSessionKey,
+} from "../routing/session-key.js";
 import { resolveUserPath } from "../utils.js";
 import { DEFAULT_AGENT_WORKSPACE_DIR } from "./workspace.js";
 
@@ -17,7 +21,9 @@ type ResolvedAgentConfig = {
   name?: string;
   workspace?: string;
   agentDir?: string;
-  model?: string;
+  model?: AgentEntry["model"];
+  memorySearch?: AgentEntry["memorySearch"];
+  humanDelay?: AgentEntry["humanDelay"];
   identity?: AgentEntry["identity"];
   groupChat?: AgentEntry["groupChat"];
   subagents?: AgentEntry["subagents"];
@@ -49,6 +55,26 @@ export function resolveDefaultAgentId(cfg: ClawdbotConfig): string {
   return normalizeAgentId(chosen || DEFAULT_AGENT_ID);
 }
 
+export function resolveSessionAgentIds(params: {
+  sessionKey?: string;
+  config?: ClawdbotConfig;
+}): { defaultAgentId: string; sessionAgentId: string } {
+  const defaultAgentId = resolveDefaultAgentId(params.config ?? {});
+  const sessionKey = params.sessionKey?.trim();
+  const parsed = sessionKey ? parseAgentSessionKey(sessionKey) : null;
+  const sessionAgentId = parsed?.agentId
+    ? normalizeAgentId(parsed.agentId)
+    : defaultAgentId;
+  return { defaultAgentId, sessionAgentId };
+}
+
+export function resolveSessionAgentId(params: {
+  sessionKey?: string;
+  config?: ClawdbotConfig;
+}): string {
+  return resolveSessionAgentIds(params).sessionAgentId;
+}
+
 function resolveAgentEntry(
   cfg: ClawdbotConfig,
   agentId: string,
@@ -69,7 +95,13 @@ export function resolveAgentConfig(
     workspace:
       typeof entry.workspace === "string" ? entry.workspace : undefined,
     agentDir: typeof entry.agentDir === "string" ? entry.agentDir : undefined,
-    model: typeof entry.model === "string" ? entry.model : undefined,
+    model:
+      typeof entry.model === "string" ||
+      (entry.model && typeof entry.model === "object")
+        ? entry.model
+        : undefined,
+    memorySearch: entry.memorySearch,
+    humanDelay: entry.humanDelay,
     identity: entry.identity,
     groupChat: entry.groupChat,
     subagents:
@@ -79,6 +111,28 @@ export function resolveAgentConfig(
     sandbox: entry.sandbox,
     tools: entry.tools,
   };
+}
+
+export function resolveAgentModelPrimary(
+  cfg: ClawdbotConfig,
+  agentId: string,
+): string | undefined {
+  const raw = resolveAgentConfig(cfg, agentId)?.model;
+  if (!raw) return undefined;
+  if (typeof raw === "string") return raw.trim() || undefined;
+  const primary = raw.primary?.trim();
+  return primary || undefined;
+}
+
+export function resolveAgentModelFallbacksOverride(
+  cfg: ClawdbotConfig,
+  agentId: string,
+): string[] | undefined {
+  const raw = resolveAgentConfig(cfg, agentId)?.model;
+  if (!raw || typeof raw === "string") return undefined;
+  // Important: treat an explicitly provided empty array as an override to disable global fallbacks.
+  if (!Object.hasOwn(raw, "fallbacks")) return undefined;
+  return Array.isArray(raw.fallbacks) ? raw.fallbacks : undefined;
 }
 
 export function resolveAgentWorkspaceDir(cfg: ClawdbotConfig, agentId: string) {
@@ -100,13 +154,4 @@ export function resolveAgentDir(cfg: ClawdbotConfig, agentId: string) {
   if (configured) return resolveUserPath(configured);
   const root = resolveStateDir(process.env, os.homedir);
   return path.join(root, "agents", id, "agent");
-}
-
-/**
- * Resolve the agent directory for the default agent without requiring config.
- * Used by onboarding when writing auth profiles before config is fully set up.
- */
-export function resolveDefaultAgentDir(): string {
-  const root = resolveStateDir(process.env, os.homedir);
-  return path.join(root, "agents", DEFAULT_AGENT_ID, "agent");
 }

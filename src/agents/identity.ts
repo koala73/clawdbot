@@ -1,4 +1,8 @@
-import type { ClawdbotConfig, IdentityConfig } from "../config/config.js";
+import type {
+  ClawdbotConfig,
+  HumanDelayConfig,
+  IdentityConfig,
+} from "../config/config.js";
 import { resolveAgentConfig } from "./agent-scope.js";
 
 const DEFAULT_ACK_REACTION = "👀";
@@ -32,9 +36,9 @@ export function resolveIdentityNamePrefix(
 export function resolveMessagePrefix(
   cfg: ClawdbotConfig,
   agentId: string,
-  opts?: { hasAllowFrom?: boolean; fallback?: string },
+  opts?: { configured?: string; hasAllowFrom?: boolean; fallback?: string },
 ): string {
-  const configured = cfg.messages?.messagePrefix;
+  const configured = opts?.configured ?? cfg.messages?.messagePrefix;
   if (configured !== undefined) return configured;
 
   const hasAllowFrom = opts?.hasAllowFrom === true;
@@ -50,8 +54,13 @@ export function resolveResponsePrefix(
   agentId: string,
 ): string | undefined {
   const configured = cfg.messages?.responsePrefix;
-  if (configured !== undefined) return configured;
-  return resolveIdentityNamePrefix(cfg, agentId);
+  if (configured !== undefined) {
+    if (configured === "auto") {
+      return resolveIdentityNamePrefix(cfg, agentId);
+    }
+    return configured;
+  }
+  return undefined;
 }
 
 export function resolveEffectiveMessagesConfig(
@@ -65,5 +74,19 @@ export function resolveEffectiveMessagesConfig(
       fallback: opts?.fallbackMessagePrefix,
     }),
     responsePrefix: resolveResponsePrefix(cfg, agentId),
+  };
+}
+
+export function resolveHumanDelayConfig(
+  cfg: ClawdbotConfig,
+  agentId: string,
+): HumanDelayConfig | undefined {
+  const defaults = cfg.agents?.defaults?.humanDelay;
+  const overrides = resolveAgentConfig(cfg, agentId)?.humanDelay;
+  if (!defaults && !overrides) return undefined;
+  return {
+    mode: overrides?.mode ?? defaults?.mode,
+    minMs: overrides?.minMs ?? defaults?.minMs,
+    maxMs: overrides?.maxMs ?? defaults?.maxMs,
   };
 }

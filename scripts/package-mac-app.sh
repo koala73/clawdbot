@@ -107,35 +107,6 @@ merge_framework_machos() {
   done < <(find "$primary" -type f -print0)
 }
 
-build_relay_binary() {
-  local arch="$1"
-  local out="$2"
-  local define_arg="__CLAWDBOT_VERSION__=\\\"$PKG_VERSION\\\""
-  local bun_bin="bun"
-  local -a cmd=("$bun_bin" build "$ROOT_DIR/dist/macos/relay.js" --compile --bytecode --outfile "$out" -e electron --define "$define_arg")
-  if [[ "$arch" == "x86_64" ]]; then
-    if ! arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
-      echo "ERROR: Rosetta is required to build the x86_64 relay. Install Rosetta and retry." >&2
-      exit 1
-    fi
-    local bun_x86="${BUN_X86_64_BIN:-$HOME/.bun-x64/bun-darwin-x64/bun}"
-    if [[ ! -x "$bun_x86" ]]; then
-      bun_x86="$HOME/.bun-x64/bin/bun"
-    fi
-    if [[ "$bun_x86" == *baseline* ]]; then
-      echo "ERROR: x86_64 relay builds are locked to AVX2; baseline Bun is not allowed." >&2
-      echo "Set BUN_X86_64_BIN to a non-baseline Bun (bun-darwin-x64)." >&2
-      exit 1
-    fi
-    if [[ -x "$bun_x86" ]]; then
-      cmd=("$bun_x86" build "$ROOT_DIR/dist/macos/relay.js" --compile --bytecode --outfile "$out" -e electron --define "$define_arg")
-    fi
-    arch -x86_64 "${cmd[@]}"
-  else
-    "${cmd[@]}"
-  fi
-}
-
 echo "📦 Ensuring deps (pnpm install)"
 (cd "$ROOT_DIR" && pnpm install --no-frozen-lockfile --config.node-linker=hoisted)
 if [[ "${SKIP_TSC:-0}" != "1" ]]; then
@@ -166,7 +137,6 @@ echo "🧹 Cleaning old app bundle"
 rm -rf "$APP_ROOT"
 mkdir -p "$APP_ROOT/Contents/MacOS"
 mkdir -p "$APP_ROOT/Contents/Resources"
-mkdir -p "$APP_ROOT/Contents/Resources/Relay"
 mkdir -p "$APP_ROOT/Contents/Frameworks"
 
 echo "📄 Copying Info.plist template"
@@ -244,74 +214,6 @@ if [ -d "$CLAWDBOTKIT_BUNDLE" ]; then
   cp -R "$CLAWDBOTKIT_BUNDLE" "$APP_ROOT/Contents/Resources/ClawdbotKit_ClawdbotKit.bundle"
 else
   echo "WARN: ClawdbotKit resource bundle not found at $CLAWDBOTKIT_BUNDLE (continuing)" >&2
-fi
-
-RELAY_DIR="$APP_ROOT/Contents/Resources/Relay"
-
-if [[ "${SKIP_GATEWAY_PACKAGE:-0}" != "1" ]]; then
-  if ! command -v bun >/dev/null 2>&1; then
-    echo "ERROR: bun missing. Install bun to package the embedded gateway." >&2
-    exit 1
-  fi
-
-  echo "🧰 Building bundled relay (bun --compile)"
-  mkdir -p "$RELAY_DIR"
-  RELAY_OUT="$RELAY_DIR/clawdbot"
-  RELAY_BUILD_DIR="$RELAY_DIR/.relay-build"
-  rm -rf "$RELAY_BUILD_DIR"
-  mkdir -p "$RELAY_BUILD_DIR"
-  for arch in "${BUILD_ARCHS[@]}"; do
-    RELAY_ARCH_OUT="$RELAY_BUILD_DIR/clawdbot-$arch"
-    build_relay_binary "$arch" "$RELAY_ARCH_OUT"
-    chmod +x "$RELAY_ARCH_OUT"
-  done
-  if [[ "${#BUILD_ARCHS[@]}" -gt 1 ]]; then
-    /usr/bin/lipo -create "$RELAY_BUILD_DIR"/clawdbot-* -output "$RELAY_OUT"
-  else
-    cp "$RELAY_BUILD_DIR/clawdbot-${BUILD_ARCHS[0]}" "$RELAY_OUT"
-  fi
-  rm -rf "$RELAY_BUILD_DIR"
-
-  echo "🧪 Smoke testing bundled relay QR modules"
-  "$RELAY_OUT" --smoke qr >/dev/null
-
-  echo "🎨 Copying gateway A2UI host assets"
-  rm -rf "$RELAY_DIR/a2ui"
-  cp -R "$ROOT_DIR/src/canvas-host/a2ui" "$RELAY_DIR/a2ui"
-
-  echo "🎛  Copying Control UI assets"
-  rm -rf "$RELAY_DIR/control-ui"
-  cp -R "$ROOT_DIR/dist/control-ui" "$RELAY_DIR/control-ui"
-
-  echo "🧠 Copying bundled skills"
-  rm -rf "$RELAY_DIR/skills"
-  cp -R "$ROOT_DIR/skills" "$RELAY_DIR/skills"
-
-  echo "📄 Writing embedded runtime package.json (Pi compatibility)"
-  cat > "$RELAY_DIR/package.json" <<JSON
-{
-  "name": "clawdbot-embedded",
-  "version": "$PKG_VERSION",
-  "piConfig": {
-    "name": "pi",
-    "configDir": ".pi"
-  }
-}
-JSON
-
-  echo "🎨 Copying Pi theme payload (optional)"
-  PI_ENTRY_URL="$(cd "$ROOT_DIR" && node --input-type=module -e "console.log(import.meta.resolve('@mariozechner/pi-coding-agent'))")"
-  PI_ENTRY="$(cd "$ROOT_DIR" && node --input-type=module -e "console.log(new URL(process.argv[1]).pathname)" "$PI_ENTRY_URL")"
-  PI_DIR="$(cd "$(dirname "$PI_ENTRY")/.." && pwd)"
-  THEME_SRC="$PI_DIR/dist/modes/interactive/theme"
-  if [ -d "$THEME_SRC" ]; then
-    rm -rf "$RELAY_DIR/theme"
-    cp -R "$THEME_SRC" "$RELAY_DIR/theme"
-  else
-    echo "WARN: Pi theme dir missing at $THEME_SRC (continuing)" >&2
-  fi
-else
-  echo "🧰 Skipping gateway payload packaging (SKIP_GATEWAY_PACKAGE=1)"
 fi
 
 echo "⏹  Stopping any running Clawdbot"

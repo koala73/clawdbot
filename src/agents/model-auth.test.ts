@@ -32,6 +32,7 @@ describe("getApiKeyForModel", () => {
       );
 
       vi.resetModules();
+      const { ensureAuthProfileStore } = await import("./auth-profiles.js");
       const { getApiKeyForModel } = await import("./model-auth.js");
 
       const model = {
@@ -40,6 +41,9 @@ describe("getApiKeyForModel", () => {
         api: "openai-codex-responses",
       } as Model<Api>;
 
+      const store = ensureAuthProfileStore(process.env.CLAWDBOT_AGENT_DIR, {
+        allowKeychainPrompt: false,
+      });
       const apiKey = await getApiKeyForModel({
         model,
         cfg: {
@@ -52,6 +56,8 @@ describe("getApiKeyForModel", () => {
             },
           },
         },
+        store,
+        agentDir: process.env.CLAWDBOT_AGENT_DIR,
       });
       expect(apiKey.apiKey).toBe(oauthFixture.access);
 
@@ -196,6 +202,61 @@ describe("getApiKeyForModel", () => {
         delete process.env.Z_AI_API_KEY;
       } else {
         process.env.Z_AI_API_KEY = previousLegacy;
+      }
+    }
+  });
+
+  it("accepts legacy Z_AI_API_KEY for zai", async () => {
+    const previousZai = process.env.ZAI_API_KEY;
+    const previousLegacy = process.env.Z_AI_API_KEY;
+
+    try {
+      delete process.env.ZAI_API_KEY;
+      process.env.Z_AI_API_KEY = "zai-test-key";
+
+      vi.resetModules();
+      const { resolveApiKeyForProvider } = await import("./model-auth.js");
+
+      const resolved = await resolveApiKeyForProvider({
+        provider: "zai",
+        store: { version: 1, profiles: {} },
+      });
+      expect(resolved.apiKey).toBe("zai-test-key");
+      expect(resolved.source).toContain("Z_AI_API_KEY");
+    } finally {
+      if (previousZai === undefined) {
+        delete process.env.ZAI_API_KEY;
+      } else {
+        process.env.ZAI_API_KEY = previousZai;
+      }
+      if (previousLegacy === undefined) {
+        delete process.env.Z_AI_API_KEY;
+      } else {
+        process.env.Z_AI_API_KEY = previousLegacy;
+      }
+    }
+  });
+
+  it("resolves Synthetic API key from env", async () => {
+    const previousSynthetic = process.env.SYNTHETIC_API_KEY;
+
+    try {
+      process.env.SYNTHETIC_API_KEY = "synthetic-test-key";
+
+      vi.resetModules();
+      const { resolveApiKeyForProvider } = await import("./model-auth.js");
+
+      const resolved = await resolveApiKeyForProvider({
+        provider: "synthetic",
+        store: { version: 1, profiles: {} },
+      });
+      expect(resolved.apiKey).toBe("synthetic-test-key");
+      expect(resolved.source).toContain("SYNTHETIC_API_KEY");
+    } finally {
+      if (previousSynthetic === undefined) {
+        delete process.env.SYNTHETIC_API_KEY;
+      } else {
+        process.env.SYNTHETIC_API_KEY = previousSynthetic;
       }
     }
   });

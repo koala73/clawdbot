@@ -50,7 +50,7 @@ You can tune console verbosity independently via:
 
 ## Tool summary redaction
 
-Verbose tool summaries (e.g. `🛠️ bash: ...`) can mask sensitive tokens before they hit the
+Verbose tool summaries (e.g. `🛠️ exec: ...`) can mask sensitive tokens before they hit the
 console stream. This is **tools-only** and does not alter file logs.
 
 - `logging.redactSensitive`: `off` | `tools` (default: `tools`)
@@ -101,7 +101,7 @@ Behavior:
 - **Subsystem prefixes** on every line (e.g. `[gateway]`, `[canvas]`, `[tailscale]`)
 - **Subsystem colors** (stable per subsystem) plus level coloring
 - **Color when output is a TTY or the environment looks like a rich terminal** (`TERM`/`COLORTERM`/`TERM_PROGRAM`), respects `NO_COLOR`
-- **Shortened subsystem prefixes**: drops leading `gateway/` + `providers/`, keeps last 2 segments (e.g. `whatsapp/outbound`)
+- **Shortened subsystem prefixes**: drops leading `gateway/` + `channels/`, keeps last 2 segments (e.g. `whatsapp/outbound`)
 - **Sub-loggers by subsystem** (auto prefix + structured field `{ subsystem }`)
 - **`logRaw()`** for QR/UX output (no prefix, no formatting)
 - **Console styles** (e.g. `pretty | compact | json`)

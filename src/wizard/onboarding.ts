@@ -2,17 +2,25 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { ensureAuthProfileStore } from "../agents/auth-profiles.js";
 import { DEFAULT_BOOTSTRAP_FILENAME } from "../agents/workspace.js";
+import { listChannelPlugins } from "../channels/plugins/index.js";
 import {
   applyAuthChoice,
+  resolvePreferredProviderForAuthChoice,
   warnIfModelConfigLooksOff,
 } from "../commands/auth-choice.js";
-import { buildAuthChoiceOptions } from "../commands/auth-choice-options.js";
+import { promptAuthChoiceGrouped } from "../commands/auth-choice-prompt.js";
 import {
   DEFAULT_GATEWAY_DAEMON_RUNTIME,
   GATEWAY_DAEMON_RUNTIME_OPTIONS,
   type GatewayDaemonRuntime,
 } from "../commands/daemon-runtime.js";
 import { healthCommand } from "../commands/health.js";
+import { formatHealthCheckFailure } from "../commands/health-format.js";
+import {
+  applyPrimaryModel,
+  promptDefaultModel,
+} from "../commands/model-picker.js";
+import { setupChannels } from "../commands/onboard-channels.js";
 import {
   applyWizardMetadata,
   DEFAULT_WORKSPACE,
@@ -27,11 +35,9 @@ import {
   resolveControlUiLinks,
   summarizeExistingConfig,
 } from "../commands/onboard-helpers.js";
-import { setupProviders } from "../commands/onboard-providers.js";
 import { promptRemoteGatewayConfig } from "../commands/onboard-remote.js";
 import { setupSkills } from "../commands/onboard-skills.js";
 import type {
-  AuthChoice,
   GatewayAuthChoice,
   OnboardMode,
   OnboardOptions,
@@ -46,12 +52,18 @@ import {
   resolveGatewayPort,
   writeConfigFile,
 } from "../config/config.js";
-import { GATEWAY_LAUNCH_AGENT_LABEL } from "../daemon/constants.js";
+import { resolveGatewayLaunchAgentLabel } from "../daemon/constants.js";
 import { resolveGatewayProgramArguments } from "../daemon/program-args.js";
-import { resolvePreferredNodePath } from "../daemon/runtime-paths.js";
+import {
+  renderSystemNodeWarning,
+  resolvePreferredNodePath,
+  resolveSystemNodeInfo,
+} from "../daemon/runtime-paths.js";
 import { resolveGatewayService } from "../daemon/service.js";
 import { buildServiceEnvironment } from "../daemon/service-env.js";
+import { isSystemdUserServiceAvailable } from "../daemon/systemd.js";
 import { ensureControlUiAssetsBuilt } from "../infra/control-ui-assets.js";
+import { findTailscaleBinary } from "../infra/tailscale.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { defaultRuntime } from "../runtime.js";
 import { runTui } from "../tui/tui.js";
@@ -85,6 +97,14 @@ export async function runOnboardingWizard(
       );
     }
 
+    if (!snapshot.valid) {
+      await prompter.outro(
+        "Config invalid. Run `clawdbot doctor` to repair it, then re-run onboarding.",
+      );
+      runtime.exit(1);
+      return;
+    }
+
     const action = (await prompter.select({
       message: "Config handling",
       options: [
@@ -113,21 +133,31 @@ export async function runOnboardingWizard(
       })) as ResetScope;
       await handleReset(resetScope, resolveUserPath(workspaceDefault), runtime);
       baseConfig = {};
-    } else if (action === "keep" && !snapshot.valid) {
-      baseConfig = {};
     }
   }
 
   const quickstartHint = "Configure details later via clawdbot configure.";
   const advancedHint = "Configure port, network, Tailscale, and auth options.";
-  let flow = (await prompter.select({
-    message: "Onboarding mode",
-    options: [
-      { value: "quickstart", label: "QuickStart", hint: quickstartHint },
-      { value: "advanced", label: "Advanced", hint: advancedHint },
-    ],
-    initialValue: "quickstart",
-  })) as "quickstart" | "advanced";
+  const explicitFlow = opts.flow?.trim();
+  if (
+    explicitFlow &&
+    explicitFlow !== "quickstart" &&
+    explicitFlow !== "advanced"
+  ) {
+    runtime.error("Invalid --flow (use quickstart or advanced).");
+    runtime.exit(1);
+    return;
+  }
+  let flow =
+    explicitFlow ??
+    ((await prompter.select({
+      message: "Onboarding mode",
+      options: [
+        { value: "quickstart", label: "QuickStart", hint: quickstartHint },
+        { value: "advanced", label: "Advanced", hint: advancedHint },
+      ],
+      initialValue: "quickstart",
+    })) as "quickstart" | "advanced");
 
   if (opts.mode === "remote" && flow === "quickstart") {
     await prompter.note(
@@ -144,18 +174,19 @@ export async function runOnboardingWizard(
       baseConfig.gateway?.auth?.mode !== undefined ||
       baseConfig.gateway?.auth?.token !== undefined ||
       baseConfig.gateway?.auth?.password !== undefined ||
+      baseConfig.gateway?.customBindHost !== undefined ||
       baseConfig.gateway?.tailscale?.mode !== undefined;
 
     const bindRaw = baseConfig.gateway?.bind;
     const bind =
       bindRaw === "loopback" ||
       bindRaw === "lan" ||
-      bindRaw === "tailnet" ||
-      bindRaw === "auto"
+      bindRaw === "auto" ||
+      bindRaw === "custom"
         ? bindRaw
         : "loopback";
 
-    let authMode: GatewayAuthChoice = "off";
+    let authMode: GatewayAuthChoice = "token";
     if (
       baseConfig.gateway?.auth?.mode === "token" ||
       baseConfig.gateway?.auth?.mode === "password"
@@ -183,20 +214,21 @@ export async function runOnboardingWizard(
       tailscaleMode,
       token: baseConfig.gateway?.auth?.token,
       password: baseConfig.gateway?.auth?.password,
+      customBindHost: baseConfig.gateway?.customBindHost,
       tailscaleResetOnExit: baseConfig.gateway?.tailscale?.resetOnExit ?? false,
     };
   })();
 
   if (flow === "quickstart") {
-    const formatBind = (value: "loopback" | "lan" | "tailnet" | "auto") => {
+    const formatBind = (value: "loopback" | "lan" | "auto" | "custom") => {
       if (value === "loopback") return "Loopback (127.0.0.1)";
       if (value === "lan") return "LAN";
-      if (value === "tailnet") return "Tailnet";
+      if (value === "custom") return "Custom IP";
       return "Auto";
     };
     const formatAuth = (value: GatewayAuthChoice) => {
       if (value === "off") return "Off (loopback only)";
-      if (value === "token") return "Token";
+      if (value === "token") return "Token (default)";
       return "Password";
     };
     const formatTailscale = (value: "off" | "serve" | "funnel") => {
@@ -209,18 +241,22 @@ export async function runOnboardingWizard(
           "Keeping your current gateway settings:",
           `Gateway port: ${quickstartGateway.port}`,
           `Gateway bind: ${formatBind(quickstartGateway.bind)}`,
+          ...(quickstartGateway.bind === "custom" &&
+          quickstartGateway.customBindHost
+            ? [`Gateway custom IP: ${quickstartGateway.customBindHost}`]
+            : []),
           `Gateway auth: ${formatAuth(quickstartGateway.authMode)}`,
           `Tailscale exposure: ${formatTailscale(
             quickstartGateway.tailscaleMode,
           )}`,
-          "Direct to chat providers.",
+          "Direct to chat channels.",
         ]
       : [
           `Gateway port: ${DEFAULT_GATEWAY_PORT}`,
           "Gateway bind: Loopback (127.0.0.1)",
-          "Gateway auth: Off (loopback only)",
+          "Gateway auth: Token (default)",
           "Tailscale exposure: Off",
-          "Direct to chat providers.",
+          "Direct to chat channels.",
         ];
     await prompter.note(quickstartLines.join("\n"), "QuickStart");
   }
@@ -229,7 +265,8 @@ export async function runOnboardingWizard(
   const localUrl = `ws://127.0.0.1:${localPort}`;
   const localProbe = await probeGatewayReachable({
     url: localUrl,
-    token: process.env.CLAWDBOT_GATEWAY_TOKEN,
+    token:
+      baseConfig.gateway?.auth?.token ?? process.env.CLAWDBOT_GATEWAY_TOKEN,
     password:
       baseConfig.gateway?.auth?.password ??
       process.env.CLAWDBOT_GATEWAY_PASSWORD,
@@ -309,14 +346,15 @@ export async function runOnboardingWizard(
   const authStore = ensureAuthProfileStore(undefined, {
     allowKeychainPrompt: false,
   });
-  const authChoice = (await prompter.select({
-    message: "Model/auth choice",
-    options: buildAuthChoiceOptions({
+  const authChoiceFromPrompt = opts.authChoice === undefined;
+  const authChoice =
+    opts.authChoice ??
+    (await promptAuthChoiceGrouped({
+      prompter,
       store: authStore,
       includeSkip: true,
       includeClaudeCliIfMissing: true,
-    }),
-  })) as AuthChoice;
+    }));
 
   const authResult = await applyAuthChoice({
     authChoice,
@@ -326,6 +364,19 @@ export async function runOnboardingWizard(
     setDefaultModel: true,
   });
   nextConfig = authResult.config;
+
+  if (authChoiceFromPrompt) {
+    const modelSelection = await promptDefaultModel({
+      config: nextConfig,
+      prompter,
+      allowKeep: true,
+      ignoreAllowlist: true,
+      preferredProvider: resolvePreferredProviderForAuthChoice(authChoice),
+    });
+    if (modelSelection.model) {
+      nextConfig = applyPrimaryModel(nextConfig, modelSelection.model);
+    }
+  }
 
   await warnIfModelConfigLooksOff(nextConfig, prompter);
 
@@ -352,11 +403,41 @@ export async function runOnboardingWizard(
           options: [
             { value: "loopback", label: "Loopback (127.0.0.1)" },
             { value: "lan", label: "LAN" },
-            { value: "tailnet", label: "Tailnet" },
             { value: "auto", label: "Auto" },
+            { value: "custom", label: "Custom IP" },
           ],
-        })) as "loopback" | "lan" | "tailnet" | "auto")
-  ) as "loopback" | "lan" | "tailnet" | "auto";
+        })) as "loopback" | "lan" | "auto" | "custom")
+  ) as "loopback" | "lan" | "auto" | "custom";
+
+  let customBindHost = quickstartGateway.customBindHost;
+  if (bind === "custom") {
+    const needsPrompt = flow !== "quickstart" || !customBindHost;
+    if (needsPrompt) {
+      const input = await prompter.text({
+        message: "Custom IP address",
+        placeholder: "192.168.1.100",
+        initialValue: customBindHost ?? "",
+        validate: (value) => {
+          if (!value) return "IP address is required for custom bind mode";
+          const trimmed = value.trim();
+          const parts = trimmed.split(".");
+          if (parts.length !== 4)
+            return "Invalid IPv4 address (e.g., 192.168.1.100)";
+          if (
+            parts.every((part) => {
+              const n = parseInt(part, 10);
+              return (
+                !Number.isNaN(n) && n >= 0 && n <= 255 && part === String(n)
+              );
+            })
+          )
+            return undefined;
+          return "Invalid IPv4 address (each octet must be 0-255)";
+        },
+      });
+      customBindHost = typeof input === "string" ? input.trim() : undefined;
+    }
+  }
 
   let authMode = (
     flow === "quickstart"
@@ -367,15 +448,16 @@ export async function runOnboardingWizard(
             {
               value: "off",
               label: "Off (loopback only)",
-              hint: "Recommended for single-machine setups",
+              hint: "Not recommended unless you fully trust local processes",
             },
             {
               value: "token",
               label: "Token",
-              hint: "Use for multi-machine access or non-loopback binds",
+              hint: "Recommended default (local + remote)",
             },
             { value: "password", label: "Password" },
           ],
+          initialValue: "token",
         })) as GatewayAuthChoice)
   ) as GatewayAuthChoice;
 
@@ -399,6 +481,23 @@ export async function runOnboardingWizard(
           ],
         })) as "off" | "serve" | "funnel")
   ) as "off" | "serve" | "funnel";
+
+  // Detect Tailscale binary before proceeding with serve/funnel setup
+  if (tailscaleMode !== "off") {
+    const tailscaleBin = await findTailscaleBinary();
+    if (!tailscaleBin) {
+      await prompter.note(
+        [
+          "Tailscale binary not found in PATH or /Applications.",
+          "Ensure Tailscale is installed from:",
+          "  https://tailscale.com/download/mac",
+          "",
+          "You can continue setup, but serve/funnel will fail at runtime.",
+        ].join("\n"),
+        "Tailscale Warning",
+      );
+    }
+  }
 
   let tailscaleResetOnExit =
     flow === "quickstart" ? quickstartGateway.tailscaleResetOnExit : false;
@@ -425,6 +524,7 @@ export async function runOnboardingWizard(
       "Note",
     );
     bind = "loopback";
+    customBindHost = undefined;
   }
 
   if (authMode === "off" && bind !== "loopback") {
@@ -442,8 +542,8 @@ export async function runOnboardingWizard(
 
   let gatewayToken: string | undefined;
   if (authMode === "token") {
-    if (flow === "quickstart" && quickstartGateway.token) {
-      gatewayToken = quickstartGateway.token;
+    if (flow === "quickstart") {
+      gatewayToken = quickstartGateway.token ?? randomToken();
     } else {
       const tokenInput = await prompter.text({
         message: "Gateway token (blank to generate)",
@@ -493,6 +593,7 @@ export async function runOnboardingWizard(
       ...nextConfig.gateway,
       port,
       bind,
+      ...(bind === "custom" && customBindHost ? { customBindHost } : {}),
       tailscale: {
         ...nextConfig.gateway?.tailscale,
         mode: tailscaleMode,
@@ -501,14 +602,23 @@ export async function runOnboardingWizard(
     },
   };
 
-  nextConfig = await setupProviders(nextConfig, runtime, prompter, {
-    allowSignalInstall: true,
-    forceAllowFromProviders:
-      flow === "quickstart" ? ["telegram", "whatsapp"] : [],
-    skipDmPolicyPrompt: flow === "quickstart",
-    skipConfirm: flow === "quickstart",
-    quickstartDefaults: flow === "quickstart",
-  });
+  if (opts.skipChannels ?? opts.skipProviders) {
+    await prompter.note("Skipping channel setup.", "Channels");
+  } else {
+    const quickstartAllowFromChannels =
+      flow === "quickstart"
+        ? listChannelPlugins()
+            .filter((plugin) => plugin.meta.quickstartAllowFrom)
+            .map((plugin) => plugin.id)
+        : [];
+    nextConfig = await setupChannels(nextConfig, runtime, prompter, {
+      allowSignalInstall: true,
+      forceAllowFromChannels: quickstartAllowFromChannels,
+      skipDmPolicyPrompt: flow === "quickstart",
+      skipConfirm: flow === "quickstart",
+      quickstartDefaults: flow === "quickstart",
+    });
+  }
 
   await writeConfigFile(nextConfig);
   runtime.log(`Updated ${CONFIG_PATH_CLAWDBOT}`);
@@ -516,28 +626,59 @@ export async function runOnboardingWizard(
     skipBootstrap: Boolean(nextConfig.agents?.defaults?.skipBootstrap),
   });
 
-  nextConfig = await setupSkills(nextConfig, workspaceDir, runtime, prompter);
+  if (opts.skipSkills) {
+    await prompter.note("Skipping skills setup.", "Skills");
+  } else {
+    nextConfig = await setupSkills(nextConfig, workspaceDir, runtime, prompter);
+  }
   nextConfig = applyWizardMetadata(nextConfig, { command: "onboard", mode });
   await writeConfigFile(nextConfig);
 
-  await ensureSystemdUserLingerInteractive({
-    runtime,
-    prompter: {
-      confirm: prompter.confirm,
-      note: prompter.note,
-    },
-    reason:
-      "Linux installs use a systemd user service by default. Without lingering, systemd stops the user session on logout/idle and kills the Gateway.",
-    requireConfirm: false,
-  });
+  const systemdAvailable =
+    process.platform === "linux" ? await isSystemdUserServiceAvailable() : true;
+  if (process.platform === "linux" && !systemdAvailable) {
+    await prompter.note(
+      "Systemd user services are unavailable. Skipping lingering checks and daemon install.",
+      "Systemd",
+    );
+  }
 
-  const installDaemon =
-    flow === "quickstart"
-      ? true
-      : await prompter.confirm({
-          message: "Install Gateway daemon (recommended)",
-          initialValue: true,
-        });
+  if (process.platform === "linux" && systemdAvailable) {
+    await ensureSystemdUserLingerInteractive({
+      runtime,
+      prompter: {
+        confirm: prompter.confirm,
+        note: prompter.note,
+      },
+      reason:
+        "Linux installs use a systemd user service by default. Without lingering, systemd stops the user session on logout/idle and kills the Gateway.",
+      requireConfirm: false,
+    });
+  }
+
+  const explicitInstallDaemon =
+    typeof opts.installDaemon === "boolean" ? opts.installDaemon : undefined;
+  let installDaemon: boolean;
+  if (explicitInstallDaemon !== undefined) {
+    installDaemon = explicitInstallDaemon;
+  } else if (process.platform === "linux" && !systemdAvailable) {
+    installDaemon = false;
+  } else if (flow === "quickstart") {
+    installDaemon = true;
+  } else {
+    installDaemon = await prompter.confirm({
+      message: "Install Gateway daemon (recommended)",
+      initialValue: true,
+    });
+  }
+
+  if (process.platform === "linux" && !systemdAvailable && installDaemon) {
+    await prompter.note(
+      "Systemd user services are unavailable; skipping daemon install. Use your container supervisor or `docker compose up -d`.",
+      "Gateway daemon",
+    );
+    installDaemon = false;
+  }
 
   if (installDaemon) {
     const daemonRuntime =
@@ -555,7 +696,10 @@ export async function runOnboardingWizard(
       );
     }
     const service = resolveGatewayService();
-    const loaded = await service.isLoaded({ env: process.env });
+    const loaded = await service.isLoaded({
+      env: process.env,
+      profile: process.env.CLAWDBOT_PROFILE,
+    });
     if (loaded) {
       const action = (await prompter.select({
         message: "Gateway service already installed",
@@ -566,7 +710,11 @@ export async function runOnboardingWizard(
         ],
       })) as "restart" | "reinstall" | "skip";
       if (action === "restart") {
-        await service.restart({ stdout: process.stdout });
+        await service.restart({
+          env: process.env,
+          profile: process.env.CLAWDBOT_PROFILE,
+          stdout: process.stdout,
+        });
       } else if (action === "reinstall") {
         await service.uninstall({ env: process.env, stdout: process.stdout });
       }
@@ -574,7 +722,11 @@ export async function runOnboardingWizard(
 
     if (
       !loaded ||
-      (loaded && (await service.isLoaded({ env: process.env })) === false)
+      (loaded &&
+        (await service.isLoaded({
+          env: process.env,
+          profile: process.env.CLAWDBOT_PROFILE,
+        })) === false)
     ) {
       const devMode =
         process.argv[1]?.includes(`${path.sep}src${path.sep}`) &&
@@ -590,13 +742,21 @@ export async function runOnboardingWizard(
           runtime: daemonRuntime,
           nodePath,
         });
+      if (daemonRuntime === "node") {
+        const systemNode = await resolveSystemNodeInfo({ env: process.env });
+        const warning = renderSystemNodeWarning(
+          systemNode,
+          programArguments[0],
+        );
+        if (warning) await prompter.note(warning, "Gateway runtime");
+      }
       const environment = buildServiceEnvironment({
         env: process.env,
         port,
         token: gatewayToken,
         launchdLabel:
           process.platform === "darwin"
-            ? GATEWAY_LAUNCH_AGENT_LABEL
+            ? resolveGatewayLaunchAgentLabel(process.env.CLAWDBOT_PROFILE)
             : undefined,
       });
       await service.install({
@@ -609,24 +769,32 @@ export async function runOnboardingWizard(
     }
   }
 
-  await sleep(1500);
-  try {
-    await healthCommand({ json: false, timeoutMs: 10_000 }, runtime);
-  } catch (err) {
-    runtime.error(`Health check failed: ${String(err)}`);
-    await prompter.note(
-      [
-        "Docs:",
-        "https://docs.clawd.bot/gateway/health",
-        "https://docs.clawd.bot/gateway/troubleshooting",
-      ].join("\n"),
-      "Health check help",
-    );
+  if (!opts.skipHealth) {
+    await sleep(1500);
+    try {
+      await healthCommand({ json: false, timeoutMs: 10_000 }, runtime);
+    } catch (err) {
+      runtime.error(formatHealthCheckFailure(err));
+      await prompter.note(
+        [
+          "Docs:",
+          "https://docs.clawd.bot/gateway/health",
+          "https://docs.clawd.bot/gateway/troubleshooting",
+        ].join("\n"),
+        "Health check help",
+      );
+    }
   }
 
-  const controlUiAssets = await ensureControlUiAssetsBuilt(runtime);
-  if (!controlUiAssets.ok && controlUiAssets.message) {
-    runtime.error(controlUiAssets.message);
+  const controlUiEnabled =
+    nextConfig.gateway?.controlUi?.enabled ??
+    baseConfig.gateway?.controlUi?.enabled ??
+    true;
+  if (!opts.skipUi && controlUiEnabled) {
+    const controlUiAssets = await ensureControlUiAssetsBuilt(runtime);
+    if (!controlUiAssets.ok && controlUiAssets.message) {
+      runtime.error(controlUiAssets.message);
+    }
   }
 
   await prompter.note(
@@ -639,10 +807,14 @@ export async function runOnboardingWizard(
     "Optional apps",
   );
 
+  const controlUiBasePath =
+    nextConfig.gateway?.controlUi?.basePath ??
+    baseConfig.gateway?.controlUi?.basePath;
   const links = resolveControlUiLinks({
     bind,
     port,
-    basePath: baseConfig.gateway?.controlUi?.basePath,
+    customBindHost,
+    basePath: controlUiBasePath,
   });
   const tokenParam =
     authMode === "token" && gatewayToken
@@ -652,7 +824,7 @@ export async function runOnboardingWizard(
   const gatewayProbe = await probeGatewayReachable({
     url: links.wsUrl,
     token: authMode === "token" ? gatewayToken : undefined,
-    password: authMode === "password" ? baseConfig.gateway?.auth?.password : "",
+    password: authMode === "password" ? nextConfig.gateway?.auth?.password : "",
   });
   const gatewayStatusLine = gatewayProbe.ok
     ? "Gateway: reachable"
@@ -676,7 +848,7 @@ export async function runOnboardingWizard(
     "Control UI",
   );
 
-  if (gatewayProbe.ok) {
+  if (!opts.skipUi && gatewayProbe.ok) {
     if (hasBootstrap) {
       await prompter.note(
         [
@@ -688,7 +860,7 @@ export async function runOnboardingWizard(
         "Start TUI (best option!)",
       );
       const wantsTui = await prompter.confirm({
-        message: "Start TUI now? (best option!)",
+        message: "Do you want to hatch your bot now?",
         initialValue: true,
       });
       if (wantsTui) {
@@ -697,6 +869,8 @@ export async function runOnboardingWizard(
           token: authMode === "token" ? gatewayToken : undefined,
           password:
             authMode === "password" ? baseConfig.gateway?.auth?.password : "",
+          // Safety: onboarding TUI should not auto-deliver to lastProvider/lastTo.
+          deliver: false,
           message: "Wake up, my friend!",
         });
       }
@@ -706,31 +880,20 @@ export async function runOnboardingWizard(
         await prompter.note(
           formatControlUiSshHint({
             port,
-            basePath: baseConfig.gateway?.controlUi?.basePath,
+            basePath: controlUiBasePath,
             token: authMode === "token" ? gatewayToken : undefined,
           }),
           "Open Control UI",
         );
       } else {
-        const wantsOpen = await prompter.confirm({
-          message: "Open Control UI now?",
-          initialValue: true,
-        });
-        if (wantsOpen) {
-          const opened = await openUrl(`${links.httpUrl}${tokenParam}`);
-          if (!opened) {
-            await prompter.note(
-              formatControlUiSshHint({
-                port,
-                basePath: baseConfig.gateway?.controlUi?.basePath,
-                token: authMode === "token" ? gatewayToken : undefined,
-              }),
-              "Open Control UI",
-            );
-          }
-        }
+        await prompter.note(
+          "Opening Control UI automatically after onboarding (no extra prompts).",
+          "Open Control UI",
+        );
       }
     }
+  } else if (opts.skipUi) {
+    await prompter.note("Skipping Control UI/TUI prompts.", "Control UI");
   }
 
   await prompter.note(
@@ -741,5 +904,51 @@ export async function runOnboardingWizard(
     "Workspace backup",
   );
 
-  await prompter.outro("Onboarding complete.");
+  await prompter.note(
+    "Running agents on your computer is risky — harden your setup: https://docs.clawd.bot/security",
+    "Security",
+  );
+
+  const shouldOpenControlUi =
+    !opts.skipUi && authMode === "token" && Boolean(gatewayToken);
+  let controlUiOpened = false;
+  let controlUiOpenHint: string | undefined;
+  if (shouldOpenControlUi) {
+    const browserSupport = await detectBrowserOpenSupport();
+    if (browserSupport.ok) {
+      controlUiOpened = await openUrl(authedUrl);
+      if (!controlUiOpened) {
+        controlUiOpenHint = formatControlUiSshHint({
+          port,
+          basePath: controlUiBasePath,
+          token: gatewayToken,
+        });
+      }
+    } else {
+      controlUiOpenHint = formatControlUiSshHint({
+        port,
+        basePath: controlUiBasePath,
+        token: gatewayToken,
+      });
+    }
+
+    await prompter.note(
+      [
+        `Dashboard link (with token): ${authedUrl}`,
+        controlUiOpened
+          ? "Opened in your browser. Keep that tab to control Clawdbot."
+          : "Copy/paste this URL in a browser on this machine to control Clawdbot.",
+        controlUiOpenHint,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      "Dashboard ready",
+    );
+  }
+
+  await prompter.outro(
+    controlUiOpened
+      ? "Onboarding complete. Dashboard opened with your token; keep that tab to control Clawdbot."
+      : "Onboarding complete. Use the tokenized dashboard link above to control Clawdbot.",
+  );
 }

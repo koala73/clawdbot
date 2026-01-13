@@ -10,7 +10,13 @@ type StubSession = {
 type SessionEventHandler = (evt: unknown) => void;
 
 describe("subscribeEmbeddedPiSession", () => {
-  it("filters to <final> and falls back when tags are malformed", () => {
+  const THINKING_TAG_CASES = [
+    { tag: "think", open: "<think>", close: "</think>" },
+    { tag: "thinking", open: "<thinking>", close: "</thinking>" },
+    { tag: "thought", open: "<thought>", close: "</thought>" },
+    { tag: "antthinking", open: "<antthinking>", close: "</antthinking>" },
+  ] as const;
+  it("filters to <final> and suppresses output without a start tag", () => {
     let handler: ((evt: unknown) => void) | undefined;
     const session: StubSession = {
       subscribe: (fn) => {
@@ -32,6 +38,7 @@ describe("subscribeEmbeddedPiSession", () => {
       onAgentEvent,
     });
 
+    handler?.({ type: "message_start", message: { role: "assistant" } });
     handler?.({
       type: "message_update",
       message: { role: "assistant" },
@@ -47,11 +54,7 @@ describe("subscribeEmbeddedPiSession", () => {
 
     onPartialReply.mockReset();
 
-    handler?.({
-      type: "message_end",
-      message: { role: "assistant" },
-    });
-
+    handler?.({ type: "message_start", message: { role: "assistant" } });
     handler?.({
       type: "message_update",
       message: { role: "assistant" },
@@ -61,8 +64,7 @@ describe("subscribeEmbeddedPiSession", () => {
       },
     });
 
-    const secondPayload = onPartialReply.mock.calls[0][0];
-    expect(secondPayload.text).toContain("Oops no start");
+    expect(onPartialReply).not.toHaveBeenCalled();
   });
 
   it("does not require <final> when enforcement is off", () => {
@@ -129,7 +131,7 @@ describe("subscribeEmbeddedPiSession", () => {
     expect(payload.text).toBe("Hello block");
   });
 
-  it("prepends reasoning before text when enabled", () => {
+  it("emits reasoning as a separate message when enabled", () => {
     let handler: ((evt: unknown) => void) | undefined;
     const session: StubSession = {
       subscribe: (fn) => {
@@ -160,14 +162,19 @@ describe("subscribeEmbeddedPiSession", () => {
 
     handler?.({ type: "message_end", message: assistantMessage });
 
-    expect(onBlockReply).toHaveBeenCalledTimes(1);
-    const payload = onBlockReply.mock.calls[0][0];
-    expect(payload.text).toBe(
-      "_Reasoning:_\n_Because it helps_\n\nFinal answer",
+    expect(onBlockReply).toHaveBeenCalledTimes(2);
+    expect(onBlockReply.mock.calls[0][0].text).toBe(
+      "Reasoning:\n_Because it helps_",
     );
+    expect(onBlockReply.mock.calls[1][0].text).toBe("Final answer");
   });
 
-  it("promotes <think> tags to thinking blocks at write-time", () => {
+  it.each(
+    THINKING_TAG_CASES,
+  )("promotes <%s> tags to thinking blocks at write-time", ({
+    open,
+    close,
+  }) => {
     let handler: ((evt: unknown) => void) | undefined;
     const session: StubSession = {
       subscribe: (fn) => {
@@ -193,17 +200,18 @@ describe("subscribeEmbeddedPiSession", () => {
       content: [
         {
           type: "text",
-          text: "<think>\nBecause it helps\n</think>\n\nFinal answer",
+          text: `${open}\nBecause it helps\n${close}\n\nFinal answer`,
         },
       ],
     } as AssistantMessage;
 
     handler?.({ type: "message_end", message: assistantMessage });
 
-    expect(onBlockReply).toHaveBeenCalledTimes(1);
+    expect(onBlockReply).toHaveBeenCalledTimes(2);
     expect(onBlockReply.mock.calls[0][0].text).toBe(
-      "_Reasoning:_\n_Because it helps_\n\nFinal answer",
+      "Reasoning:\n_Because it helps_",
     );
+    expect(onBlockReply.mock.calls[1][0].text).toBe("Final answer");
 
     expect(assistantMessage.content).toEqual([
       { type: "thinking", thinking: "Because it helps" },
@@ -211,7 +219,12 @@ describe("subscribeEmbeddedPiSession", () => {
     ]);
   });
 
-  it("streams <think> reasoning via onReasoningStream without leaking into final text", () => {
+  it.each(
+    THINKING_TAG_CASES,
+  )("streams <%s> reasoning via onReasoningStream without leaking into final text", ({
+    open,
+    close,
+  }) => {
     let handler: ((evt: unknown) => void) | undefined;
     const session: StubSession = {
       subscribe: (fn) => {
@@ -239,7 +252,7 @@ describe("subscribeEmbeddedPiSession", () => {
       message: { role: "assistant" },
       assistantMessageEvent: {
         type: "text_delta",
-        delta: "<think>\nBecause",
+        delta: `${open}\nBecause`,
       },
     });
 
@@ -248,7 +261,7 @@ describe("subscribeEmbeddedPiSession", () => {
       message: { role: "assistant" },
       assistantMessageEvent: {
         type: "text_delta",
-        delta: " it helps\n</think>\n\nFinal answer",
+        delta: ` it helps\n${close}\n\nFinal answer`,
       },
     });
 
@@ -257,7 +270,7 @@ describe("subscribeEmbeddedPiSession", () => {
       content: [
         {
           type: "text",
-          text: "<think>\nBecause it helps\n</think>\n\nFinal answer",
+          text: `${open}\nBecause it helps\n${close}\n\nFinal answer`,
         },
       ],
     } as AssistantMessage;
@@ -270,12 +283,196 @@ describe("subscribeEmbeddedPiSession", () => {
     const streamTexts = onReasoningStream.mock.calls
       .map((call) => call[0]?.text)
       .filter((value): value is string => typeof value === "string");
-    expect(streamTexts.at(-1)).toBe("Reasoning:\nBecause it helps");
+    expect(streamTexts.at(-1)).toBe("Reasoning:\n_Because it helps_");
 
     expect(assistantMessage.content).toEqual([
       { type: "thinking", thinking: "Because it helps" },
       { type: "text", text: "Final answer" },
     ]);
+  });
+
+  it.each(
+    THINKING_TAG_CASES,
+  )("suppresses <%s> blocks across chunk boundaries", ({ open, close }) => {
+    let handler: ((evt: unknown) => void) | undefined;
+    const session: StubSession = {
+      subscribe: (fn) => {
+        handler = fn;
+        return () => {};
+      },
+    };
+
+    const onBlockReply = vi.fn();
+
+    subscribeEmbeddedPiSession({
+      session: session as unknown as Parameters<
+        typeof subscribeEmbeddedPiSession
+      >[0]["session"],
+      runId: "run",
+      onBlockReply,
+      blockReplyBreak: "text_end",
+      blockReplyChunking: {
+        minChars: 5,
+        maxChars: 50,
+        breakPreference: "newline",
+      },
+    });
+
+    handler?.({ type: "message_start", message: { role: "assistant" } });
+
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: {
+        type: "text_delta",
+        delta: `${open}Reasoning chunk that should not leak`,
+      },
+    });
+
+    expect(onBlockReply).not.toHaveBeenCalled();
+
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: {
+        type: "text_delta",
+        delta: `${close}\n\nFinal answer`,
+      },
+    });
+
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: { type: "text_end" },
+    });
+
+    const payloadTexts = onBlockReply.mock.calls
+      .map((call) => call[0]?.text)
+      .filter((value): value is string => typeof value === "string");
+    expect(payloadTexts.length).toBeGreaterThan(0);
+    for (const text of payloadTexts) {
+      expect(text).not.toContain("Reasoning");
+      expect(text).not.toContain(open);
+    }
+    const combined = payloadTexts.join(" ").replace(/\s+/g, " ").trim();
+    expect(combined).toBe("Final answer");
+  });
+
+  it("keeps assistantTexts to the final answer when block replies are disabled", () => {
+    let handler: ((evt: unknown) => void) | undefined;
+    const session: StubSession = {
+      subscribe: (fn) => {
+        handler = fn;
+        return () => {};
+      },
+    };
+
+    const subscription = subscribeEmbeddedPiSession({
+      session: session as unknown as Parameters<
+        typeof subscribeEmbeddedPiSession
+      >[0]["session"],
+      runId: "run",
+      reasoningMode: "on",
+    });
+
+    handler?.({ type: "message_start", message: { role: "assistant" } });
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: {
+        type: "text_delta",
+        delta: "Final ",
+      },
+    });
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: {
+        type: "text_delta",
+        delta: "answer",
+      },
+    });
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: {
+        type: "text_end",
+      },
+    });
+
+    const assistantMessage = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "Because it helps" },
+        { type: "text", text: "Final answer" },
+      ],
+    } as AssistantMessage;
+
+    handler?.({ type: "message_end", message: assistantMessage });
+
+    expect(subscription.assistantTexts).toEqual(["Final answer"]);
+  });
+
+  it("suppresses partial replies when reasoning is enabled and block replies are disabled", () => {
+    let handler: ((evt: unknown) => void) | undefined;
+    const session: StubSession = {
+      subscribe: (fn) => {
+        handler = fn;
+        return () => {};
+      },
+    };
+
+    const onPartialReply = vi.fn();
+
+    const subscription = subscribeEmbeddedPiSession({
+      session: session as unknown as Parameters<
+        typeof subscribeEmbeddedPiSession
+      >[0]["session"],
+      runId: "run",
+      reasoningMode: "on",
+      onPartialReply,
+    });
+
+    handler?.({ type: "message_start", message: { role: "assistant" } });
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: {
+        type: "text_delta",
+        delta: "Draft ",
+      },
+    });
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: {
+        type: "text_delta",
+        delta: "reply",
+      },
+    });
+
+    expect(onPartialReply).not.toHaveBeenCalled();
+
+    const assistantMessage = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "Because it helps" },
+        { type: "text", text: "Final answer" },
+      ],
+    } as AssistantMessage;
+
+    handler?.({ type: "message_end", message: assistantMessage });
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: {
+        type: "text_end",
+        content: "Draft reply",
+      },
+    });
+
+    expect(onPartialReply).not.toHaveBeenCalled();
+    expect(subscription.assistantTexts).toEqual(["Final answer"]);
   });
 
   it("emits block replies on text_end and does not duplicate on message_end", () => {
@@ -385,6 +582,100 @@ describe("subscribeEmbeddedPiSession", () => {
 
     expect(onBlockReply).toHaveBeenCalledTimes(1);
     expect(subscription.assistantTexts).toEqual(["Hello block"]);
+  });
+
+  it("suppresses message_end block replies when the message tool already sent", () => {
+    let handler: ((evt: unknown) => void) | undefined;
+    const session: StubSession = {
+      subscribe: (fn) => {
+        handler = fn;
+        return () => {};
+      },
+    };
+
+    const onBlockReply = vi.fn();
+
+    subscribeEmbeddedPiSession({
+      session: session as unknown as Parameters<
+        typeof subscribeEmbeddedPiSession
+      >[0]["session"],
+      runId: "run",
+      onBlockReply,
+      blockReplyBreak: "message_end",
+    });
+
+    const messageText = "This is the answer.";
+
+    handler?.({
+      type: "tool_execution_start",
+      toolName: "message",
+      toolCallId: "tool-message-1",
+      args: { action: "send", to: "+1555", message: messageText },
+    });
+
+    handler?.({
+      type: "tool_execution_end",
+      toolName: "message",
+      toolCallId: "tool-message-1",
+      isError: false,
+      result: "ok",
+    });
+
+    const assistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: messageText }],
+    } as AssistantMessage;
+
+    handler?.({ type: "message_end", message: assistantMessage });
+
+    expect(onBlockReply).not.toHaveBeenCalled();
+  });
+
+  it("does not suppress message_end replies when message tool reports error", () => {
+    let handler: ((evt: unknown) => void) | undefined;
+    const session: StubSession = {
+      subscribe: (fn) => {
+        handler = fn;
+        return () => {};
+      },
+    };
+
+    const onBlockReply = vi.fn();
+
+    subscribeEmbeddedPiSession({
+      session: session as unknown as Parameters<
+        typeof subscribeEmbeddedPiSession
+      >[0]["session"],
+      runId: "run",
+      onBlockReply,
+      blockReplyBreak: "message_end",
+    });
+
+    const messageText = "Please retry the send.";
+
+    handler?.({
+      type: "tool_execution_start",
+      toolName: "message",
+      toolCallId: "tool-message-err",
+      args: { action: "send", to: "+1555", message: messageText },
+    });
+
+    handler?.({
+      type: "tool_execution_end",
+      toolName: "message",
+      toolCallId: "tool-message-err",
+      isError: false,
+      result: { details: { status: "error" } },
+    });
+
+    const assistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: messageText }],
+    } as AssistantMessage;
+
+    handler?.({ type: "message_end", message: assistantMessage });
+
+    expect(onBlockReply).toHaveBeenCalledTimes(1);
   });
 
   it("clears block reply state on message_start", () => {
@@ -503,6 +794,37 @@ describe("subscribeEmbeddedPiSession", () => {
     const assistantMessage = {
       role: "assistant",
       content: [{ type: "text", text: "Hello world" }],
+    } as AssistantMessage;
+
+    handler?.({ type: "message_end", message: assistantMessage });
+    handler?.({ type: "message_end", message: assistantMessage });
+
+    expect(subscription.assistantTexts).toEqual(["Hello world"]);
+  });
+
+  it("does not duplicate assistantTexts when message_end repeats with reasoning blocks", () => {
+    let handler: SessionEventHandler | undefined;
+    const session: StubSession = {
+      subscribe: (fn) => {
+        handler = fn;
+        return () => {};
+      },
+    };
+
+    const subscription = subscribeEmbeddedPiSession({
+      session: session as unknown as Parameters<
+        typeof subscribeEmbeddedPiSession
+      >[0]["session"],
+      runId: "run",
+      reasoningMode: "on",
+    });
+
+    const assistantMessage = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "Because" },
+        { type: "text", text: "Hello world" },
+      ],
     } as AssistantMessage;
 
     handler?.({ type: "message_end", message: assistantMessage });
@@ -784,7 +1106,7 @@ describe("subscribeEmbeddedPiSession", () => {
       blockReplyBreak: "message_end",
       blockReplyChunking: {
         minChars: 5,
-        maxChars: 40,
+        maxChars: 25,
         breakPreference: "paragraph",
       },
     });
@@ -836,7 +1158,7 @@ describe("subscribeEmbeddedPiSession", () => {
       blockReplyBreak: "message_end",
       blockReplyChunking: {
         minChars: 5,
-        maxChars: 50,
+        maxChars: 25,
         breakPreference: "paragraph",
       },
     });
@@ -939,7 +1261,7 @@ describe("subscribeEmbeddedPiSession", () => {
       blockReplyBreak: "message_end",
       blockReplyChunking: {
         minChars: 5,
-        maxChars: 40,
+        maxChars: 25,
         breakPreference: "paragraph",
       },
     });
@@ -986,7 +1308,7 @@ describe("subscribeEmbeddedPiSession", () => {
       blockReplyBreak: "message_end",
       blockReplyChunking: {
         minChars: 5,
-        maxChars: 45,
+        maxChars: 30,
         breakPreference: "paragraph",
       },
     });
@@ -1035,7 +1357,7 @@ describe("subscribeEmbeddedPiSession", () => {
       blockReplyBreak: "message_end",
       blockReplyChunking: {
         minChars: 10,
-        maxChars: 50,
+        maxChars: 30,
         breakPreference: "paragraph",
       },
     });
@@ -1058,10 +1380,17 @@ describe("subscribeEmbeddedPiSession", () => {
 
     handler?.({ type: "message_end", message: assistantMessage });
 
-    expect(onBlockReply).toHaveBeenCalledTimes(3);
-    expect(onBlockReply.mock.calls[1][0].text).toBe(
-      "````md\nline1\nline2\n````",
-    );
+    const payloadTexts = onBlockReply.mock.calls
+      .map((call) => call[0]?.text)
+      .filter((value): value is string => typeof value === "string");
+    expect(payloadTexts.length).toBeGreaterThan(0);
+    const combined = payloadTexts.join(" ").replace(/\s+/g, " ").trim();
+    expect(combined).toContain("````md");
+    expect(combined).toContain("line1");
+    expect(combined).toContain("line2");
+    expect(combined).toContain("````");
+    expect(combined).toContain("Intro");
+    expect(combined).toContain("Outro");
   });
 
   it("splits long single-line fenced blocks with reopen/close", () => {
@@ -1420,5 +1749,151 @@ describe("subscribeEmbeddedPiSession", () => {
     });
 
     expect(onToolResult).toHaveBeenCalledTimes(1);
+  });
+
+  it("calls onBlockReplyFlush before tool_execution_start to preserve message boundaries", () => {
+    let handler: SessionEventHandler | undefined;
+    const session: StubSession = {
+      subscribe: (fn) => {
+        handler = fn;
+        return () => {};
+      },
+    };
+
+    const onBlockReplyFlush = vi.fn();
+    const onBlockReply = vi.fn();
+
+    subscribeEmbeddedPiSession({
+      session: session as unknown as Parameters<
+        typeof subscribeEmbeddedPiSession
+      >[0]["session"],
+      runId: "run-flush-test",
+      onBlockReply,
+      onBlockReplyFlush,
+      blockReplyBreak: "text_end",
+    });
+
+    // Simulate text arriving before tool
+    handler?.({
+      type: "message_start",
+      message: { role: "assistant" },
+    });
+
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: {
+        type: "text_delta",
+        delta: "First message before tool.",
+      },
+    });
+
+    expect(onBlockReplyFlush).not.toHaveBeenCalled();
+
+    // Tool execution starts - should trigger flush
+    handler?.({
+      type: "tool_execution_start",
+      toolName: "bash",
+      toolCallId: "tool-flush-1",
+      args: { command: "echo hello" },
+    });
+
+    expect(onBlockReplyFlush).toHaveBeenCalledTimes(1);
+
+    // Another tool - should flush again
+    handler?.({
+      type: "tool_execution_start",
+      toolName: "read",
+      toolCallId: "tool-flush-2",
+      args: { path: "/tmp/test.txt" },
+    });
+
+    expect(onBlockReplyFlush).toHaveBeenCalledTimes(2);
+  });
+
+  it("flushes buffered block chunks before tool execution", () => {
+    let handler: SessionEventHandler | undefined;
+    const session: StubSession = {
+      subscribe: (fn) => {
+        handler = fn;
+        return () => {};
+      },
+    };
+
+    const onBlockReply = vi.fn();
+    const onBlockReplyFlush = vi.fn();
+
+    subscribeEmbeddedPiSession({
+      session: session as unknown as Parameters<
+        typeof subscribeEmbeddedPiSession
+      >[0]["session"],
+      runId: "run-flush-buffer",
+      onBlockReply,
+      onBlockReplyFlush,
+      blockReplyBreak: "text_end",
+      blockReplyChunking: { minChars: 50, maxChars: 200 },
+    });
+
+    handler?.({
+      type: "message_start",
+      message: { role: "assistant" },
+    });
+
+    handler?.({
+      type: "message_update",
+      message: { role: "assistant" },
+      assistantMessageEvent: {
+        type: "text_delta",
+        delta: "Short chunk.",
+      },
+    });
+
+    expect(onBlockReply).not.toHaveBeenCalled();
+
+    handler?.({
+      type: "tool_execution_start",
+      toolName: "bash",
+      toolCallId: "tool-flush-buffer-1",
+      args: { command: "echo flush" },
+    });
+
+    expect(onBlockReply).toHaveBeenCalledTimes(1);
+    expect(onBlockReply.mock.calls[0]?.[0]?.text).toBe("Short chunk.");
+    expect(onBlockReplyFlush).toHaveBeenCalledTimes(1);
+    expect(onBlockReply.mock.invocationCallOrder[0]).toBeLessThan(
+      onBlockReplyFlush.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("does not call onBlockReplyFlush when callback is not provided", () => {
+    let handler: SessionEventHandler | undefined;
+    const session: StubSession = {
+      subscribe: (fn) => {
+        handler = fn;
+        return () => {};
+      },
+    };
+
+    const onBlockReply = vi.fn();
+
+    // No onBlockReplyFlush provided
+    subscribeEmbeddedPiSession({
+      session: session as unknown as Parameters<
+        typeof subscribeEmbeddedPiSession
+      >[0]["session"],
+      runId: "run-no-flush",
+      onBlockReply,
+      blockReplyBreak: "text_end",
+    });
+
+    // This should not throw even without onBlockReplyFlush
+    expect(() => {
+      handler?.({
+        type: "tool_execution_start",
+        toolName: "bash",
+        toolCallId: "tool-no-flush",
+        args: { command: "echo test" },
+      });
+    }).not.toThrow();
   });
 });

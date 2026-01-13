@@ -30,15 +30,19 @@ Use `pnpm` (Node 22+) from the repo root. Keep the working tree clean before tag
 - [ ] `pnpm test` (or `pnpm test:coverage` if you need coverage output)
 - [ ] `pnpm run build` (last sanity check after tests)
 - [ ] `pnpm release:check` (verifies npm pack contents)
+- [ ] (Optional) Installer E2E (Docker, runs `curl -fsSL https://clawd.bot/install.sh | bash`, onboards, then runs real tool calls):
+  - `pnpm test:install:e2e:openai` (requires `OPENAI_API_KEY`)
+  - `pnpm test:install:e2e:anthropic` (requires `ANTHROPIC_API_KEY`)
+  - `pnpm test:install:e2e` (requires both keys; runs both providers)
 - [ ] (Optional) Spot-check the web gateway if your changes affect send/receive paths.
 
 5) **macOS app (Sparkle)**
 - [ ] Build + sign the macOS app, then zip it for distribution.
 - [ ] Generate the Sparkle appcast (HTML notes via [`scripts/make_appcast.sh`](https://github.com/clawdbot/clawdbot/blob/main/scripts/make_appcast.sh)) and update `appcast.xml`.
 - [ ] Keep the app zip (and optional dSYM zip) ready to attach to the GitHub release.
-- [ ] Follow [`docs/mac/release.md`](/platforms/mac/release) for the exact commands and required env vars.
+- [ ] Follow [macOS release](/platforms/mac/release) for the exact commands and required env vars.
   - `APP_BUILD` must be numeric + monotonic (no `-beta`) so Sparkle compares versions correctly.
-  - If notarizing, use the `clawdbot-notary` keychain profile created from App Store Connect API env vars (see [`docs/mac/release.md`](/platforms/mac/release)).
+  - If notarizing, use the `clawdbot-notary` keychain profile created from App Store Connect API env vars (see [macOS release](/platforms/mac/release)).
 
 6) **Publish (npm)**
 - [ ] Confirm git status is clean; commit and push as needed.

@@ -27,7 +27,7 @@ extension OnboardingView {
             Spacer(minLength: 0)
             self.navigationBar
         }
-        .frame(width: self.pageWidth, height: 684)
+        .frame(width: self.pageWidth, height: Self.windowHeight)
         .background(Color(NSColor.windowBackgroundColor))
         .onAppear {
             self.currentPage = 0
@@ -54,6 +54,7 @@ extension OnboardingView {
             self.stopPermissionMonitoring()
             self.stopDiscovery()
             self.stopAuthMonitoring()
+            Task { await self.onboardingWizard.cancelIfRunning() }
         }
         .task {
             await self.refreshPerms()
@@ -171,6 +172,22 @@ extension OnboardingView {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .fill(Color(NSColor.controlBackgroundColor))
                 .shadow(color: .black.opacity(0.06), radius: 8, y: 3))
+    }
+
+    func onboardingGlassCard(
+        spacing: CGFloat = 12,
+        padding: CGFloat = 16,
+        @ViewBuilder _ content: () -> some View) -> some View
+    {
+        let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
+        return VStack(alignment: .leading, spacing: spacing) {
+            content()
+        }
+        .padding(padding)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.clear)
+        .clipShape(shape)
+        .overlay(shape.strokeBorder(Color.white.opacity(0.10), lineWidth: 1))
     }
 
     func featureRow(title: String, subtitle: String, systemImage: String) -> some View {

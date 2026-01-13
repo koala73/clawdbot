@@ -28,7 +28,6 @@ struct DebugSettings: View {
     @State private var tunnelResetInFlight = false
     @State private var tunnelResetStatus: String?
     @State private var pendingKill: DebugActions.PortListener?
-    @AppStorage(attachExistingGatewayOnlyKey) private var attachExistingGatewayOnly: Bool = false
     @AppStorage(debugFileLogEnabledKey) private var diagnosticsFileLogEnabled: Bool = false
     @AppStorage(appLogLevelKey) private var appLogLevelRaw: String = AppLogLevel.default.rawValue
 
@@ -108,7 +107,7 @@ struct DebugSettings: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 GridRow {
-                    self.gridLabel("CLI helper")
+                    self.gridLabel("CLI")
                     let loc = CLIInstaller.installedLocation()
                     Text(loc ?? "missing")
                         .font(.caption.monospaced())
@@ -144,16 +143,6 @@ struct DebugSettings: View {
                             Text(self.gatewayManager.status.label)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    GridRow {
-                        self.gridLabel("Attach only")
-                        Toggle("", isOn: self.$attachExistingGatewayOnly)
-                            .labelsHidden()
-                            .toggleStyle(.checkbox)
-                            .help(
-                                "When enabled in local mode, the mac app will only connect " +
-                                    "to an already-running gateway " +
-                                    "and will not start one itself.")
                     }
                 }
 
@@ -497,6 +486,7 @@ struct DebugSettings: View {
 
                 HStack(spacing: 8) {
                     Button("Restart app") { DebugActions.restartApp() }
+                    Button("Restart onboarding") { DebugActions.restartOnboarding() }
                     Button("Reveal app in Finder") { self.revealApp() }
                     Spacer(minLength: 0)
                 }
@@ -782,7 +772,7 @@ struct DebugSettings: View {
     }
 
     private var canRestartGateway: Bool {
-        self.state.connectionMode == .local && !self.attachExistingGatewayOnly
+        self.state.connectionMode == .local
     }
 
     private func configURL() -> URL {

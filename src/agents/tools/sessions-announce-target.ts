@@ -1,3 +1,7 @@
+import {
+  getChannelPlugin,
+  normalizeChannelId,
+} from "../../channels/plugins/index.js";
 import { callGateway } from "../../gateway/call.js";
 import type { AnnounceTarget } from "./sessions-send-helpers.js";
 import { resolveAnnounceTargetFromKey } from "./sessions-send-helpers.js";
@@ -10,9 +14,13 @@ export async function resolveAnnounceTarget(params: {
   const parsedDisplay = resolveAnnounceTargetFromKey(params.displayKey);
   const fallback = parsed ?? parsedDisplay ?? null;
 
-  // Most providers can derive (provider,to) from the session key directly.
-  // WhatsApp is special: we may need lastAccountId from the session store.
-  if (fallback && fallback.provider !== "whatsapp") return fallback;
+  if (fallback) {
+    const normalized = normalizeChannelId(fallback.channel);
+    const plugin = normalized ? getChannelPlugin(normalized) : null;
+    if (!plugin?.meta?.preferSessionLookupForAnnounceTarget) {
+      return fallback;
+    }
+  }
 
   try {
     const list = (await callGateway({
@@ -27,14 +35,14 @@ export async function resolveAnnounceTarget(params: {
     const match =
       sessions.find((entry) => entry?.key === params.sessionKey) ??
       sessions.find((entry) => entry?.key === params.displayKey);
-    const provider =
-      typeof match?.lastProvider === "string" ? match.lastProvider : undefined;
+    const channel =
+      typeof match?.lastChannel === "string" ? match.lastChannel : undefined;
     const to = typeof match?.lastTo === "string" ? match.lastTo : undefined;
     const accountId =
       typeof match?.lastAccountId === "string"
         ? match.lastAccountId
         : undefined;
-    if (provider && to) return { provider, to, accountId };
+    if (channel && to) return { channel, to, accountId };
   } catch {
     // ignore
   }

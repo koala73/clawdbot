@@ -1,6 +1,6 @@
 ---
 name: discord
-description: Use when you need to control Discord from Clawdbot via the discord tool: send messages, react, post or upload stickers, upload emojis, run polls, manage threads/pins/search, fetch permissions or member/role/channel info, or handle moderation actions in Discord DMs or channels.
+description: Use when you need to control Discord from Clawdbot via the discord tool: send messages, react, post or upload stickers, upload emojis, run polls, manage threads/pins/search, create/edit/delete channels and categories, fetch permissions or member/role/channel info, or handle moderation actions in Discord DMs or channels.
 ---
 
 # Discord Actions
@@ -12,6 +12,7 @@ Use `discord` to manage messages, reactions, threads, polls, and moderation. You
 ## Inputs to collect
 
 - For reactions: `channelId`, `messageId`, and an `emoji`.
+- For fetchMessage: `guildId`, `channelId`, `messageId`, or a `messageLink` like `https://discord.com/channels/<guildId>/<channelId>/<messageId>`.
 - For stickers/polls/sendMessage: a `to` target (`channel:<id>` or `user:<id>`). Optional `content` text.
 - Polls also need a `question` plus 2–10 `answers`.
 - For media: `mediaUrl` with `file:///path` for local files or `https://...` for remote.
@@ -21,6 +22,7 @@ Use `discord` to manage messages, reactions, threads, polls, and moderation. You
 Message context lines include `discord message id` and `channel` fields you can reuse directly.
 
 **Note:** `sendMessage` uses `to: "channel:<id>"` format, not `channelId`. Other actions like `react`, `readMessages`, `editMessage` use `channelId` directly.
+**Note:** `fetchMessage` accepts message IDs or full links like `https://discord.com/channels/<guildId>/<channelId>/<messageId>`.
 
 ## Actions
 
@@ -133,6 +135,7 @@ Use `discord.actions.*` to disable action groups:
 - `emojiUploads`, `stickerUploads`
 - `memberInfo`, `roleInfo`, `channelInfo`, `voiceStatus`, `events`
 - `roles` (role add/remove, default `false`)
+- `channels` (channel/category create/edit/delete/move, default `false`)
 - `moderation` (timeout/kick/ban, default `false`)
 ### Read recent messages
 
@@ -141,6 +144,24 @@ Use `discord.actions.*` to disable action groups:
   "action": "readMessages",
   "channelId": "123",
   "limit": 20
+}
+```
+
+### Fetch a single message
+
+```json
+{
+  "action": "fetchMessage",
+  "guildId": "999",
+  "channelId": "123",
+  "messageId": "456"
+}
+```
+
+```json
+{
+  "action": "fetchMessage",
+  "messageLink": "https://discord.com/channels/999/123/456"
 }
 ```
 
@@ -291,6 +312,90 @@ Use `discord.actions.*` to disable action groups:
 {
   "action": "channelList",
   "guildId": "999"
+}
+```
+
+### Channel management (disabled by default)
+
+Create, edit, delete, and move channels and categories. Enable via `discord.actions.channels: true`.
+
+**Create a text channel:**
+
+```json
+{
+  "action": "channelCreate",
+  "guildId": "999",
+  "name": "general-chat",
+  "type": 0,
+  "parentId": "888",
+  "topic": "General discussion"
+}
+```
+
+- `type`: Discord channel type integer (0 = text, 2 = voice, 4 = category; other values supported)
+- `parentId`: category ID to nest under (optional)
+- `topic`, `position`, `nsfw`: optional
+
+**Create a category:**
+
+```json
+{
+  "action": "categoryCreate",
+  "guildId": "999",
+  "name": "Projects"
+}
+```
+
+**Edit a channel:**
+
+```json
+{
+  "action": "channelEdit",
+  "channelId": "123",
+  "name": "new-name",
+  "topic": "Updated topic"
+}
+```
+
+- Supports `name`, `topic`, `position`, `parentId` (null to remove from category), `nsfw`, `rateLimitPerUser`
+
+**Move a channel:**
+
+```json
+{
+  "action": "channelMove",
+  "guildId": "999",
+  "channelId": "123",
+  "parentId": "888",
+  "position": 2
+}
+```
+
+- `parentId`: target category (null to move to top level)
+
+**Delete a channel:**
+
+```json
+{
+  "action": "channelDelete",
+  "channelId": "123"
+}
+```
+
+**Edit/delete a category:**
+
+```json
+{
+  "action": "categoryEdit",
+  "categoryId": "888",
+  "name": "Renamed Category"
+}
+```
+
+```json
+{
+  "action": "categoryDelete",
+  "categoryId": "888"
 }
 ```
 

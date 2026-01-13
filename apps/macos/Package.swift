@@ -10,7 +10,10 @@ let package = Package(
     ],
     products: [
         .library(name: "ClawdbotIPC", targets: ["ClawdbotIPC"]),
+        .library(name: "ClawdbotDiscovery", targets: ["ClawdbotDiscovery"]),
         .executable(name: "Clawdbot", targets: ["Clawdbot"]),
+        .executable(name: "clawdbot-mac-discovery", targets: ["ClawdbotDiscoveryCLI"]),
+        .executable(name: "clawdbot-mac-wizard", targets: ["ClawdbotWizardCLI"]),
     ],
     dependencies: [
         .package(url: "https://github.com/orchetect/MenuBarExtraAccess", exact: "1.2.2"),
@@ -36,10 +39,20 @@ let package = Package(
             swiftSettings: [
                 .enableUpcomingFeature("StrictConcurrency"),
             ]),
+        .target(
+            name: "ClawdbotDiscovery",
+            dependencies: [
+                .product(name: "ClawdbotKit", package: "ClawdbotKit"),
+            ],
+            path: "Sources/ClawdbotDiscovery",
+            swiftSettings: [
+                .enableUpcomingFeature("StrictConcurrency"),
+            ]),
         .executableTarget(
             name: "Clawdbot",
             dependencies: [
                 "ClawdbotIPC",
+                "ClawdbotDiscovery",
                 "ClawdbotProtocol",
                 .product(name: "ClawdbotKit", package: "ClawdbotKit"),
                 .product(name: "ClawdbotChatUI", package: "ClawdbotKit"),
@@ -61,11 +74,30 @@ let package = Package(
             swiftSettings: [
                 .enableUpcomingFeature("StrictConcurrency"),
             ]),
+        .executableTarget(
+            name: "ClawdbotDiscoveryCLI",
+            dependencies: [
+                "ClawdbotDiscovery",
+            ],
+            path: "Sources/ClawdbotDiscoveryCLI",
+            swiftSettings: [
+                .enableUpcomingFeature("StrictConcurrency"),
+            ]),
+        .executableTarget(
+            name: "ClawdbotWizardCLI",
+            dependencies: [
+                "ClawdbotProtocol",
+            ],
+            path: "Sources/ClawdbotWizardCLI",
+            swiftSettings: [
+                .enableUpcomingFeature("StrictConcurrency"),
+            ]),
         .testTarget(
             name: "ClawdbotIPCTests",
             dependencies: [
                 "ClawdbotIPC",
                 "Clawdbot",
+                "ClawdbotDiscovery",
                 "ClawdbotProtocol",
                 .product(name: "SwabbleKit", package: "swabble"),
             ],

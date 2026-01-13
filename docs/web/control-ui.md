@@ -25,11 +25,12 @@ Auth is supplied during the WebSocket handshake via:
 - `connect.params.auth.token`
 - `connect.params.auth.password`
 The dashboard settings panel lets you store a token; passwords are not persisted.
+The onboarding wizard generates a gateway token by default, so paste it here on first connect.
 
 ## What it can do (today)
 - Chat with the model via Gateway WS (`chat.history`, `chat.send`, `chat.abort`)
 - Stream tool calls + live tool output cards in Chat (agent events)
-- Connections: WhatsApp/Telegram status + QR login + Telegram config (`providers.status`, `web.login.*`, `config.set`)
+- Connections: WhatsApp/Telegram status + QR login + Telegram config (`channels.status`, `web.login.*`, `config.set`)
 - Instances: presence list + refresh (`system-presence`)
 - Sessions: list + per-session thinking/verbose overrides (`sessions.list`, `sessions.patch`)
 - Cron jobs: list/add/run/enable/disable + run history (`cron.*`)
@@ -41,6 +42,27 @@ The dashboard settings panel lets you store a token; passwords are not persisted
 - Debug: status/health/models snapshots + event log + manual RPC calls (`status`, `health`, `models.list`)
 - Logs: live tail of gateway file logs with filter/export (`logs.tail`)
 - Update: run a package/git update + restart (`update.run`) with a restart report
+
+## Model presets (Config tab)
+
+The Config tab includes **Model presets**: one-click inserts to add common model providers and set a default model:
+
+- **MiniMax M2.1 (Anthropic)** → configures MiniMax via `https://api.minimax.io/anthropic` and `anthropic-messages` (see [/providers/minimax](/providers/minimax))
+- **GLM 4.7 (Z.AI)** → adds `ZAI_API_KEY` + sets `zai/glm-4.7` (see [/providers/zai](/providers/zai))
+- **Kimi (Moonshot)** → configures Moonshot + sets `moonshot/kimi-k2-0905-preview` (see [/providers/moonshot](/providers/moonshot))
+
+Notes:
+- Presets **keep existing API keys and per-model params** when present.
+- Use `/model` (see [/tools/slash-commands](/tools/slash-commands)) to switch models from chat without editing config.
+
+## Chat behavior
+
+- `chat.send` is **non-blocking**: it acks immediately with `{ runId, status: "started" }` and the response streams via `chat` events.
+- Re-sending with the same `idempotencyKey` returns `{ status: "in_flight" }` while running, and `{ status: "ok" }` after completion.
+- Stop:
+  - Click **Stop** (calls `chat.abort`)
+  - Type `/stop` (or `stop|esc|abort|wait|exit`) to abort out-of-band
+  - `chat.abort` supports `{ sessionKey }` (no `runId`) to abort all active runs for that session
 
 ## Tailnet access (recommended)
 
@@ -55,10 +77,14 @@ clawdbot gateway --tailscale serve
 Open:
 - `https://<magicdns>/` (or your configured `gateway.controlUi.basePath`)
 
-By default, the gateway trusts Tailscale identity headers in serve mode. You can still set
-`CLAWDBOT_GATEWAY_TOKEN` or `gateway.auth` if you want a shared secret instead.
+By default, Serve requests can authenticate via Tailscale identity headers
+(`tailscale-user-login`) when `gateway.auth.allowTailscale` is `true`. Clawdbot
+only accepts these when the request hits loopback with Tailscale’s
+`x-forwarded-*` headers. Set `gateway.auth.allowTailscale: false` (or force
+`gateway.auth.mode: "password"`) if you want to require a token/password even
+for Serve traffic.
 
-### Bind to tailnet + token (legacy)
+### Bind to tailnet + token
 
 ```bash
 clawdbot gateway --bind tailnet --token "$(openssl rand -hex 32)"

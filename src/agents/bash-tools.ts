@@ -40,27 +40,14 @@ const DEFAULT_PATH =
   process.env.PATH ??
   "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-// NOTE: Using Type.Unsafe with enum instead of Type.Union([Type.Literal(...)])
-// because Claude API on Vertex AI rejects nested anyOf schemas as invalid JSON Schema.
-// Type.Union of literals compiles to { anyOf: [{enum:["a"]}, {enum:["b"]}, ...] }
-// which is valid but not accepted. A flat enum { type: "string", enum: [...] } works.
-const stringEnum = <T extends readonly string[]>(
-  values: T,
-  options?: { description?: string },
-) =>
-  Type.Unsafe<T[number]>({
-    type: "string",
-    enum: values as unknown as string[],
-    ...options,
-  });
-
-export type BashToolDefaults = {
+export type ExecToolDefaults = {
   backgroundMs?: number;
   timeoutSec?: number;
   sandbox?: BashSandboxConfig;
-  elevated?: BashElevatedDefaults;
+  elevated?: ExecElevatedDefaults;
   allowBackground?: boolean;
   scopeKey?: string;
+  cwd?: string;
 };
 
 export type ProcessToolDefaults = {
@@ -75,14 +62,14 @@ export type BashSandboxConfig = {
   env?: Record<string, string>;
 };
 
-export type BashElevatedDefaults = {
+export type ExecElevatedDefaults = {
   enabled: boolean;
   allowed: boolean;
   defaultLevel: "on" | "off";
 };
 
-const bashSchema = Type.Object({
-  command: Type.String({ description: "Bash command to execute" }),
+const execSchema = Type.Object({
+  command: Type.String({ description: "Shell command to execute" }),
   workdir: Type.Optional(
     Type.String({ description: "Working directory (defaults to cwd)" }),
   ),
@@ -107,12 +94,13 @@ const bashSchema = Type.Object({
   ),
 });
 
-export type BashToolDetails =
+export type ExecToolDetails =
   | {
       status: "running";
       sessionId: string;
       pid?: number;
       startedAt: number;
+      cwd?: string;
       tail?: string;
     }
   | {
@@ -120,12 +108,13 @@ export type BashToolDetails =
       exitCode: number | null;
       durationMs: number;
       aggregated: string;
+      cwd?: string;
     };
 
-export function createBashTool(
-  defaults?: BashToolDefaults,
+export function createExecTool(
+  defaults?: ExecToolDefaults,
   // biome-ignore lint/suspicious/noExplicitAny: TypeBox schema type from pi-agent-core uses a different module instance.
-): AgentTool<any, BashToolDetails> {
+): AgentTool<any, ExecToolDetails> {
   const defaultBackgroundMs = clampNumber(
     defaults?.backgroundMs ?? readEnvInt("PI_BASH_YIELD_MS"),
     10_000,
@@ -139,11 +128,11 @@ export function createBashTool(
       : 1800;
 
   return {
-    name: "bash",
-    label: "bash",
+    name: "exec",
+    label: "exec",
     description:
-      "Execute bash with background continuation. Use yieldMs/background to continue later via process tool. For real TTY mode, use the tmux skill.",
-    parameters: bashSchema,
+      "Execute shell commands with background continuation. Use yieldMs/background to continue later via process tool. For real TTY mode, use the tmux skill.",
+    parameters: execSchema,
     execute: async (_toolCallId, args, signal, onUpdate) => {
       const params = args as {
         command: string;
@@ -191,10 +180,31 @@ export function createBashTool(
           : elevatedDefaultOn;
       if (elevatedRequested) {
         if (!elevatedDefaults?.enabled || !elevatedDefaults.allowed) {
-          throw new Error("elevated is not available right now.");
+          const runtime = defaults?.sandbox ? "sandboxed" : "direct";
+          const gates: string[] = [];
+          if (!elevatedDefaults?.enabled) {
+            gates.push(
+              "enabled (tools.elevated.enabled / agents.list[].tools.elevated.enabled)",
+            );
+          } else {
+            gates.push(
+              "allowFrom (tools.elevated.allowFrom.<provider> / agents.list[].tools.elevated.allowFrom.<provider>)",
+            );
+          }
+          throw new Error(
+            [
+              `elevated is not available right now (runtime=${runtime}).`,
+              `Failing gates: ${gates.join(", ")}`,
+              "Fix-it keys:",
+              "- tools.elevated.enabled",
+              "- tools.elevated.allowFrom.<provider>",
+              "- agents.list[].tools.elevated.enabled",
+              "- agents.list[].tools.elevated.allowFrom.<provider>",
+            ].join("\n"),
+          );
         }
         logInfo(
-          `bash: elevated command (${sessionId.slice(0, 8)}) ${truncateMiddle(
+          `exec: elevated command (${sessionId.slice(0, 8)}) ${truncateMiddle(
             params.command,
             120,
           )}`,
@@ -202,7 +212,8 @@ export function createBashTool(
       }
 
       const sandbox = elevatedRequested ? undefined : defaults?.sandbox;
-      const rawWorkdir = params.workdir?.trim() || process.cwd();
+      const rawWorkdir =
+        params.workdir?.trim() || defaults?.cwd || process.cwd();
       let workdir = rawWorkdir;
       let containerWorkdir = sandbox?.containerWorkdir;
       if (sandbox) {
@@ -240,15 +251,17 @@ export function createBashTool(
             {
               cwd: workdir,
               env: process.env,
-              detached: true,
+              detached: process.platform !== "win32",
               stdio: ["pipe", "pipe", "pipe"],
+              windowsHide: true,
             },
           )
         : spawn(shell, [...shellArgs, params.command], {
             cwd: workdir,
             env,
-            detached: true,
+            detached: process.platform !== "win32",
             stdio: ["pipe", "pipe", "pipe"],
+            windowsHide: true,
           });
 
       const session = {
@@ -314,6 +327,7 @@ export function createBashTool(
             sessionId,
             pid: session.pid ?? undefined,
             startedAt,
+            cwd: session.cwd,
             tail: session.tail,
           },
         });
@@ -335,7 +349,7 @@ export function createBashTool(
         }
       });
 
-      return new Promise<AgentToolResult<BashToolDetails>>(
+      return new Promise<AgentToolResult<ExecToolDetails>>(
         (resolve, reject) => {
           const resolveRunning = () => {
             settle(() =>
@@ -354,6 +368,7 @@ export function createBashTool(
                   sessionId,
                   pid: session.pid ?? undefined,
                   startedAt,
+                  cwd: session.cwd,
                   tail: session.tail,
                 },
               }),
@@ -429,12 +444,15 @@ export function createBashTool(
                   exitCode: code ?? 0,
                   durationMs,
                   aggregated,
+                  cwd: session.cwd,
                 },
               }),
             );
           };
 
-          child.once("exit", (code, exitSignal) => {
+          // `exit` can fire before stdio fully flushes (notably on Windows).
+          // `close` waits for streams to close, so aggregated output is complete.
+          child.once("close", (code, exitSignal) => {
             handleExit(code, exitSignal);
           });
 
@@ -450,15 +468,10 @@ export function createBashTool(
   };
 }
 
-export const bashTool = createBashTool();
+export const execTool = createExecTool();
 
 const processSchema = Type.Object({
-  action: stringEnum(
-    ["list", "poll", "log", "write", "kill", "clear", "remove"] as const,
-    {
-      description: "Process action",
-    },
-  ),
+  action: Type.String({ description: "Process action" }),
   sessionId: Type.Optional(
     Type.String({ description: "Session id for actions other than list" }),
   ),
@@ -482,7 +495,7 @@ export function createProcessTool(
   return {
     name: "process",
     label: "process",
-    description: "Manage running bash sessions: list, poll, log, write, kill.",
+    description: "Manage running exec sessions: list, poll, log, write, kill.",
     parameters: processSchema,
     execute: async (_toolCallId, args) => {
       const params = args as {

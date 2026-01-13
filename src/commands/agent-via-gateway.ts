@@ -1,3 +1,4 @@
+import { DEFAULT_CHAT_CHANNEL } from "../channels/registry.js";
 import type { CliDeps } from "../cli/deps.js";
 import { withProgress } from "../cli/progress.js";
 import { loadConfig } from "../config/config.js";
@@ -7,8 +8,13 @@ import {
   resolveStorePath,
 } from "../config/sessions.js";
 import { callGateway, randomIdempotencyKey } from "../gateway/call.js";
+import { normalizeMainKey } from "../routing/session-key.js";
 import type { RuntimeEnv } from "../runtime.js";
-import { normalizeMessageProvider } from "../utils/message-provider.js";
+import {
+  GATEWAY_CLIENT_MODES,
+  GATEWAY_CLIENT_NAMES,
+  normalizeMessageChannel,
+} from "../utils/message-channel.js";
 import { agentCommand } from "./agent.js";
 
 type AgentGatewayResult = {
@@ -36,7 +42,7 @@ export type AgentCliOpts = {
   json?: boolean;
   timeout?: string;
   deliver?: boolean;
-  provider?: string;
+  channel?: string;
   bestEffortDeliver?: boolean;
   lane?: string;
   runId?: string;
@@ -51,7 +57,7 @@ function resolveGatewaySessionKey(opts: {
 }): string | undefined {
   const sessionCfg = opts.cfg.session;
   const scope = sessionCfg?.scope ?? "per-sender";
-  const mainKey = sessionCfg?.mainKey ?? "main";
+  const mainKey = normalizeMainKey(sessionCfg?.mainKey);
   const storePath = resolveStorePath(sessionCfg?.store);
   const store = loadSessionStore(storePath);
 
@@ -123,7 +129,7 @@ export async function agentViaGatewayCommand(
     sessionId: opts.sessionId,
   });
 
-  const provider = normalizeMessageProvider(opts.provider) ?? "whatsapp";
+  const channel = normalizeMessageChannel(opts.channel) ?? DEFAULT_CHAT_CHANNEL;
   const idempotencyKey = opts.runId?.trim() || randomIdempotencyKey();
 
   const response = await withProgress(
@@ -142,7 +148,7 @@ export async function agentViaGatewayCommand(
           sessionKey,
           thinking: opts.thinking,
           deliver: Boolean(opts.deliver),
-          provider,
+          channel,
           timeout: timeoutSeconds,
           lane: opts.lane,
           extraSystemPrompt: opts.extraSystemPrompt,
@@ -150,8 +156,8 @@ export async function agentViaGatewayCommand(
         },
         expectFinal: true,
         timeoutMs: gatewayTimeoutMs,
-        clientName: "cli",
-        mode: "cli",
+        clientName: GATEWAY_CLIENT_NAMES.CLI,
+        mode: GATEWAY_CLIENT_MODES.CLI,
       }),
   );
 

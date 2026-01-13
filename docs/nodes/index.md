@@ -8,13 +8,17 @@ read_when:
 
 # Nodes
 
-A **node** is a companion device (iOS/Android today) that connects to the Gateway over the **Bridge** and exposes a command surface (e.g. `canvas.*`, `camera.*`, `system.*`) via `node.invoke`.
+A **node** is a companion device (iOS/Android today) that connects to the Gateway over the **Bridge** and exposes a command surface (e.g. `canvas.*`, `camera.*`, `system.*`) via `node.invoke`. Bridge protocol details: [Bridge protocol](/gateway/bridge-protocol).
 
 macOS can also run in **node mode**: the menubar app connects to the Gateway’s bridge and exposes its local canvas/camera commands as a node (so `clawdbot nodes …` works against this Mac).
 
+Notes:
+- Nodes are **peripherals**, not gateways. They don’t run the gateway daemon.
+- Telegram/WhatsApp/etc. messages land on the **gateway**, not on nodes.
+
 ## Pairing + status
 
-Pairing is gateway-owned and approval-based. See [`docs/gateway/pairing.md`](/gateway/pairing) for the full flow.
+Pairing is gateway-owned and approval-based. See [Gateway pairing](/gateway/pairing) for the full flow.
 
 Quick CLI:
 
@@ -51,11 +55,36 @@ clawdbot nodes canvas snapshot --node <idOrNameOrIp> --format png
 clawdbot nodes canvas snapshot --node <idOrNameOrIp> --format jpg --max-width 1200 --quality 0.9
 ```
 
+### Canvas controls
+
+```bash
+clawdbot nodes canvas present --node <idOrNameOrIp> --target https://example.com
+clawdbot nodes canvas hide --node <idOrNameOrIp>
+clawdbot nodes canvas navigate https://example.com --node <idOrNameOrIp>
+clawdbot nodes canvas eval --node <idOrNameOrIp> --js "document.title"
+```
+
+Notes:
+- `canvas present` accepts URLs or local file paths (`--target`), plus optional `--x/--y/--width/--height` for positioning.
+- `canvas eval` accepts inline JS (`--js`) or a positional arg.
+
+### A2UI (Canvas)
+
+```bash
+clawdbot nodes canvas a2ui push --node <idOrNameOrIp> --text "Hello"
+clawdbot nodes canvas a2ui push --node <idOrNameOrIp> --jsonl ./payload.jsonl
+clawdbot nodes canvas a2ui reset --node <idOrNameOrIp>
+```
+
+Notes:
+- Only A2UI v0.8 JSONL is supported (v0.9/createSurface is rejected).
+
 ## Photos + videos (node camera)
 
 Photos (`jpg`):
 
 ```bash
+clawdbot nodes camera list --node <idOrNameOrIp>
 clawdbot nodes camera snap --node <idOrNameOrIp>            # default: both facings (2 MEDIA lines)
 clawdbot nodes camera snap --node <idOrNameOrIp> --facing front
 ```
@@ -86,6 +115,7 @@ Notes:
 - Android will show the system screen-capture prompt before recording.
 - Screen recordings are clamped to `<= 60s`.
 - `--no-audio` disables microphone capture (supported on iOS/Android; macOS uses system capture audio).
+- Use `--screen <index>` to select a display when multiple screens are available.
 
 ## Location (nodes)
 
@@ -131,6 +161,8 @@ clawdbot nodes notify --node <idOrNameOrIp> --title "Ping" --body "Gateway ready
 Notes:
 - `system.run` returns stdout/stderr/exit code in the payload.
 - `system.notify` respects notification permission state on the macOS app.
+- `system.run` supports `--cwd`, `--env KEY=VAL`, `--command-timeout`, and `--needs-screen-recording`.
+- `system.notify` supports `--priority <passive|active|timeSensitive>` and `--delivery <system|overlay|auto>`.
 
 ## Permissions map
 

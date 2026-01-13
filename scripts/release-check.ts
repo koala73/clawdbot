@@ -5,7 +5,12 @@ import { execSync } from "node:child_process";
 type PackFile = { path: string };
 type PackResult = { files?: PackFile[] };
 
-const requiredPaths = ["dist/discord/send.js", "dist/hooks/gmail.js"];
+const requiredPaths = [
+  "dist/discord/send.js",
+  "dist/hooks/gmail.js",
+  "dist/msteams/send.js",
+  "dist/whatsapp/normalize.js",
+];
 const forbiddenPrefixes = ["dist/Clawdbot.app/"];
 
 function runPackDry(): PackResult[] {

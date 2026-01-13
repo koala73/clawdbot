@@ -1,3 +1,4 @@
+import { listChannelDocks } from "../channels/dock.js";
 import type { ClawdbotConfig } from "../config/types.js";
 
 export type CommandScope = "text" | "native" | "both";
@@ -137,6 +138,19 @@ export const CHAT_COMMANDS: ChatCommandDefinition[] = (() => {
       textAlias: "/status",
     }),
     defineChatCommand({
+      key: "whoami",
+      nativeName: "whoami",
+      description: "Show your sender id.",
+      textAlias: "/whoami",
+    }),
+    defineChatCommand({
+      key: "config",
+      nativeName: "config",
+      description: "Show or set config values.",
+      textAlias: "/config",
+      acceptsArgs: true,
+    }),
+    defineChatCommand({
       key: "debug",
       nativeName: "debug",
       description: "Set runtime debug overrides.",
@@ -237,9 +251,17 @@ export const CHAT_COMMANDS: ChatCommandDefinition[] = (() => {
       textAlias: "/queue",
       acceptsArgs: true,
     }),
+    defineChatCommand({
+      key: "bash",
+      description: "Run host shell commands (host-only).",
+      textAlias: "/bash",
+      scope: "text",
+      acceptsArgs: true,
+    }),
   ];
 
   registerAlias(commands, "status", "/usage");
+  registerAlias(commands, "whoami", "/id");
   registerAlias(commands, "think", "/thinking", "/t");
   registerAlias(commands, "verbose", "/v");
   registerAlias(commands, "reasoning", "/reason");
@@ -249,8 +271,18 @@ export const CHAT_COMMANDS: ChatCommandDefinition[] = (() => {
   assertCommandRegistry(commands);
   return commands;
 })();
+let cachedNativeCommandSurfaces: Set<string> | null = null;
 
-const NATIVE_COMMAND_SURFACES = new Set(["discord", "slack", "telegram"]);
+const getNativeCommandSurfaces = (): Set<string> => {
+  if (!cachedNativeCommandSurfaces) {
+    cachedNativeCommandSurfaces = new Set(
+      listChannelDocks()
+        .filter((dock) => dock.capabilities.nativeCommands)
+        .map((dock) => dock.id),
+    );
+  }
+  return cachedNativeCommandSurfaces;
+};
 
 const TEXT_ALIAS_MAP: Map<string, TextAliasSpec> = (() => {
   const map = new Map<string, TextAliasSpec>();
@@ -283,6 +315,22 @@ export function listChatCommands(): ChatCommandDefinition[] {
   return [...CHAT_COMMANDS];
 }
 
+export function isCommandEnabled(
+  cfg: ClawdbotConfig,
+  commandKey: string,
+): boolean {
+  if (commandKey === "config") return cfg.commands?.config === true;
+  if (commandKey === "debug") return cfg.commands?.debug === true;
+  if (commandKey === "bash") return cfg.commands?.bash === true;
+  return true;
+}
+
+export function listChatCommandsForConfig(
+  cfg: ClawdbotConfig,
+): ChatCommandDefinition[] {
+  return CHAT_COMMANDS.filter((command) => isCommandEnabled(cfg, command.key));
+}
+
 export function listNativeCommandSpecs(): NativeCommandSpec[] {
   return CHAT_COMMANDS.filter(
     (command) => command.scope !== "text" && command.nativeName,
@@ -291,6 +339,18 @@ export function listNativeCommandSpecs(): NativeCommandSpec[] {
     description: command.description,
     acceptsArgs: Boolean(command.acceptsArgs),
   }));
+}
+
+export function listNativeCommandSpecsForConfig(
+  cfg: ClawdbotConfig,
+): NativeCommandSpec[] {
+  return listChatCommandsForConfig(cfg)
+    .filter((command) => command.scope !== "text" && command.nativeName)
+    .map((command) => ({
+      name: command.nativeName ?? command.key,
+      description: command.description,
+      acceptsArgs: Boolean(command.acceptsArgs),
+    }));
 }
 
 export function findCommandByNativeName(
@@ -309,74 +369,136 @@ export function buildCommandText(commandName: string, args?: string): string {
   return trimmedArgs ? `/${commandName} ${trimmedArgs}` : `/${commandName}`;
 }
 
-export function normalizeCommandBody(raw: string): string {
+export type CommandNormalizeOptions = {
+  botUsername?: string;
+};
+
+export function normalizeCommandBody(
+  raw: string,
+  options?: CommandNormalizeOptions,
+): string {
   const trimmed = raw.trim();
   if (!trimmed.startsWith("/")) return trimmed;
 
-  const colonMatch = trimmed.match(/^\/([^\s:]+)\s*:(.*)$/);
+  const newline = trimmed.indexOf("\n");
+  const singleLine =
+    newline === -1 ? trimmed : trimmed.slice(0, newline).trim();
+
+  const colonMatch = singleLine.match(/^\/([^\s:]+)\s*:(.*)$/);
   const normalized = colonMatch
     ? (() => {
         const [, command, rest] = colonMatch;
         const normalizedRest = rest.trimStart();
         return normalizedRest ? `/${command} ${normalizedRest}` : `/${command}`;
       })()
-    : trimmed;
+    : singleLine;
 
-  const lowered = normalized.toLowerCase();
+  const normalizedBotUsername = options?.botUsername?.trim().toLowerCase();
+  const mentionMatch = normalizedBotUsername
+    ? normalized.match(/^\/([^\s@]+)@([^\s]+)(.*)$/)
+    : null;
+  const commandBody =
+    mentionMatch && mentionMatch[2].toLowerCase() === normalizedBotUsername
+      ? `/${mentionMatch[1]}${mentionMatch[3] ?? ""}`
+      : normalized;
+
+  const lowered = commandBody.toLowerCase();
   const exact = TEXT_ALIAS_MAP.get(lowered);
   if (exact) return exact.canonical;
 
-  const tokenMatch = normalized.match(/^\/([^\s]+)(?:\s+([\s\S]+))?$/);
-  if (!tokenMatch) return normalized;
+  const tokenMatch = commandBody.match(/^\/([^\s]+)(?:\s+([\s\S]+))?$/);
+  if (!tokenMatch) return commandBody;
   const [, token, rest] = tokenMatch;
   const tokenKey = `/${token.toLowerCase()}`;
   const tokenSpec = TEXT_ALIAS_MAP.get(tokenKey);
-  if (!tokenSpec) return normalized;
-  if (rest && !tokenSpec.acceptsArgs) return normalized;
+  if (!tokenSpec) return commandBody;
+  if (rest && !tokenSpec.acceptsArgs) return commandBody;
   const normalizedRest = rest?.trimStart();
   return normalizedRest
     ? `${tokenSpec.canonical} ${normalizedRest}`
     : tokenSpec.canonical;
 }
 
-export function getCommandDetection(): { exact: Set<string>; regex: RegExp } {
+export function isCommandMessage(raw: string): boolean {
+  const trimmed = normalizeCommandBody(raw);
+  return trimmed.startsWith("/");
+}
+
+export function getCommandDetection(_cfg?: ClawdbotConfig): {
+  exact: Set<string>;
+  regex: RegExp;
+} {
   if (cachedDetection) return cachedDetection;
   const exact = new Set<string>();
   const patterns: string[] = [];
-  for (const command of CHAT_COMMANDS) {
-    for (const alias of command.textAliases) {
+  for (const cmd of CHAT_COMMANDS) {
+    for (const alias of cmd.textAliases) {
       const normalized = alias.trim().toLowerCase();
       if (!normalized) continue;
       exact.add(normalized);
       const escaped = escapeRegExp(normalized);
       if (!escaped) continue;
-      if (command.acceptsArgs) {
+      if (cmd.acceptsArgs) {
         patterns.push(`${escaped}(?:\\s+.+|\\s*:\\s*.*)?`);
       } else {
         patterns.push(`${escaped}(?:\\s*:\\s*)?`);
       }
     }
   }
-  const regex = patterns.length
-    ? new RegExp(`^(?:${patterns.join("|")})$`, "i")
-    : /$^/;
-  cachedDetection = { exact, regex };
+  cachedDetection = {
+    exact,
+    regex: patterns.length
+      ? new RegExp(`^(?:${patterns.join("|")})$`, "i")
+      : /$^/,
+  };
   return cachedDetection;
 }
 
-export function supportsNativeCommands(surface?: string): boolean {
+export function maybeResolveTextAlias(raw: string, cfg?: ClawdbotConfig) {
+  const trimmed = normalizeCommandBody(raw).trim();
+  if (!trimmed.startsWith("/")) return null;
+  const detection = getCommandDetection(cfg);
+  const normalized = trimmed.toLowerCase();
+  if (detection.exact.has(normalized)) return normalized;
+  if (!detection.regex.test(normalized)) return null;
+  const tokenMatch = normalized.match(/^\/([^\s:]+)(?:\s|$)/);
+  if (!tokenMatch) return null;
+  const tokenKey = `/${tokenMatch[1]}`;
+  return TEXT_ALIAS_MAP.has(tokenKey) ? tokenKey : null;
+}
+
+export function resolveTextCommand(
+  raw: string,
+  cfg?: ClawdbotConfig,
+): {
+  command: ChatCommandDefinition;
+  args?: string;
+} | null {
+  const trimmed = normalizeCommandBody(raw).trim();
+  const alias = maybeResolveTextAlias(trimmed, cfg);
+  if (!alias) return null;
+  const spec = TEXT_ALIAS_MAP.get(alias);
+  if (!spec) return null;
+  const command = CHAT_COMMANDS.find(
+    (entry) => `/${entry.key}` === spec.canonical,
+  );
+  if (!command) return null;
+  if (!spec.acceptsArgs) return { command };
+  const args = trimmed.slice(alias.length).trim();
+  return { command, args: args || undefined };
+}
+
+export function isNativeCommandSurface(surface?: string): boolean {
   if (!surface) return false;
-  return NATIVE_COMMAND_SURFACES.has(surface.toLowerCase());
+  return getNativeCommandSurfaces().has(surface.toLowerCase());
 }
 
 export function shouldHandleTextCommands(params: {
   cfg: ClawdbotConfig;
-  surface?: string;
+  surface: string;
   commandSource?: "text" | "native";
 }): boolean {
-  const { cfg, surface, commandSource } = params;
-  const textEnabled = cfg.commands?.text !== false;
-  if (commandSource === "native") return true;
-  if (textEnabled) return true;
-  return !supportsNativeCommands(surface);
+  if (params.commandSource === "native") return true;
+  if (params.cfg.commands?.text !== false) return true;
+  return !isNativeCommandSurface(params.surface);
 }

@@ -16,10 +16,14 @@ The design goal is to keep all network discovery/advertising in the **Node Gatew
 
 ## Terms
 
-- **Gateway**: the single, long-running gateway process that owns state (sessions, pairing, node registry) and runs providers.
+- **Gateway**: the single, long-running gateway process that owns state (sessions, pairing, node registry) and runs channels.
 - **Gateway WS (loopback)**: the existing gateway WebSocket control endpoint on `127.0.0.1:18789`.
 - **Bridge (direct transport)**: a LAN/tailnet-facing endpoint owned by the gateway that allows authenticated clients/nodes to call a scoped subset of gateway methods. The bridge exists so the gateway can remain loopback-only.
 - **SSH transport (fallback)**: remote control by forwarding `127.0.0.1:18789` over SSH.
+
+Protocol details:
+- [Gateway protocol](/gateway/protocol)
+- [Bridge protocol](/gateway/bridge-protocol)
 
 ## Why we keep both “direct” and SSH
 
@@ -42,7 +46,7 @@ Target direction:
 - The **gateway** advertises its bridge via Bonjour.
 - Clients browse and show a “pick a gateway” list, then store the chosen endpoint.
 
-Troubleshooting and beacon details: [`docs/bonjour.md`](/gateway/bonjour).
+Troubleshooting and beacon details: [Bonjour](/gateway/bonjour).
 
 #### Service beacon details
 
@@ -77,7 +81,7 @@ If the gateway can detect it is running under Tailscale, it publishes `tailnetDn
 
 When there is no direct route (or direct is disabled), clients can always connect via SSH by forwarding the loopback gateway port.
 
-See [`docs/remote.md`](/gateway/remote).
+See [Remote access](/gateway/remote).
 
 ## Transport selection (client policy)
 
@@ -92,7 +96,7 @@ Recommended client behavior:
 
 The gateway is the source of truth for node/client admission.
 
-- Pairing requests are created/approved/rejected in the gateway (see [`docs/gateway/pairing.md`](/gateway/pairing)).
+- Pairing requests are created/approved/rejected in the gateway (see [Gateway pairing](/gateway/pairing)).
 - The bridge enforces:
   - auth (token / keypair)
   - scopes/ACLs (bridge is not a raw proxy to every gateway method)

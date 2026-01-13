@@ -1,5 +1,5 @@
+import ClawdbotDiscovery
 import Testing
-@testable import Clawdbot
 
 @Suite
 @MainActor
@@ -61,6 +61,24 @@ struct GatewayDiscoveryModelTests {
             tailnetDns: nil,
             displayName: nil,
             serviceName: "studio-bridge",
+            local: local))
+    }
+
+    @Test func serviceNameDoesNotFalsePositiveOnSubstringHostToken() {
+        let local = GatewayDiscoveryModel.LocalIdentity(
+            hostTokens: ["steipete"],
+            displayTokens: [])
+        #expect(!GatewayDiscoveryModel.isLocalGateway(
+            lanHost: nil,
+            tailnetDns: nil,
+            displayName: nil,
+            serviceName: "steipetacstudio (Clawdbot)",
+            local: local))
+        #expect(GatewayDiscoveryModel.isLocalGateway(
+            lanHost: nil,
+            tailnetDns: nil,
+            displayName: nil,
+            serviceName: "steipete (Clawdbot)",
             local: local))
     }
 

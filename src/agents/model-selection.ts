@@ -1,12 +1,19 @@
 import type { ClawdbotConfig } from "../config/config.js";
 import type { ModelCatalogEntry } from "./model-catalog.js";
+import { normalizeGoogleModelId } from "./models-config.providers.js";
 
 export type ModelRef = {
   provider: string;
   model: string;
 };
 
-export type ThinkLevel = "off" | "minimal" | "low" | "medium" | "high";
+export type ThinkLevel =
+  | "off"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh";
 
 export type ModelAliasIndex = {
   byAlias: Map<string, { alias: string; ref: ModelRef }>;
@@ -24,7 +31,18 @@ export function modelKey(provider: string, model: string) {
 export function normalizeProviderId(provider: string): string {
   const normalized = provider.trim().toLowerCase();
   if (normalized === "z.ai" || normalized === "z-ai") return "zai";
+  if (normalized === "opencode-zen") return "opencode";
   return normalized;
+}
+
+export function isCliProvider(provider: string, cfg?: ClawdbotConfig): boolean {
+  const normalized = normalizeProviderId(provider);
+  if (normalized === "claude-cli") return true;
+  if (normalized === "codex-cli") return true;
+  const backends = cfg?.agents?.defaults?.cliBackends ?? {};
+  return Object.keys(backends).some(
+    (key) => normalizeProviderId(key) === normalized,
+  );
 }
 
 function normalizeAnthropicModelId(model: string): string {
@@ -36,6 +54,12 @@ function normalizeAnthropicModelId(model: string): string {
   return trimmed;
 }
 
+function normalizeProviderModelId(provider: string, model: string): string {
+  if (provider === "anthropic") return normalizeAnthropicModelId(model);
+  if (provider === "google") return normalizeGoogleModelId(model);
+  return model;
+}
+
 export function parseModelRef(
   raw: string,
   defaultProvider: string,
@@ -45,16 +69,14 @@ export function parseModelRef(
   const slash = trimmed.indexOf("/");
   if (slash === -1) {
     const provider = normalizeProviderId(defaultProvider);
-    const model =
-      provider === "anthropic" ? normalizeAnthropicModelId(trimmed) : trimmed;
+    const model = normalizeProviderModelId(provider, trimmed);
     return { provider, model };
   }
   const providerRaw = trimmed.slice(0, slash).trim();
   const provider = normalizeProviderId(providerRaw);
   const model = trimmed.slice(slash + 1).trim();
   if (!provider || !model) return null;
-  const normalizedModel =
-    provider === "anthropic" ? normalizeAnthropicModelId(model) : model;
+  const normalizedModel = normalizeProviderModelId(provider, model);
   return { provider, model: normalizedModel };
 }
 
@@ -168,11 +190,22 @@ export function buildAllowedModelSet(params: {
   }
 
   const allowedKeys = new Set<string>();
+  const configuredProviders = (params.cfg.models?.providers ?? {}) as Record<
+    string,
+    unknown
+  >;
   for (const raw of rawAllowlist) {
     const parsed = parseModelRef(String(raw), params.defaultProvider);
     if (!parsed) continue;
     const key = modelKey(parsed.provider, parsed.model);
-    if (catalogKeys.has(key)) {
+    const providerKey = normalizeProviderId(parsed.provider);
+    if (isCliProvider(parsed.provider, params.cfg)) {
+      allowedKeys.add(key);
+    } else if (catalogKeys.has(key)) {
+      allowedKeys.add(key);
+    } else if (configuredProviders[providerKey] != null) {
+      // Explicitly configured providers should be allowlist-able even when
+      // they don't exist in the curated model catalog.
       allowedKeys.add(key);
     }
   }
@@ -185,7 +218,7 @@ export function buildAllowedModelSet(params: {
     allowedKeys.has(modelKey(entry.provider, entry.id)),
   );
 
-  if (allowedCatalog.length === 0) {
+  if (allowedCatalog.length === 0 && allowedKeys.size === 0) {
     if (defaultKey) catalogKeys.add(defaultKey);
     return {
       allowAny: true,
@@ -195,6 +228,76 @@ export function buildAllowedModelSet(params: {
   }
 
   return { allowAny: false, allowedCatalog, allowedKeys };
+}
+
+export type ModelRefStatus = {
+  key: string;
+  inCatalog: boolean;
+  allowAny: boolean;
+  allowed: boolean;
+};
+
+export function getModelRefStatus(params: {
+  cfg: ClawdbotConfig;
+  catalog: ModelCatalogEntry[];
+  ref: ModelRef;
+  defaultProvider: string;
+  defaultModel?: string;
+}): ModelRefStatus {
+  const allowed = buildAllowedModelSet({
+    cfg: params.cfg,
+    catalog: params.catalog,
+    defaultProvider: params.defaultProvider,
+    defaultModel: params.defaultModel,
+  });
+  const key = modelKey(params.ref.provider, params.ref.model);
+  return {
+    key,
+    inCatalog: params.catalog.some(
+      (entry) => modelKey(entry.provider, entry.id) === key,
+    ),
+    allowAny: allowed.allowAny,
+    allowed: allowed.allowAny || allowed.allowedKeys.has(key),
+  };
+}
+
+export function resolveAllowedModelRef(params: {
+  cfg: ClawdbotConfig;
+  catalog: ModelCatalogEntry[];
+  raw: string;
+  defaultProvider: string;
+  defaultModel?: string;
+}):
+  | { ref: ModelRef; key: string }
+  | {
+      error: string;
+    } {
+  const trimmed = params.raw.trim();
+  if (!trimmed) return { error: "invalid model: empty" };
+
+  const aliasIndex = buildModelAliasIndex({
+    cfg: params.cfg,
+    defaultProvider: params.defaultProvider,
+  });
+  const resolved = resolveModelRefFromString({
+    raw: trimmed,
+    defaultProvider: params.defaultProvider,
+    aliasIndex,
+  });
+  if (!resolved) return { error: `invalid model: ${trimmed}` };
+
+  const status = getModelRefStatus({
+    cfg: params.cfg,
+    catalog: params.catalog,
+    ref: resolved.ref,
+    defaultProvider: params.defaultProvider,
+    defaultModel: params.defaultModel,
+  });
+  if (!status.allowed) {
+    return { error: `model not allowed: ${status.key}` };
+  }
+
+  return { ref: resolved.ref, key: status.key };
 }
 
 export function resolveThinkingDefault(params: {

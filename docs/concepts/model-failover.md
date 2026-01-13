@@ -46,7 +46,7 @@ When a provider has multiple profiles, Clawdbot chooses an order like this:
 If no explicit order is configured, Clawdbot uses a round‑robin order:
 - **Primary key:** profile type (**OAuth before API keys**).
 - **Secondary key:** `usageStats.lastUsed` (oldest first, within each type).
-- **Cooldown profiles** are moved to the end, ordered by soonest cooldown expiry.
+- **Cooldown/disabled profiles** are moved to the end, ordered by soonest expiry.
 
 ### Why OAuth can “look lost”
 
@@ -58,6 +58,8 @@ If you have both an OAuth profile and an API key profile for the same provider, 
 
 When a profile fails due to auth/rate‑limit errors (or a timeout that looks
 like rate limiting), Clawdbot marks it in cooldown and moves to the next profile.
+Format/invalid‑request errors (for example Cloud Code Assist tool call ID
+validation failures) are treated as failover‑worthy and use the same cooldowns.
 
 Cooldowns use exponential backoff:
 - 1 minute
@@ -79,17 +81,43 @@ State is stored in `auth-profiles.json` under `usageStats`:
 }
 ```
 
+## Billing disables
+
+Billing/credit failures (for example “insufficient credits” / “credit balance too low”) are treated as failover‑worthy, but they’re usually not transient. Instead of a short cooldown, Clawdbot marks the profile as **disabled** (with a longer backoff) and rotates to the next profile/provider.
+
+State is stored in `auth-profiles.json`:
+
+```json
+{
+  "usageStats": {
+    "provider:profile": {
+      "disabledUntil": 1736178000000,
+      "disabledReason": "billing"
+    }
+  }
+}
+```
+
+Defaults:
+- Billing backoff starts at **5 hours**, doubles per billing failure, and caps at **24 hours**.
+- Backoff counters reset if the profile hasn’t failed for **24 hours** (configurable).
+
 ## Model fallback
 
 If all profiles for a provider fail, Clawdbot moves to the next model in
 `agents.defaults.model.fallbacks`. This applies to auth failures, rate limits, and
-timeouts that exhausted profile rotation.
+timeouts that exhausted profile rotation (other errors do not advance fallback).
+
+When a run starts with a model override (hooks or CLI), fallbacks still end at
+`agents.defaults.model.primary` after trying any configured fallbacks.
 
 ## Related config
 
-See [`docs/configuration.md`](/gateway/configuration) for:
+See [Gateway configuration](/gateway/configuration) for:
 - `auth.profiles` / `auth.order`
+- `auth.cooldowns.billingBackoffHours` / `auth.cooldowns.billingBackoffHoursByProvider`
+- `auth.cooldowns.billingMaxHours` / `auth.cooldowns.failureWindowHours`
 - `agents.defaults.model.primary` / `agents.defaults.model.fallbacks`
 - `agents.defaults.imageModel` routing
 
-See [`docs/models.md`](/concepts/models) for the broader model selection and fallback overview.
+See [Models](/concepts/models) for the broader model selection and fallback overview.

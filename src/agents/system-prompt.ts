@@ -1,17 +1,24 @@
-import type { ThinkLevel } from "../auto-reply/thinking.js";
+import type { ReasoningLevel, ThinkLevel } from "../auto-reply/thinking.js";
+import { SILENT_REPLY_TOKEN } from "../auto-reply/tokens.js";
+import { CHANNEL_IDS } from "../channels/registry.js";
 import type { EmbeddedContextFile } from "./pi-embedded-helpers.js";
+
+const MESSAGE_CHANNEL_OPTIONS = CHANNEL_IDS.join("|");
 
 export function buildAgentSystemPrompt(params: {
   workspaceDir: string;
   defaultThinkLevel?: ThinkLevel;
+  reasoningLevel?: ReasoningLevel;
   extraSystemPrompt?: string;
   ownerNumbers?: string[];
   reasoningTagHint?: boolean;
   toolNames?: string[];
+  toolSummaries?: Record<string, string>;
   modelAliasLines?: string[];
   userTimezone?: string;
   userTime?: string;
   contextFiles?: EmbeddedContextFile[];
+  skillsPrompt?: string;
   heartbeatPrompt?: string;
   runtimeInfo?: {
     host?: string;
@@ -19,6 +26,8 @@ export function buildAgentSystemPrompt(params: {
     arch?: string;
     node?: string;
     model?: string;
+    channel?: string;
+    capabilities?: string[];
   };
   sandboxInfo?: {
     enabled: boolean;
@@ -27,22 +36,32 @@ export function buildAgentSystemPrompt(params: {
     agentWorkspaceMount?: string;
     browserControlUrl?: string;
     browserNoVncUrl?: string;
+    hostBrowserAllowed?: boolean;
+    allowedControlUrls?: string[];
+    allowedControlHosts?: string[];
+    allowedControlPorts?: number[];
+    elevated?: {
+      allowed: boolean;
+      defaultLevel: "on" | "off";
+    };
   };
 }) {
-  const toolSummaries: Record<string, string> = {
+  const coreToolSummaries: Record<string, string> = {
     read: "Read file contents",
     write: "Create or overwrite files",
     edit: "Make precise edits to files",
+    apply_patch: "Apply multi-file patches",
     grep: "Search file contents for patterns",
     find: "Find files by glob pattern",
     ls: "List directory contents",
-    bash: "Run shell commands",
-    process: "Manage background bash sessions",
-    whatsapp_login: "Generate and wait for WhatsApp QR login",
+    exec: "Run shell commands",
+    process: "Manage background exec sessions",
+    // Channel docking: add login tools here when a channel needs interactive linking.
     browser: "Control web browser",
     canvas: "Present/eval/snapshot the Canvas",
     nodes: "List/describe/notify/camera/screen on paired nodes",
-    cron: "Manage cron jobs and wake events",
+    cron: "Manage cron jobs and wake events (use for reminders)",
+    message: "Send messages and channel actions",
     gateway:
       "Restart, apply config, or run updates on the running Clawdbot process",
     agents_list: "List agent ids allowed for sessions_spawn",
@@ -50,56 +69,74 @@ export function buildAgentSystemPrompt(params: {
     sessions_history: "Fetch history for another session/sub-agent",
     sessions_send: "Send a message to another session/sub-agent",
     sessions_spawn: "Spawn a sub-agent session",
+    session_status:
+      "Show a /status-equivalent status card (usage/cost + Reasoning/Verbose/Elevated); optional per-session model override",
     image: "Analyze an image with the configured image model",
-    discord: "Send Discord reactions/messages and manage threads",
-    slack: "Send Slack messages and manage channels",
-    telegram: "Send Telegram reactions",
-    whatsapp: "Send WhatsApp reactions",
   };
 
   const toolOrder = [
     "read",
     "write",
     "edit",
+    "apply_patch",
     "grep",
     "find",
     "ls",
-    "bash",
+    "exec",
     "process",
-    "whatsapp_login",
     "browser",
     "canvas",
     "nodes",
     "cron",
+    "message",
     "gateway",
     "agents_list",
     "sessions_list",
     "sessions_history",
     "sessions_send",
+    "session_status",
     "image",
-    "discord",
-    "slack",
-    "telegram",
-    "whatsapp",
   ];
 
-  const normalizedTools = (params.toolNames ?? [])
-    .map((tool) => tool.trim().toLowerCase())
-    .filter(Boolean);
+  const rawToolNames = (params.toolNames ?? []).map((tool) => tool.trim());
+  const canonicalToolNames = rawToolNames.filter(Boolean);
+  const canonicalByNormalized = new Map<string, string>();
+  for (const name of canonicalToolNames) {
+    const normalized = name.toLowerCase();
+    if (!canonicalByNormalized.has(normalized)) {
+      canonicalByNormalized.set(normalized, name);
+    }
+  }
+  const resolveToolName = (normalized: string) =>
+    canonicalByNormalized.get(normalized) ?? normalized;
+
+  const normalizedTools = canonicalToolNames.map((tool) => tool.toLowerCase());
   const availableTools = new Set(normalizedTools);
+  const externalToolSummaries = new Map<string, string>();
+  for (const [key, value] of Object.entries(params.toolSummaries ?? {})) {
+    const normalized = key.trim().toLowerCase();
+    if (!normalized || !value?.trim()) continue;
+    externalToolSummaries.set(normalized, value.trim());
+  }
   const extraTools = Array.from(
     new Set(normalizedTools.filter((tool) => !toolOrder.includes(tool))),
   );
   const enabledTools = toolOrder.filter((tool) => availableTools.has(tool));
   const toolLines = enabledTools.map((tool) => {
-    const summary = toolSummaries[tool];
-    return summary ? `- ${tool}: ${summary}` : `- ${tool}`;
+    const summary = coreToolSummaries[tool] ?? externalToolSummaries.get(tool);
+    const name = resolveToolName(tool);
+    return summary ? `- ${name}: ${summary}` : `- ${name}`;
   });
   for (const tool of extraTools.sort()) {
-    toolLines.push(`- ${tool}`);
+    const summary = coreToolSummaries[tool] ?? externalToolSummaries.get(tool);
+    const name = resolveToolName(tool);
+    toolLines.push(summary ? `- ${name}: ${summary}` : `- ${name}`);
   }
 
   const hasGateway = availableTools.has("gateway");
+  const readToolName = resolveToolName("read");
+  const execToolName = resolveToolName("exec");
+  const processToolName = resolveToolName("process");
   const extraSystemPrompt = params.extraSystemPrompt?.trim();
   const ownerNumbers = (params.ownerNumbers ?? [])
     .map((value) => value.trim())
@@ -120,19 +157,47 @@ export function buildAgentSystemPrompt(params: {
         "<final>Hey there! What would you like to do next?</final>",
       ].join(" ")
     : undefined;
+  const reasoningLevel = params.reasoningLevel ?? "off";
   const userTimezone = params.userTimezone?.trim();
   const userTime = params.userTime?.trim();
+  const skillsPrompt = params.skillsPrompt?.trim();
   const heartbeatPrompt = params.heartbeatPrompt?.trim();
   const heartbeatPromptLine = heartbeatPrompt
     ? `Heartbeat prompt: ${heartbeatPrompt}`
     : "Heartbeat prompt: (configured)";
   const runtimeInfo = params.runtimeInfo;
+  const runtimeChannel = runtimeInfo?.channel?.trim().toLowerCase();
+  const runtimeCapabilities = (runtimeInfo?.capabilities ?? [])
+    .map((cap) => String(cap).trim())
+    .filter(Boolean);
+  const runtimeCapabilitiesLower = new Set(
+    runtimeCapabilities.map((cap) => cap.toLowerCase()),
+  );
+  const inlineButtonsEnabled = runtimeCapabilitiesLower.has("inlinebuttons");
+  const skillsLines = skillsPrompt ? [skillsPrompt, ""] : [];
+  const skillsSection = skillsPrompt
+    ? [
+        "## Skills",
+        `Skills provide task-specific instructions. Use \`${readToolName}\` to load the SKILL.md at the location listed for that skill.`,
+        ...skillsLines,
+        "",
+      ]
+    : [];
+  const memorySection =
+    availableTools.has("memory_search") || availableTools.has("memory_get")
+      ? [
+          "## Memory Recall",
+          "Before answering anything about prior work, decisions, dates, people, preferences, or todos: run memory_search on MEMORY.md + memory/*.md; then use memory_get to pull only the needed lines. If low confidence after search, say you checked.",
+          "",
+        ]
+      : [];
 
   const lines = [
     "You are a personal assistant running inside Clawdbot.",
     "",
     "## Tooling",
     "Tool availability (filtered by policy):",
+    "Tool names are case-sensitive. Call tools exactly as listed.",
     toolLines.length > 0
       ? toolLines.join("\n")
       : [
@@ -140,13 +205,13 @@ export function buildAgentSystemPrompt(params: {
           "- grep: search file contents for patterns",
           "- find: find files by glob pattern",
           "- ls: list directory contents",
-          "- bash: run shell commands (supports background via yieldMs/background)",
-          "- process: manage background bash sessions",
-          "- whatsapp_login: generate a WhatsApp QR code and wait for linking",
+          "- apply_patch: apply multi-file patches",
+          `- ${execToolName}: run shell commands (supports background via yieldMs/background)`,
+          `- ${processToolName}: manage background exec sessions`,
           "- browser: control clawd's dedicated browser",
           "- canvas: present/eval/snapshot the Canvas",
           "- nodes: list/describe/notify/camera/screen on paired nodes",
-          "- cron: manage cron jobs and wake events",
+          "- cron: manage cron jobs and wake events (use for reminders)",
           "- sessions_list: list sessions",
           "- sessions_history: fetch session history",
           "- sessions_send: send to another session",
@@ -154,9 +219,8 @@ export function buildAgentSystemPrompt(params: {
     "TOOLS.md does not control tool availability; it is user guidance for how to use external tools.",
     "If a task is more complex or takes longer, spawn a sub-agent. It will do the work for you and ping you when it's done. You can always check up on it.",
     "",
-    "## Skills",
-    `Skills provide task-specific instructions. Use \`read\` to load from ${params.workspaceDir}/skills/<name>/SKILL.md when needed.`,
-    "",
+    ...skillsSection,
+    ...memorySection,
     hasGateway ? "## Clawdbot Self-Update" : "",
     hasGateway
       ? [
@@ -185,8 +249,9 @@ export function buildAgentSystemPrompt(params: {
     params.sandboxInfo?.enabled ? "## Sandbox" : "",
     params.sandboxInfo?.enabled
       ? [
-          "Tool execution is isolated in a Docker sandbox.",
+          "You are running in a sandboxed runtime (tools execute in Docker).",
           "Some tools may be unavailable due to sandbox policy.",
+          "Sub-agents stay sandboxed (no elevated/host access). Need outside-sandbox read/write? Don't spawn; ask first.",
           params.sandboxInfo.workspaceDir
             ? `Sandbox workspace: ${params.sandboxInfo.workspaceDir}`
             : "",
@@ -202,6 +267,40 @@ export function buildAgentSystemPrompt(params: {
             : "",
           params.sandboxInfo.browserNoVncUrl
             ? `Sandbox browser observer (noVNC): ${params.sandboxInfo.browserNoVncUrl}`
+            : "",
+          params.sandboxInfo.hostBrowserAllowed === true
+            ? "Host browser control: allowed."
+            : params.sandboxInfo.hostBrowserAllowed === false
+              ? "Host browser control: blocked."
+              : "",
+          params.sandboxInfo.allowedControlUrls?.length
+            ? `Browser control URL allowlist: ${params.sandboxInfo.allowedControlUrls.join(
+                ", ",
+              )}`
+            : "",
+          params.sandboxInfo.allowedControlHosts?.length
+            ? `Browser control host allowlist: ${params.sandboxInfo.allowedControlHosts.join(
+                ", ",
+              )}`
+            : "",
+          params.sandboxInfo.allowedControlPorts?.length
+            ? `Browser control port allowlist: ${params.sandboxInfo.allowedControlPorts.join(
+                ", ",
+              )}`
+            : "",
+          params.sandboxInfo.elevated?.allowed
+            ? "Elevated exec is available for this session."
+            : "",
+          params.sandboxInfo.elevated?.allowed
+            ? "User can toggle with /elevated on|off."
+            : "",
+          params.sandboxInfo.elevated?.allowed
+            ? "You may also send /elevated on|off when needed."
+            : "",
+          params.sandboxInfo.elevated?.allowed
+            ? `Current elevated level: ${
+                params.sandboxInfo.elevated.defaultLevel
+              } (on runs exec on host; off runs in sandbox).`
             : "",
         ]
           .filter(Boolean)
@@ -223,12 +322,28 @@ export function buildAgentSystemPrompt(params: {
     "- [[reply_to_current]] replies to the triggering message.",
     "- [[reply_to:<id>]] replies to a specific message id when you have it.",
     "Whitespace inside the tag is allowed (e.g. [[ reply_to_current ]] / [[ reply_to: 123 ]]).",
-    "Tags are stripped before sending; support depends on the current provider config.",
+    "Tags are stripped before sending; support depends on the current channel config.",
     "",
     "## Messaging",
-    "- Reply in current session → automatically routes to the source provider (Signal, Telegram, etc.)",
+    "- Reply in current session → automatically routes to the source channel (Signal, Telegram, etc.)",
     "- Cross-session messaging → use sessions_send(sessionKey, message)",
-    "- Never use bash/curl for provider messaging; Clawdbot handles all routing internally.",
+    "- Never use exec/curl for provider messaging; Clawdbot handles all routing internally.",
+    availableTools.has("message")
+      ? [
+          "",
+          "### message tool",
+          "- Use `message` for proactive sends + channel actions (polls, reactions, etc.).",
+          "- For `action=send`, include `to` and `message`.",
+          `- If multiple channels are configured, pass \`channel\` (${MESSAGE_CHANNEL_OPTIONS}).`,
+          inlineButtonsEnabled
+            ? "- Inline buttons supported. Use `action=send` with `buttons=[[{text,callback_data}]]` (callback_data routes back as a user message)."
+            : runtimeChannel
+              ? `- Inline buttons not enabled for ${runtimeChannel}. If you need them, ask to add "inlineButtons" to ${runtimeChannel}.capabilities or ${runtimeChannel}.accounts.<id>.capabilities.`
+              : "",
+        ]
+          .filter(Boolean)
+          .join("\n")
+      : "",
     "",
   ];
 
@@ -253,6 +368,18 @@ export function buildAgentSystemPrompt(params: {
   }
 
   lines.push(
+    "## Silent Replies",
+    `When you have nothing to say, respond with ONLY: ${SILENT_REPLY_TOKEN}`,
+    "",
+    "⚠️ Rules:",
+    "- It must be your ENTIRE message — nothing else",
+    `- Never append it to an actual response (never include "${SILENT_REPLY_TOKEN}" in real replies)`,
+    "- Never wrap it in markdown or code blocks",
+    "",
+    `❌ Wrong: "Here's help... ${SILENT_REPLY_TOKEN}"`,
+    `❌ Wrong: "${SILENT_REPLY_TOKEN}"`,
+    `✅ Right: ${SILENT_REPLY_TOKEN}`,
+    "",
     "## Heartbeats",
     heartbeatPromptLine,
     "If you receive a heartbeat poll (a user message matching the heartbeat prompt above), and there is nothing that needs attention, reply exactly:",
@@ -270,10 +397,19 @@ export function buildAgentSystemPrompt(params: {
           : "",
       runtimeInfo?.node ? `node=${runtimeInfo.node}` : "",
       runtimeInfo?.model ? `model=${runtimeInfo.model}` : "",
+      runtimeChannel ? `channel=${runtimeChannel}` : "",
+      runtimeChannel
+        ? `capabilities=${
+            runtimeCapabilities.length > 0
+              ? runtimeCapabilities.join(",")
+              : "none"
+          }`
+        : "",
       `thinking=${params.defaultThinkLevel ?? "off"}`,
     ]
       .filter(Boolean)
       .join(" | ")}`,
+    `Reasoning: ${reasoningLevel} (hidden unless on/stream). Toggle /reasoning; /status shows Reasoning when enabled.`,
   );
 
   return lines.filter(Boolean).join("\n");

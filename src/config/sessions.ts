@@ -6,11 +6,13 @@ import path from "node:path";
 import type { Skill } from "@mariozechner/pi-coding-agent";
 import JSON5 from "json5";
 import type { MsgContext } from "../auto-reply/templating.js";
+import type { ChannelId } from "../channels/plugins/types.js";
+import { CHANNEL_IDS } from "../channels/registry.js";
 import {
   buildAgentMainSessionKey,
   DEFAULT_AGENT_ID,
-  DEFAULT_MAIN_KEY,
   normalizeAgentId,
+  normalizeMainKey,
   resolveAgentIdFromSessionKey,
 } from "../routing/session-key.js";
 import { normalizeE164 } from "../utils.js";
@@ -19,6 +21,7 @@ import {
   isCacheEnabled,
   resolveCacheTtlMs,
 } from "./cache-utils.js";
+import { loadConfig } from "./config.js";
 import { resolveStateDir } from "./paths.js";
 
 // ============================================================================
@@ -62,15 +65,9 @@ export function clearSessionStoreCacheForTest(): void {
 
 export type SessionScope = "per-sender" | "global";
 
-const GROUP_SURFACES = new Set([
-  "whatsapp",
-  "telegram",
-  "discord",
-  "signal",
-  "imessage",
-  "webchat",
-  "slack",
-]);
+export type SessionChannelId = ChannelId | "webchat";
+
+const GROUP_SURFACES = new Set<string>([...CHANNEL_IDS, "webchat"]);
 
 export type SessionChatType = "direct" | "group" | "room";
 
@@ -112,30 +109,40 @@ export type SessionEntry = {
   model?: string;
   contextTokens?: number;
   compactionCount?: number;
+  memoryFlushAt?: number;
+  memoryFlushCompactionCount?: number;
+  cliSessionIds?: Record<string, string>;
   claudeCliSessionId?: string;
   label?: string;
   displayName?: string;
-  provider?: string;
+  channel?: string;
   subject?: string;
   room?: string;
   space?: string;
-  lastProvider?:
-    | "whatsapp"
-    | "telegram"
-    | "discord"
-    | "slack"
-    | "signal"
-    | "imessage"
-    | "webchat";
+  lastChannel?: SessionChannelId;
   lastTo?: string;
   lastAccountId?: string;
   skillsSnapshot?: SessionSkillSnapshot;
 };
 
+export function mergeSessionEntry(
+  existing: SessionEntry | undefined,
+  patch: Partial<SessionEntry>,
+): SessionEntry {
+  const sessionId =
+    patch.sessionId ?? existing?.sessionId ?? crypto.randomUUID();
+  const updatedAt = Math.max(
+    existing?.updatedAt ?? 0,
+    patch.updatedAt ?? 0,
+    Date.now(),
+  );
+  if (!existing) return { ...patch, sessionId, updatedAt };
+  return { ...existing, ...patch, sessionId, updatedAt };
+}
 export type GroupKeyResolution = {
   key: string;
   legacyKey?: string;
-  provider?: string;
+  channel?: string;
   id?: string;
   chatType?: SessionChatType;
 };
@@ -227,9 +234,12 @@ export function resolveMainSessionKey(cfg?: {
     agents[0]?.id ??
     DEFAULT_AGENT_ID;
   const agentId = normalizeAgentId(defaultAgentId);
-  const mainKey =
-    (cfg?.session?.mainKey ?? DEFAULT_MAIN_KEY).trim() || DEFAULT_MAIN_KEY;
+  const mainKey = normalizeMainKey(cfg?.session?.mainKey);
   return buildAgentMainSessionKey({ agentId, mainKey });
+}
+
+export function resolveMainSessionKeyFromConfig(): string {
+  return resolveMainSessionKey(loadConfig());
 }
 
 export { resolveAgentIdFromSessionKey };
@@ -238,10 +248,35 @@ export function resolveAgentMainSessionKey(params: {
   cfg?: { session?: { mainKey?: string } };
   agentId: string;
 }): string {
-  const mainKey =
-    (params.cfg?.session?.mainKey ?? DEFAULT_MAIN_KEY).trim() ||
-    DEFAULT_MAIN_KEY;
+  const mainKey = normalizeMainKey(params.cfg?.session?.mainKey);
   return buildAgentMainSessionKey({ agentId: params.agentId, mainKey });
+}
+
+export function canonicalizeMainSessionAlias(params: {
+  cfg?: { session?: { scope?: SessionScope; mainKey?: string } };
+  agentId: string;
+  sessionKey: string;
+}): string {
+  const raw = params.sessionKey.trim();
+  if (!raw) return raw;
+
+  const agentId = normalizeAgentId(params.agentId);
+  const mainKey = normalizeMainKey(params.cfg?.session?.mainKey);
+  const agentMainSessionKey = buildAgentMainSessionKey({ agentId, mainKey });
+  const agentMainAliasKey = buildAgentMainSessionKey({
+    agentId,
+    mainKey: "main",
+  });
+
+  const isMainAlias =
+    raw === "main" ||
+    raw === mainKey ||
+    raw === agentMainSessionKey ||
+    raw === agentMainAliasKey;
+
+  if (params.cfg?.session?.scope === "global" && isMainAlias) return "global";
+  if (isMainAlias) return agentMainSessionKey;
+  return raw;
 }
 
 function normalizeGroupLabel(raw?: string) {
@@ -383,7 +418,7 @@ export function resolveGroupSessionKey(
   return {
     key,
     legacyKey,
-    provider: resolvedProvider,
+    channel: resolvedProvider,
     id: id || raw || from,
     chatType: resolvedKind === "channel" ? "room" : "group",
   };
@@ -419,6 +454,23 @@ export function loadSessionStore(
     // ignore missing/invalid store; we'll recreate it
   }
 
+  // Best-effort migration: message provider → channel naming.
+  for (const entry of Object.values(store)) {
+    if (!entry || typeof entry !== "object") continue;
+    const rec = entry as unknown as Record<string, unknown>;
+    if (typeof rec.channel !== "string" && typeof rec.provider === "string") {
+      rec.channel = rec.provider;
+      delete rec.provider;
+    }
+    if (
+      typeof rec.lastChannel !== "string" &&
+      typeof rec.lastProvider === "string"
+    ) {
+      rec.lastChannel = rec.lastProvider;
+      delete rec.lastProvider;
+    }
+  }
+
   // Cache the result if caching is enabled
   if (isSessionStoreCacheEnabled()) {
     SESSION_STORE_CACHE.set(storePath, {
@@ -432,15 +484,32 @@ export function loadSessionStore(
   return store;
 }
 
-export async function saveSessionStore(
+async function saveSessionStoreUnlocked(
   storePath: string,
   store: Record<string, SessionEntry>,
-) {
+): Promise<void> {
   // Invalidate cache on write to ensure consistency
   invalidateSessionStoreCache(storePath);
 
   await fs.promises.mkdir(path.dirname(storePath), { recursive: true });
   const json = JSON.stringify(store, null, 2);
+
+  // Windows: avoid atomic rename swaps (can be flaky under concurrent access).
+  // We serialize writers via the session-store lock instead.
+  if (process.platform === "win32") {
+    try {
+      await fs.promises.writeFile(storePath, json, "utf-8");
+    } catch (err) {
+      const code =
+        err && typeof err === "object" && "code" in err
+          ? String((err as { code?: unknown }).code)
+          : null;
+      if (code === "ENOENT") return;
+      throw err;
+    }
+    return;
+  }
+
   const tmp = `${storePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
   try {
     await fs.promises.writeFile(tmp, json, "utf-8");
@@ -474,51 +543,134 @@ export async function saveSessionStore(
   }
 }
 
+export async function saveSessionStore(
+  storePath: string,
+  store: Record<string, SessionEntry>,
+): Promise<void> {
+  await withSessionStoreLock(storePath, async () => {
+    await saveSessionStoreUnlocked(storePath, store);
+  });
+}
+
+type SessionStoreLockOptions = {
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+  staleMs?: number;
+};
+
+async function withSessionStoreLock<T>(
+  storePath: string,
+  fn: () => Promise<T>,
+  opts: SessionStoreLockOptions = {},
+): Promise<T> {
+  const timeoutMs = opts.timeoutMs ?? 10_000;
+  const pollIntervalMs = opts.pollIntervalMs ?? 25;
+  const staleMs = opts.staleMs ?? 30_000;
+  const lockPath = `${storePath}.lock`;
+  const startedAt = Date.now();
+
+  await fs.promises.mkdir(path.dirname(storePath), { recursive: true });
+
+  while (true) {
+    try {
+      const handle = await fs.promises.open(lockPath, "wx");
+      try {
+        await handle.writeFile(
+          JSON.stringify({ pid: process.pid, startedAt: Date.now() }),
+          "utf-8",
+        );
+      } catch {
+        // best-effort
+      }
+      await handle.close();
+      break;
+    } catch (err) {
+      const code =
+        err && typeof err === "object" && "code" in err
+          ? String((err as { code?: unknown }).code)
+          : null;
+      if (code === "ENOENT") {
+        // Store directory may be deleted/recreated in tests while writes are in-flight.
+        // Best-effort: recreate the parent dir and retry until timeout.
+        await fs.promises
+          .mkdir(path.dirname(storePath), { recursive: true })
+          .catch(() => undefined);
+        await new Promise((r) => setTimeout(r, pollIntervalMs));
+        continue;
+      }
+      if (code !== "EEXIST") throw err;
+
+      const now = Date.now();
+      if (now - startedAt > timeoutMs) {
+        throw new Error(`timeout acquiring session store lock: ${lockPath}`);
+      }
+
+      // Best-effort stale lock eviction (e.g. crashed process).
+      try {
+        const st = await fs.promises.stat(lockPath);
+        const ageMs = now - st.mtimeMs;
+        if (ageMs > staleMs) {
+          await fs.promises.unlink(lockPath);
+          continue;
+        }
+      } catch {
+        // ignore
+      }
+
+      await new Promise((r) => setTimeout(r, pollIntervalMs));
+    }
+  }
+
+  try {
+    return await fn();
+  } finally {
+    await fs.promises.unlink(lockPath).catch(() => undefined);
+  }
+}
+
+export async function updateSessionStoreEntry(params: {
+  storePath: string;
+  sessionKey: string;
+  update: (entry: SessionEntry) => Promise<Partial<SessionEntry> | null>;
+}): Promise<SessionEntry | null> {
+  const { storePath, sessionKey, update } = params;
+  return await withSessionStoreLock(storePath, async () => {
+    const store = loadSessionStore(storePath);
+    const existing = store[sessionKey];
+    if (!existing) return null;
+    const patch = await update(existing);
+    if (!patch) return existing;
+    const next = mergeSessionEntry(existing, patch);
+    store[sessionKey] = next;
+    await saveSessionStoreUnlocked(storePath, store);
+    return next;
+  });
+}
+
 export async function updateLastRoute(params: {
   storePath: string;
   sessionKey: string;
-  provider: SessionEntry["lastProvider"];
+  channel: SessionEntry["lastChannel"];
   to?: string;
   accountId?: string;
 }) {
-  const { storePath, sessionKey, provider, to, accountId } = params;
-  const store = loadSessionStore(storePath);
-  const existing = store[sessionKey];
-  const now = Date.now();
-  const next: SessionEntry = {
-    sessionId: existing?.sessionId ?? crypto.randomUUID(),
-    updatedAt: Math.max(existing?.updatedAt ?? 0, now),
-    sessionFile: existing?.sessionFile,
-    systemSent: existing?.systemSent,
-    abortedLastRun: existing?.abortedLastRun,
-    thinkingLevel: existing?.thinkingLevel,
-    verboseLevel: existing?.verboseLevel,
-    providerOverride: existing?.providerOverride,
-    modelOverride: existing?.modelOverride,
-    sendPolicy: existing?.sendPolicy,
-    queueMode: existing?.queueMode,
-    inputTokens: existing?.inputTokens,
-    outputTokens: existing?.outputTokens,
-    totalTokens: existing?.totalTokens,
-    modelProvider: existing?.modelProvider,
-    model: existing?.model,
-    contextTokens: existing?.contextTokens,
-    displayName: existing?.displayName,
-    chatType: existing?.chatType,
-    provider: existing?.provider,
-    subject: existing?.subject,
-    room: existing?.room,
-    space: existing?.space,
-    skillsSnapshot: existing?.skillsSnapshot,
-    lastProvider: provider,
-    lastTo: to?.trim() ? to.trim() : undefined,
-    lastAccountId: accountId?.trim()
-      ? accountId.trim()
-      : existing?.lastAccountId,
-  };
-  store[sessionKey] = next;
-  await saveSessionStore(storePath, store);
-  return next;
+  const { storePath, sessionKey, channel, to, accountId } = params;
+  return await withSessionStoreLock(storePath, async () => {
+    const store = loadSessionStore(storePath);
+    const existing = store[sessionKey];
+    const now = Date.now();
+    const next = mergeSessionEntry(existing, {
+      updatedAt: Math.max(existing?.updatedAt ?? 0, now),
+      lastChannel: channel,
+      lastTo: to?.trim() ? to.trim() : undefined,
+      lastAccountId: accountId?.trim()
+        ? accountId.trim()
+        : existing?.lastAccountId,
+    });
+    store[sessionKey] = next;
+    await saveSessionStoreUnlocked(storePath, store);
+    return next;
+  });
 }
 
 // Decide which session bucket to use (per-sender vs global).
@@ -543,8 +695,7 @@ export function resolveSessionKey(
   if (explicit) return explicit;
   const raw = deriveSessionKey(scope, ctx);
   if (scope === "global") return raw;
-  const canonicalMainKey =
-    (mainKey ?? DEFAULT_MAIN_KEY).trim() || DEFAULT_MAIN_KEY;
+  const canonicalMainKey = normalizeMainKey(mainKey);
   const canonical = buildAgentMainSessionKey({
     agentId: DEFAULT_AGENT_ID,
     mainKey: canonicalMainKey,

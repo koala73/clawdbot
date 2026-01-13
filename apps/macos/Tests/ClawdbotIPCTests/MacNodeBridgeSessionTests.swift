@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import Clawdbot
 
@@ -16,4 +17,3 @@ struct MacNodeBridgeSessionTests {
         }
     }
 }
-

@@ -1,6 +1,9 @@
 import type { SlashCommand } from "@mariozechner/pi-tui";
+import {
+  formatThinkingLevels,
+  listThinkingLevels,
+} from "../auto-reply/thinking.js";
 
-const THINK_LEVELS = ["off", "minimal", "low", "medium", "high"];
 const VERBOSE_LEVELS = ["on", "off"];
 const REASONING_LEVELS = ["on", "off"];
 const ELEVATED_LEVELS = ["on", "off"];
@@ -10,6 +13,11 @@ const TOGGLE = ["on", "off"];
 export type ParsedCommand = {
   name: string;
   args: string;
+};
+
+export type SlashCommandOptions = {
+  provider?: string;
+  model?: string;
 };
 
 const COMMAND_ALIASES: Record<string, string> = {
@@ -27,7 +35,10 @@ export function parseCommand(input: string): ParsedCommand {
   };
 }
 
-export function getSlashCommands(): SlashCommand[] {
+export function getSlashCommands(
+  options: SlashCommandOptions = {},
+): SlashCommand[] {
+  const thinkLevels = listThinkingLevels(options.provider, options.model);
   return [
     { name: "help", description: "Show slash command help" },
     { name: "status", description: "Show gateway status summary" },
@@ -44,9 +55,9 @@ export function getSlashCommands(): SlashCommand[] {
       name: "think",
       description: "Set thinking level",
       getArgumentCompletions: (prefix) =>
-        THINK_LEVELS.filter((v) => v.startsWith(prefix.toLowerCase())).map(
-          (value) => ({ value, label: value }),
-        ),
+        thinkLevels
+          .filter((v) => v.startsWith(prefix.toLowerCase()))
+          .map((value) => ({ value, label: value })),
     },
     {
       name: "verbose",
@@ -96,14 +107,6 @@ export function getSlashCommands(): SlashCommand[] {
           (value) => ({ value, label: value }),
         ),
     },
-    {
-      name: "deliver",
-      description: "Toggle delivery of assistant replies",
-      getArgumentCompletions: (prefix) =>
-        TOGGLE.filter((v) => v.startsWith(prefix.toLowerCase())).map(
-          (value) => ({ value, label: value }),
-        ),
-    },
     { name: "abort", description: "Abort active run" },
     { name: "new", description: "Reset the session" },
     { name: "reset", description: "Reset the session" },
@@ -113,7 +116,12 @@ export function getSlashCommands(): SlashCommand[] {
   ];
 }
 
-export function helpText(): string {
+export function helpText(options: SlashCommandOptions = {}): string {
+  const thinkLevels = formatThinkingLevels(
+    options.provider,
+    options.model,
+    "|",
+  );
   return [
     "Slash commands:",
     "/help",
@@ -121,14 +129,13 @@ export function helpText(): string {
     "/agent <id> (or /agents)",
     "/session <key> (or /sessions)",
     "/model <provider/model> (or /models)",
-    "/think <off|minimal|low|medium|high>",
+    `/think <${thinkLevels}>`,
     "/verbose <on|off>",
     "/reasoning <on|off>",
     "/cost <on|off>",
     "/elevated <on|off>",
     "/elev <on|off>",
     "/activation <mention|always>",
-    "/deliver <on|off>",
     "/new or /reset",
     "/abort",
     "/settings",

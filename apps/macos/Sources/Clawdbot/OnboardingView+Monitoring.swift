@@ -33,7 +33,7 @@ extension OnboardingView {
         if shouldMonitor, !self.monitoringDiscovery {
             self.monitoringDiscovery = true
             Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 550_000_000)
+                try? await Task.sleep(nanoseconds: 150_000_000)
                 guard self.monitoringDiscovery else { return }
                 self.gatewayDiscovery.start()
                 await self.refreshLocalGatewayProbe()
@@ -95,7 +95,7 @@ extension OnboardingView {
         self.installingCLI = true
         defer { installingCLI = false }
         await CLIInstaller.install { message in
-            await MainActor.run { self.cliStatus = message }
+            self.cliStatus = message
         }
         self.refreshCLIStatus()
     }

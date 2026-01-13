@@ -1,4 +1,5 @@
 import type { ClawdbotConfig } from "../../config/config.js";
+import { normalizeMainKey } from "../../routing/session-key.js";
 
 export type SessionKind = "main" | "group" | "cron" | "hook" | "node" | "other";
 
@@ -8,7 +9,7 @@ function normalizeKey(value?: string) {
 }
 
 export function resolveMainSessionAlias(cfg: ClawdbotConfig) {
-  const mainKey = normalizeKey(cfg.session?.mainKey) ?? "main";
+  const mainKey = normalizeMainKey(cfg.session?.mainKey);
   const scope = cfg.session?.scope ?? "per-sender";
   const alias = scope === "global" ? "global" : mainKey;
   return { mainKey, alias, scope };
@@ -55,11 +56,11 @@ export function classifySessionKind(params: {
   return "other";
 }
 
-export function deriveProvider(params: {
+export function deriveChannel(params: {
   key: string;
   kind: SessionKind;
-  provider?: string | null;
-  lastProvider?: string | null;
+  channel?: string | null;
+  lastChannel?: string | null;
 }): string {
   if (
     params.kind === "cron" ||
@@ -67,10 +68,10 @@ export function deriveProvider(params: {
     params.kind === "node"
   )
     return "internal";
-  const provider = normalizeKey(params.provider ?? undefined);
-  if (provider) return provider;
-  const lastProvider = normalizeKey(params.lastProvider ?? undefined);
-  if (lastProvider) return lastProvider;
+  const channel = normalizeKey(params.channel ?? undefined);
+  if (channel) return channel;
+  const lastChannel = normalizeKey(params.lastChannel ?? undefined);
+  if (lastChannel) return lastChannel;
   const parts = params.key.split(":").filter(Boolean);
   if (parts.length >= 3 && (parts[1] === "group" || parts[1] === "channel")) {
     return parts[0];

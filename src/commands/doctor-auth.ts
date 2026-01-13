@@ -1,5 +1,3 @@
-import { note as clackNote } from "@clack/prompts";
-
 import {
   buildAuthHealthSummary,
   DEFAULT_OAUTH_WARN_MS,
@@ -11,13 +9,11 @@ import {
   ensureAuthProfileStore,
   repairOAuthProfileIdMismatch,
   resolveApiKeyForProfile,
+  resolveProfileUnusableUntilForDisplay,
 } from "../agents/auth-profiles.js";
 import type { ClawdbotConfig } from "../config/config.js";
-import { stylePromptTitle } from "../terminal/prompt-style.js";
+import { note } from "../terminal/note.js";
 import type { DoctorPrompter } from "./doctor-prompter.js";
-
-const note = (message: string, title?: string) =>
-  clackNote(message, stylePromptTitle(title));
 
 export async function maybeRepairAnthropicOAuthProfileId(
   cfg: ClawdbotConfig,
@@ -81,6 +77,32 @@ export async function noteAuthProfileHealth(params: {
   const store = ensureAuthProfileStore(undefined, {
     allowKeychainPrompt: params.allowKeychainPrompt,
   });
+  const unusable = (() => {
+    const now = Date.now();
+    const out: string[] = [];
+    for (const profileId of Object.keys(store.usageStats ?? {})) {
+      const until = resolveProfileUnusableUntilForDisplay(store, profileId);
+      if (!until || now >= until) continue;
+      const stats = store.usageStats?.[profileId];
+      const remaining = formatRemainingShort(until - now);
+      const kind =
+        typeof stats?.disabledUntil === "number" && now < stats.disabledUntil
+          ? `disabled${stats.disabledReason ? `:${stats.disabledReason}` : ""}`
+          : "cooldown";
+      const hint = kind.startsWith("disabled:billing")
+        ? "Top up credits (provider billing) or switch provider."
+        : "Wait for cooldown or switch provider.";
+      out.push(
+        `- ${profileId}: ${kind} (${remaining})${hint ? ` — ${hint}` : ""}`,
+      );
+    }
+    return out;
+  })();
+
+  if (unusable.length > 0) {
+    note(unusable.join("\n"), "Auth profile cooldowns");
+  }
+
   let summary = buildAuthHealthSummary({
     store,
     cfg: params.cfg,

@@ -4,12 +4,13 @@ import type { HealthSummary } from "../../commands/health.js";
 import type { CronService } from "../../cron/service.js";
 import type { startNodeBridgeServer } from "../../infra/bridge/server.js";
 import type { WizardSession } from "../../wizard/session.js";
+import type { ChatAbortControllerEntry } from "../chat-abort.js";
 import type {
   ConnectParams,
   ErrorShape,
   RequestFrame,
 } from "../protocol/index.js";
-import type { ProviderRuntimeSnapshot } from "../server-providers.js";
+import type { ChannelRuntimeSnapshot } from "../server-channels.js";
 import type { DedupeEntry } from "../server-shared.js";
 
 export type GatewayClient = {
@@ -31,6 +32,7 @@ export type GatewayRequestContext = {
   getHealthCache: () => HealthSummary | null;
   refreshHealthSnapshot: (opts?: { probe?: boolean }) => Promise<HealthSummary>;
   logHealth: { error: (message: string) => void };
+  logGateway: { warn: (message: string) => void };
   incrementPresenceVersion: () => number;
   getHealthVersion: () => number;
   broadcast: (
@@ -49,10 +51,8 @@ export type GatewayRequestContext = {
   ) => void;
   hasConnectedMobileNode: () => boolean;
   agentRunSeq: Map<string, number>;
-  chatAbortControllers: Map<
-    string,
-    { controller: AbortController; sessionId: string; sessionKey: string }
-  >;
+  chatAbortControllers: Map<string, ChatAbortControllerEntry>;
+  chatAbortedRuns: Map<string, number>;
   chatRunBuffers: Map<string, string>;
   chatDeltaSentAt: Map<string, number>;
   addChatRun: (
@@ -68,20 +68,20 @@ export type GatewayRequestContext = {
   wizardSessions: Map<string, WizardSession>;
   findRunningWizard: () => string | null;
   purgeWizardSession: (id: string) => void;
-  getRuntimeSnapshot: () => ProviderRuntimeSnapshot;
-  startWhatsAppProvider: (accountId?: string) => Promise<void>;
-  stopWhatsAppProvider: (accountId?: string) => Promise<void>;
-  startTelegramProvider: (accountId?: string) => Promise<void>;
-  stopTelegramProvider: (accountId?: string) => Promise<void>;
-  startDiscordProvider: (accountId?: string) => Promise<void>;
-  stopDiscordProvider: (accountId?: string) => Promise<void>;
-  startSlackProvider: (accountId?: string) => Promise<void>;
-  stopSlackProvider: (accountId?: string) => Promise<void>;
-  startSignalProvider: (accountId?: string) => Promise<void>;
-  stopSignalProvider: (accountId?: string) => Promise<void>;
-  startIMessageProvider: (accountId?: string) => Promise<void>;
-  stopIMessageProvider: (accountId?: string) => Promise<void>;
-  markWhatsAppLoggedOut: (cleared: boolean, accountId?: string) => void;
+  getRuntimeSnapshot: () => ChannelRuntimeSnapshot;
+  startChannel: (
+    channel: import("../../channels/plugins/types.js").ChannelId,
+    accountId?: string,
+  ) => Promise<void>;
+  stopChannel: (
+    channel: import("../../channels/plugins/types.js").ChannelId,
+    accountId?: string,
+  ) => Promise<void>;
+  markChannelLoggedOut: (
+    channelId: import("../../channels/plugins/types.js").ChannelId,
+    cleared: boolean,
+    accountId?: string,
+  ) => void;
   wizardRunner: (
     opts: import("../../commands/onboard-types.js").OnboardOptions,
     runtime: import("../../runtime.js").RuntimeEnv,

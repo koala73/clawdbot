@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { HeartbeatRunResult } from "../infra/heartbeat-wake.js";
 import { CronService } from "./service.js";
 
 const noopLogger = {
@@ -70,10 +71,116 @@ describe("CronService", () => {
     const jobs = await cron.list({ includeDisabled: true });
     const updated = jobs.find((j) => j.id === job.id);
     expect(updated?.enabled).toBe(false);
-    expect(enqueueSystemEvent).toHaveBeenCalledWith("hello");
+    expect(enqueueSystemEvent).toHaveBeenCalledWith("hello", {
+      agentId: undefined,
+    });
     expect(requestHeartbeatNow).toHaveBeenCalled();
 
     await cron.list({ includeDisabled: true });
+    cron.stop();
+    await store.cleanup();
+  });
+
+  it("runs a one-shot job and deletes it after success when requested", async () => {
+    const store = await makeStorePath();
+    const enqueueSystemEvent = vi.fn();
+    const requestHeartbeatNow = vi.fn();
+
+    const cron = new CronService({
+      storePath: store.storePath,
+      cronEnabled: true,
+      log: noopLogger,
+      enqueueSystemEvent,
+      requestHeartbeatNow,
+      runIsolatedAgentJob: vi.fn(async () => ({ status: "ok" })),
+    });
+
+    await cron.start();
+    const atMs = Date.parse("2025-12-13T00:00:02.000Z");
+    const job = await cron.add({
+      name: "one-shot delete",
+      enabled: true,
+      deleteAfterRun: true,
+      schedule: { kind: "at", atMs },
+      sessionTarget: "main",
+      wakeMode: "now",
+      payload: { kind: "systemEvent", text: "hello" },
+    });
+
+    vi.setSystemTime(new Date("2025-12-13T00:00:02.000Z"));
+    await vi.runOnlyPendingTimersAsync();
+
+    const jobs = await cron.list({ includeDisabled: true });
+    expect(jobs.find((j) => j.id === job.id)).toBeUndefined();
+    expect(enqueueSystemEvent).toHaveBeenCalledWith("hello", {
+      agentId: undefined,
+    });
+    expect(requestHeartbeatNow).toHaveBeenCalled();
+
+    cron.stop();
+    await store.cleanup();
+  });
+
+  it("wakeMode now waits for heartbeat completion when available", async () => {
+    const store = await makeStorePath();
+    const enqueueSystemEvent = vi.fn();
+    const requestHeartbeatNow = vi.fn();
+
+    let now = 0;
+    const nowMs = () => {
+      now += 10;
+      return now;
+    };
+
+    let resolveHeartbeat: ((res: HeartbeatRunResult) => void) | null = null;
+    const runHeartbeatOnce = vi.fn(
+      async () =>
+        await new Promise<HeartbeatRunResult>((resolve) => {
+          resolveHeartbeat = resolve;
+        }),
+    );
+
+    const cron = new CronService({
+      storePath: store.storePath,
+      cronEnabled: true,
+      log: noopLogger,
+      nowMs,
+      enqueueSystemEvent,
+      requestHeartbeatNow,
+      runHeartbeatOnce,
+      runIsolatedAgentJob: vi.fn(async () => ({ status: "ok" })),
+    });
+
+    await cron.start();
+    const job = await cron.add({
+      name: "wakeMode now waits",
+      enabled: true,
+      schedule: { kind: "at", atMs: 1 },
+      sessionTarget: "main",
+      wakeMode: "now",
+      payload: { kind: "systemEvent", text: "hello" },
+    });
+
+    const runPromise = cron.run(job.id, "force");
+    for (let i = 0; i < 10; i++) {
+      if (runHeartbeatOnce.mock.calls.length > 0) break;
+      // Let the locked() chain progress.
+      await Promise.resolve();
+    }
+
+    expect(runHeartbeatOnce).toHaveBeenCalledTimes(1);
+    expect(requestHeartbeatNow).not.toHaveBeenCalled();
+    expect(enqueueSystemEvent).toHaveBeenCalledWith("hello", {
+      agentId: undefined,
+    });
+    expect(job.state.runningAtMs).toBeTypeOf("number");
+
+    resolveHeartbeat?.({ status: "ran", durationMs: 123 });
+    await runPromise;
+
+    expect(job.state.lastStatus).toBe("ok");
+    expect(job.state.lastDurationMs).toBeGreaterThan(0);
+
     cron.stop();
     await store.cleanup();
   });
@@ -112,8 +219,111 @@ describe("CronService", () => {
 
     await cron.list({ includeDisabled: true });
     expect(runIsolatedAgentJob).toHaveBeenCalledTimes(1);
-    expect(enqueueSystemEvent).toHaveBeenCalledWith("Cron: done");
+    expect(enqueueSystemEvent).toHaveBeenCalledWith("Cron: done", {
+      agentId: undefined,
+    });
     expect(requestHeartbeatNow).toHaveBeenCalled();
+    cron.stop();
+    await store.cleanup();
+  });
+
+  it("migrates legacy payload.provider to payload.channel on load", async () => {
+    const store = await makeStorePath();
+    const enqueueSystemEvent = vi.fn();
+    const requestHeartbeatNow = vi.fn();
+
+    const rawJob = {
+      id: "legacy-1",
+      name: "legacy",
+      enabled: true,
+      createdAtMs: Date.now(),
+      updatedAtMs: Date.now(),
+      schedule: { kind: "cron", expr: "* * * * *" },
+      sessionTarget: "isolated",
+      wakeMode: "now",
+      payload: {
+        kind: "agentTurn",
+        message: "hi",
+        deliver: true,
+        provider: " TeLeGrAm ",
+        to: "7200373102",
+      },
+      state: {},
+    };
+
+    await fs.mkdir(path.dirname(store.storePath), { recursive: true });
+    await fs.writeFile(
+      store.storePath,
+      JSON.stringify({ version: 1, jobs: [rawJob] }, null, 2),
+      "utf-8",
+    );
+
+    const cron = new CronService({
+      storePath: store.storePath,
+      cronEnabled: true,
+      log: noopLogger,
+      enqueueSystemEvent,
+      requestHeartbeatNow,
+      runIsolatedAgentJob: vi.fn(async () => ({ status: "ok" })),
+    });
+
+    await cron.start();
+    const jobs = await cron.list({ includeDisabled: true });
+    const job = jobs.find((j) => j.id === rawJob.id);
+    const payload = job?.payload as unknown as Record<string, unknown>;
+    expect(payload.channel).toBe("telegram");
+    expect("provider" in payload).toBe(false);
+
+    cron.stop();
+    await store.cleanup();
+  });
+
+  it("canonicalizes payload.channel casing on load", async () => {
+    const store = await makeStorePath();
+    const enqueueSystemEvent = vi.fn();
+    const requestHeartbeatNow = vi.fn();
+
+    const rawJob = {
+      id: "legacy-2",
+      name: "legacy",
+      enabled: true,
+      createdAtMs: Date.now(),
+      updatedAtMs: Date.now(),
+      schedule: { kind: "cron", expr: "* * * * *" },
+      sessionTarget: "isolated",
+      wakeMode: "now",
+      payload: {
+        kind: "agentTurn",
+        message: "hi",
+        deliver: true,
+        channel: "Telegram",
+        to: "7200373102",
+      },
+      state: {},
+    };
+
+    await fs.mkdir(path.dirname(store.storePath), { recursive: true });
+    await fs.writeFile(
+      store.storePath,
+      JSON.stringify({ version: 1, jobs: [rawJob] }, null, 2),
+      "utf-8",
+    );
+
+    const cron = new CronService({
+      storePath: store.storePath,
+      cronEnabled: true,
+      log: noopLogger,
+      enqueueSystemEvent,
+      requestHeartbeatNow,
+      runIsolatedAgentJob: vi.fn(async () => ({ status: "ok" })),
+    });
+
+    await cron.start();
+    const jobs = await cron.list({ includeDisabled: true });
+    const job = jobs.find((j) => j.id === rawJob.id);
+    const payload = job?.payload as unknown as Record<string, unknown>;
+    expect(payload.channel).toBe("telegram");
+
     cron.stop();
     await store.cleanup();
   });
@@ -154,6 +364,7 @@ describe("CronService", () => {
 
     expect(enqueueSystemEvent).toHaveBeenCalledWith(
       "Cron (error): last output",
+      { agentId: undefined },
     );
     expect(requestHeartbeatNow).toHaveBeenCalled();
     cron.stop();

@@ -32,82 +32,75 @@ const hoisted = vi.hoisted(() => {
 
   const providerManager = {
     getRuntimeSnapshot: vi.fn(() => ({
-      whatsapp: {
-        running: false,
-        connected: false,
-        reconnectAttempts: 0,
-        lastConnectedAt: null,
-        lastDisconnect: null,
-        lastMessageAt: null,
-        lastEventAt: null,
-        lastError: null,
+      providers: {
+        whatsapp: {
+          running: false,
+          connected: false,
+          reconnectAttempts: 0,
+          lastConnectedAt: null,
+          lastDisconnect: null,
+          lastMessageAt: null,
+          lastEventAt: null,
+          lastError: null,
+        },
+        telegram: {
+          running: false,
+          lastStartAt: null,
+          lastStopAt: null,
+          lastError: null,
+          mode: null,
+        },
+        discord: {
+          running: false,
+          lastStartAt: null,
+          lastStopAt: null,
+          lastError: null,
+        },
+        slack: {
+          running: false,
+          lastStartAt: null,
+          lastStopAt: null,
+          lastError: null,
+        },
+        signal: {
+          running: false,
+          lastStartAt: null,
+          lastStopAt: null,
+          lastError: null,
+          baseUrl: null,
+        },
+        imessage: {
+          running: false,
+          lastStartAt: null,
+          lastStopAt: null,
+          lastError: null,
+          cliPath: null,
+          dbPath: null,
+        },
+        msteams: {
+          running: false,
+          lastStartAt: null,
+          lastStopAt: null,
+          lastError: null,
+        },
       },
-      whatsappAccounts: {},
-      telegram: {
-        running: false,
-        lastStartAt: null,
-        lastStopAt: null,
-        lastError: null,
-        mode: null,
-      },
-      telegramAccounts: {},
-      discord: {
-        running: false,
-        lastStartAt: null,
-        lastStopAt: null,
-        lastError: null,
-      },
-      discordAccounts: {},
-      slack: {
-        running: false,
-        lastStartAt: null,
-        lastStopAt: null,
-        lastError: null,
-      },
-      slackAccounts: {},
-      signal: {
-        running: false,
-        lastStartAt: null,
-        lastStopAt: null,
-        lastError: null,
-        baseUrl: null,
-      },
-      signalAccounts: {},
-      imessage: {
-        running: false,
-        lastStartAt: null,
-        lastStopAt: null,
-        lastError: null,
-        cliPath: null,
-        dbPath: null,
-      },
-      imessageAccounts: {},
-      msteams: {
-        running: false,
-        lastStartAt: null,
-        lastStopAt: null,
-        lastError: null,
+      providerAccounts: {
+        whatsapp: {},
+        telegram: {},
+        discord: {},
+        slack: {},
+        signal: {},
+        imessage: {},
+        msteams: {},
       },
     })),
-    startProviders: vi.fn(async () => {}),
-    startWhatsAppProvider: vi.fn(async () => {}),
-    stopWhatsAppProvider: vi.fn(async () => {}),
-    startTelegramProvider: vi.fn(async () => {}),
-    stopTelegramProvider: vi.fn(async () => {}),
-    startDiscordProvider: vi.fn(async () => {}),
-    stopDiscordProvider: vi.fn(async () => {}),
-    startSlackProvider: vi.fn(async () => {}),
-    stopSlackProvider: vi.fn(async () => {}),
-    startSignalProvider: vi.fn(async () => {}),
-    stopSignalProvider: vi.fn(async () => {}),
-    startIMessageProvider: vi.fn(async () => {}),
-    stopIMessageProvider: vi.fn(async () => {}),
-    startMSTeamsProvider: vi.fn(async () => {}),
-    stopMSTeamsProvider: vi.fn(async () => {}),
-    markWhatsAppLoggedOut: vi.fn(),
+    startChannels: vi.fn(async () => {}),
+    startChannel: vi.fn(async () => {}),
+    stopChannel: vi.fn(async () => {}),
+    markChannelLoggedOut: vi.fn(),
   };
 
-  const createProviderManager = vi.fn(() => providerManager);
+  const createChannelManager = vi.fn(() => providerManager);
 
   const reloaderStop = vi.fn(async () => {});
   let onHotReload:
@@ -136,7 +129,7 @@ const hoisted = vi.hoisted(() => {
     startGmailWatcher,
     stopGmailWatcher,
     providerManager,
-    createProviderManager,
+    createChannelManager,
     startGatewayConfigReloader,
     reloaderStop,
     getOnHotReload: () => onHotReload,
@@ -162,8 +155,8 @@ vi.mock("../hooks/gmail-watcher.js", () => ({
   stopGmailWatcher: hoisted.stopGmailWatcher,
 }));
 
-vi.mock("./server-providers.js", () => ({
-  createProviderManager: hoisted.createProviderManager,
+vi.mock("./server-channels.js", () => ({
+  createChannelManager: hoisted.createChannelManager,
 }));
 
 vi.mock("./config-reload.js", () => ({
@@ -173,21 +166,21 @@ vi.mock("./config-reload.js", () => ({
 installGatewayTestHooks();
 
 describe("gateway hot reload", () => {
-  let prevSkipProviders: string | undefined;
+  let prevSkipChannels: string | undefined;
   let prevSkipGmail: string | undefined;
 
   beforeEach(() => {
-    prevSkipProviders = process.env.CLAWDBOT_SKIP_PROVIDERS;
+    prevSkipChannels = process.env.CLAWDBOT_SKIP_CHANNELS;
     prevSkipGmail = process.env.CLAWDBOT_SKIP_GMAIL_WATCHER;
-    process.env.CLAWDBOT_SKIP_PROVIDERS = "0";
+    process.env.CLAWDBOT_SKIP_CHANNELS = "0";
     delete process.env.CLAWDBOT_SKIP_GMAIL_WATCHER;
   });
 
   afterEach(() => {
-    if (prevSkipProviders === undefined) {
-      delete process.env.CLAWDBOT_SKIP_PROVIDERS;
+    if (prevSkipChannels === undefined) {
+      delete process.env.CLAWDBOT_SKIP_CHANNELS;
     } else {
-      process.env.CLAWDBOT_SKIP_PROVIDERS = prevSkipProviders;
+      process.env.CLAWDBOT_SKIP_CHANNELS = prevSkipChannels;
     }
     if (prevSkipGmail === undefined) {
       delete process.env.CLAWDBOT_SKIP_GMAIL_WATCHER;
@@ -213,10 +206,12 @@ describe("gateway hot reload", () => {
       agents: { defaults: { heartbeat: { every: "1m" }, maxConcurrent: 2 } },
       browser: { enabled: true, controlUrl: "http://127.0.0.1:18791" },
       web: { enabled: true },
-      telegram: { botToken: "token" },
-      discord: { token: "token" },
-      signal: { account: "+15550000000" },
-      imessage: { enabled: true },
+      channels: {
+        telegram: { botToken: "token" },
+        discord: { token: "token" },
+        signal: { account: "+15550000000" },
+        imessage: { enabled: true },
+      },
     };
 
     await onHotReload?.(
@@ -227,10 +222,10 @@ describe("gateway hot reload", () => {
           "agents.defaults.heartbeat.every",
           "browser.enabled",
           "web.enabled",
-          "telegram.botToken",
-          "discord.token",
-          "signal.account",
-          "imessage.enabled",
+          "channels.telegram.botToken",
+          "channels.discord.token",
+          "channels.signal.account",
+          "channels.imessage.enabled",
         ],
         restartGateway: false,
         restartReasons: [],
@@ -240,7 +235,7 @@ describe("gateway hot reload", () => {
         restartBrowserControl: true,
         restartCron: true,
         restartHeartbeat: true,
-        restartProviders: new Set([
+        restartChannels: new Set([
           "whatsapp",
           "telegram",
           "discord",
@@ -265,33 +260,31 @@ describe("gateway hot reload", () => {
     expect(hoisted.cronInstances[0].stop).toHaveBeenCalledTimes(1);
     expect(hoisted.cronInstances[1].start).toHaveBeenCalledTimes(1);
 
-    expect(hoisted.providerManager.stopWhatsAppProvider).toHaveBeenCalledTimes(
-      1,
+    expect(hoisted.providerManager.stopChannel).toHaveBeenCalledTimes(5);
+    expect(hoisted.providerManager.startChannel).toHaveBeenCalledTimes(5);
+    expect(hoisted.providerManager.stopChannel).toHaveBeenCalledWith(
+      "whatsapp",
     );
-    expect(hoisted.providerManager.startWhatsAppProvider).toHaveBeenCalledTimes(
-      1,
+    expect(hoisted.providerManager.startChannel).toHaveBeenCalledWith(
+      "whatsapp",
     );
-    expect(hoisted.providerManager.stopTelegramProvider).toHaveBeenCalledTimes(
-      1,
+    expect(hoisted.providerManager.stopChannel).toHaveBeenCalledWith(
+      "telegram",
     );
-    expect(hoisted.providerManager.startTelegramProvider).toHaveBeenCalledTimes(
-      1,
+    expect(hoisted.providerManager.startChannel).toHaveBeenCalledWith(
+      "telegram",
     );
-    expect(hoisted.providerManager.stopDiscordProvider).toHaveBeenCalledTimes(
-      1,
+    expect(hoisted.providerManager.stopChannel).toHaveBeenCalledWith("discord");
+    expect(hoisted.providerManager.startChannel).toHaveBeenCalledWith(
+      "discord",
     );
-    expect(hoisted.providerManager.startDiscordProvider).toHaveBeenCalledTimes(
-      1,
+    expect(hoisted.providerManager.stopChannel).toHaveBeenCalledWith("signal");
+    expect(hoisted.providerManager.startChannel).toHaveBeenCalledWith("signal");
+    expect(hoisted.providerManager.stopChannel).toHaveBeenCalledWith(
+      "imessage",
     );
-    expect(hoisted.providerManager.stopSignalProvider).toHaveBeenCalledTimes(1);
-    expect(hoisted.providerManager.startSignalProvider).toHaveBeenCalledTimes(
-      1,
-    );
-    expect(hoisted.providerManager.stopIMessageProvider).toHaveBeenCalledTimes(
-      1,
-    );
-    expect(hoisted.providerManager.startIMessageProvider).toHaveBeenCalledTimes(
-      1,
+    expect(hoisted.providerManager.startChannel).toHaveBeenCalledWith(
+      "imessage",
     );
 
     await server.close();
@@ -318,7 +311,7 @@ describe("gateway hot reload", () => {
         restartBrowserControl: false,
         restartCron: false,
         restartHeartbeat: false,
-        restartProviders: new Set(),
+        restartChannels: new Set(),
         noopPaths: [],
       },
       {},

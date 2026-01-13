@@ -8,7 +8,7 @@ read_when:
 
 # Gateway CLI
 
-The Gateway is Clawdbot’s WebSocket server (providers, nodes, sessions, hooks).
+The Gateway is Clawdbot’s WebSocket server (channels, nodes, sessions, hooks).
 
 Subcommands in this page live under `clawdbot gateway …`.
 
@@ -39,6 +39,7 @@ Notes:
 - `--password <password>`: password override (also sets `CLAWDBOT_GATEWAY_PASSWORD` for the process).
 - `--tailscale <off|serve|funnel>`: expose the Gateway via Tailscale.
 - `--tailscale-reset-on-exit`: reset Tailscale serve/funnel config on shutdown.
+- `--allow-unconfigured`: allow gateway start without `gateway.mode=local` in config.
 - `--dev`: create a dev config + workspace if missing (skips BOOTSTRAP.md).
 - `--reset`: reset dev config + credentials + sessions + workspace (requires `--dev`).
 - `--force`: kill any existing listener on the selected port before starting.
@@ -77,7 +78,7 @@ clawdbot gateway health --url ws://127.0.0.1:18789
 - your configured remote gateway (if set), and
 - localhost (loopback) **even if remote is configured**.
 
-If multiple gateways are reachable, it prints all of them and warns this is an unconventional setup (usually you want only one gateway).
+If multiple gateways are reachable, it prints all of them. Multiple gateways are supported when you use profiles for redundancy, but most installs still run a single gateway.
 
 ```bash
 clawdbot gateway status
@@ -91,7 +92,7 @@ The macOS app “Remote over SSH” mode uses a local port-forward so the remote
 CLI equivalent:
 
 ```bash
-clawdbot gateway status --ssh steipete@peters-mac-studio-1
+clawdbot gateway status --ssh user@gateway-host
 ```
 
 Options:

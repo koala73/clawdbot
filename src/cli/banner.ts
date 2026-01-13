@@ -38,7 +38,7 @@ export function formatCliBannerLine(
   const commitLabel = commit ?? "unknown";
   const tagline = pickTagline(options);
   const rich = options.richTty ?? isRich();
-  const title = "🦞 ClawdBot";
+  const title = "🦞 Clawdbot";
   if (rich) {
     return `${theme.heading(title)} ${theme.info(version)} ${theme.muted(
       `(${commitLabel})`,
@@ -91,4 +91,8 @@ export function emitCliBanner(version: string, options: BannerOptions = {}) {
   const line = formatCliBannerLine(version, options);
   process.stdout.write(`\n${line}\n\n`);
   bannerEmitted = true;
+}
+
+export function hasEmittedCliBanner(): boolean {
+  return bannerEmitted;
 }

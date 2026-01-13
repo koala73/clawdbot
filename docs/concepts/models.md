@@ -9,6 +9,7 @@ read_when:
 
 See [/concepts/model-failover](/concepts/model-failover) for auth profile
 rotation, cooldowns, and how that interacts with fallbacks.
+Quick provider overview + examples: [/concepts/model-providers](/concepts/model-providers).
 
 ## How model selection works
 
@@ -22,6 +23,24 @@ Clawdbot selects models in this order:
 Related:
 - `agents.defaults.models` is the allowlist/catalog of models Clawdbot can use (plus aliases).
 - `agents.defaults.imageModel` is used **only when** the primary model can’t accept images.
+- Per-agent defaults can override `agents.defaults.model` via `agents.list[].model` plus bindings (see [/concepts/multi-agent](/concepts/multi-agent)).
+
+## Quick model picks (anecdotal)
+
+- **GLM**: a bit better for coding/tool calling.
+- **MiniMax**: better for writing and vibes.
+
+## Setup wizard (recommended)
+
+If you don’t want to hand-edit config, run the onboarding wizard:
+
+```bash
+clawdbot onboard
+```
+
+It can set up model + auth for common providers, including **OpenAI Code (Codex)
+subscription** (OAuth) and **Anthropic** (API key recommended; `claude
+setup-token` also supported).
 
 ## Config keys (overview)
 
@@ -32,6 +51,9 @@ Related:
 
 Model refs are normalized to lowercase. Provider aliases like `z.ai/*` normalize
 to `zai/*`.
+
+Provider configuration examples (including OpenCode Zen) live in
+[/gateway/configuration](/gateway/configuration#opencode-zen-multi-model-proxy).
 
 ## “Model is not allowed” (and why replies stop)
 
@@ -63,6 +85,25 @@ Example allowlist config:
   }
 }
 ```
+
+## Switching models in chat (`/model`)
+
+You can switch models for the current session without restarting:
+
+```
+/model
+/model list
+/model 3
+/model openai/gpt-5.2
+/model status
+```
+
+Notes:
+- `/model` (and `/model list`) is a compact, numbered picker (model family + available providers).
+- `/model <#>` selects from that picker.
+- `/model status` is the detailed view (auth candidates and, when configured, provider endpoint `baseUrl` + `api` mode).
+
+Full command behavior/config: [Slash commands](/tools/slash-commands).
 
 ## CLI commands
 

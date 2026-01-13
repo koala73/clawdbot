@@ -47,7 +47,19 @@ vi.mock("./queue.js", async () => {
 import { runReplyAgent } from "./agent-runner.js";
 
 type EmbeddedPiAgentParams = {
-  onPartialReply?: (payload: { text?: string }) => Promise<void> | void;
+  onPartialReply?: (payload: {
+    text?: string;
+    mediaUrls?: string[];
+  }) => Promise<void> | void;
+  onAssistantMessageStart?: () => Promise<void> | void;
+  onBlockReply?: (payload: {
+    text?: string;
+    mediaUrls?: string[];
+  }) => Promise<void> | void;
+  onToolResult?: (payload: {
+    text?: string;
+    mediaUrls?: string[];
+  }) => Promise<void> | void;
 };
 
 function createMinimalRun(params?: {
@@ -58,6 +70,7 @@ function createMinimalRun(params?: {
   sessionKey?: string;
   storePath?: string;
   typingMode?: TypingMode;
+  blockStreamingEnabled?: boolean;
 }) {
   const typing = createMockTypingController();
   const opts = params?.opts;
@@ -117,7 +130,7 @@ function createMinimalRun(params?: {
         defaultModel: "anthropic/claude-opus-4-5",
         resolvedVerboseLevel: params?.resolvedVerboseLevel ?? "off",
         isNewSession: false,
-        blockStreamingEnabled: false,
+        blockStreamingEnabled: params?.blockStreamingEnabled ?? false,
         resolvedBlockStreamingBreak: "message_end",
         shouldInjectGroupIntro: false,
         typingMode: params?.typingMode ?? "instant",
@@ -145,6 +158,23 @@ describe("runReplyAgent typing (heartbeat)", () => {
     expect(typing.startTypingLoop).toHaveBeenCalled();
   });
 
+  it("signals typing even without consumer partial handler", async () => {
+    runEmbeddedPiAgentMock.mockImplementationOnce(
+      async (params: EmbeddedPiAgentParams) => {
+        await params.onPartialReply?.({ text: "hi" });
+        return { payloads: [{ text: "final" }], meta: {} };
+      },
+    );
+
+    const { run, typing } = createMinimalRun({
+      typingMode: "message",
+    });
+    await run();
+
+    expect(typing.startTypingOnText).toHaveBeenCalledWith("hi");
+    expect(typing.startTypingLoop).not.toHaveBeenCalled();
+  });
+
   it("never signals typing for heartbeat runs", async () => {
     const onPartialReply = vi.fn();
     runEmbeddedPiAgentMock.mockImplementationOnce(
@@ -164,19 +194,40 @@ describe("runReplyAgent typing (heartbeat)", () => {
     expect(typing.startTypingLoop).not.toHaveBeenCalled();
   });
 
-  it("starts typing only on deltas in message mode", async () => {
-    runEmbeddedPiAgentMock.mockImplementationOnce(async () => ({
-      payloads: [{ text: "final" }],
-      meta: {},
-    }));
+  it("suppresses partial streaming for NO_REPLY", async () => {
+    const onPartialReply = vi.fn();
+    runEmbeddedPiAgentMock.mockImplementationOnce(
+      async (params: EmbeddedPiAgentParams) => {
+        await params.onPartialReply?.({ text: "NO_REPLY" });
+        return { payloads: [{ text: "NO_REPLY" }], meta: {} };
+      },
+    );
+
+    const { run, typing } = createMinimalRun({
+      opts: { isHeartbeat: false, onPartialReply },
+    });
+    await run();
+
+    expect(onPartialReply).not.toHaveBeenCalled();
+    expect(typing.startTypingOnText).not.toHaveBeenCalled();
+    expect(typing.startTypingLoop).not.toHaveBeenCalled();
+  });
+
+  it("starts typing on assistant message start in message mode", async () => {
+    runEmbeddedPiAgentMock.mockImplementationOnce(
+      async (params: EmbeddedPiAgentParams) => {
+        await params.onAssistantMessageStart?.();
+        return { payloads: [{ text: "final" }], meta: {} };
+      },
+    );
 
     const { run, typing } = createMinimalRun({
       typingMode: "message",
     });
     await run();
 
+    expect(typing.startTypingLoop).toHaveBeenCalled();
     expect(typing.startTypingOnText).not.toHaveBeenCalled();
-    expect(typing.startTypingLoop).not.toHaveBeenCalled();
   });
 
   it("starts typing from reasoning stream in thinking mode", async () => {
@@ -187,7 +238,7 @@ describe("runReplyAgent typing (heartbeat)", () => {
           text?: string;
         }) => Promise<void> | void;
       }) => {
-        await params.onReasoningStream?.({ text: "Reasoning:\nstep" });
+        await params.onReasoningStream?.({ text: "Reasoning:\n_step_" });
         await params.onPartialReply?.({ text: "hi" });
         return { payloads: [{ text: "final" }], meta: {} };
       },
@@ -219,6 +270,73 @@ describe("runReplyAgent typing (heartbeat)", () => {
 
     expect(typing.startTypingOnText).not.toHaveBeenCalled();
     expect(typing.startTypingLoop).not.toHaveBeenCalled();
+  });
+
+  it("signals typing on block replies", async () => {
+    const onBlockReply = vi.fn();
+    runEmbeddedPiAgentMock.mockImplementationOnce(
+      async (params: EmbeddedPiAgentParams) => {
+        await params.onBlockReply?.({ text: "chunk", mediaUrls: [] });
+        return { payloads: [{ text: "final" }], meta: {} };
+      },
+    );
+
+    const { run, typing } = createMinimalRun({
+      typingMode: "message",
+      blockStreamingEnabled: true,
+      opts: { onBlockReply },
+    });
+    await run();
+
+    expect(typing.startTypingOnText).toHaveBeenCalledWith("chunk");
+    expect(onBlockReply).toHaveBeenCalled();
+    const [blockPayload, blockOpts] = onBlockReply.mock.calls[0] ?? [];
+    expect(blockPayload).toMatchObject({ text: "chunk", audioAsVoice: false });
+    expect(blockOpts).toMatchObject({
+      abortSignal: expect.any(AbortSignal),
+      timeoutMs: expect.any(Number),
+    });
+  });
+
+  it("signals typing on tool results", async () => {
+    const onToolResult = vi.fn();
+    runEmbeddedPiAgentMock.mockImplementationOnce(
+      async (params: EmbeddedPiAgentParams) => {
+        await params.onToolResult?.({ text: "tooling", mediaUrls: [] });
+        return { payloads: [{ text: "final" }], meta: {} };
+      },
+    );
+
+    const { run, typing } = createMinimalRun({
+      typingMode: "message",
+      opts: { onToolResult },
+    });
+    await run();
+
+    expect(typing.startTypingOnText).toHaveBeenCalledWith("tooling");
+    expect(onToolResult).toHaveBeenCalledWith({
+      text: "tooling",
+      mediaUrls: [],
+    });
+  });
+
+  it("skips typing for silent tool results", async () => {
+    const onToolResult = vi.fn();
+    runEmbeddedPiAgentMock.mockImplementationOnce(
+      async (params: EmbeddedPiAgentParams) => {
+        await params.onToolResult?.({ text: "NO_REPLY", mediaUrls: [] });
+        return { payloads: [{ text: "final" }], meta: {} };
+      },
+    );
+
+    const { run, typing } = createMinimalRun({
+      typingMode: "message",
+      opts: { onToolResult },
+    });
+    await run();
+
+    expect(typing.startTypingOnText).not.toHaveBeenCalled();
+    expect(onToolResult).not.toHaveBeenCalled();
   });
 
   it("announces auto-compaction in verbose mode and tracks count", async () => {
@@ -347,6 +465,116 @@ describe("runReplyAgent typing (heartbeat)", () => {
 
       const persisted = JSON.parse(await fs.readFile(storePath, "utf-8"));
       expect(persisted.main).toBeDefined();
+    } finally {
+      if (prevStateDir) {
+        process.env.CLAWDBOT_STATE_DIR = prevStateDir;
+      } else {
+        delete process.env.CLAWDBOT_STATE_DIR;
+      }
+    }
+  });
+
+  it("retries after compaction failure by resetting the session", async () => {
+    const prevStateDir = process.env.CLAWDBOT_STATE_DIR;
+    const stateDir = await fs.mkdtemp(
+      path.join(tmpdir(), "clawdbot-session-compaction-reset-"),
+    );
+    process.env.CLAWDBOT_STATE_DIR = stateDir;
+    try {
+      const sessionId = "session";
+      const storePath = path.join(stateDir, "sessions", "sessions.json");
+      const sessionEntry = { sessionId, updatedAt: Date.now() };
+      const sessionStore = { main: sessionEntry };
+
+      await fs.mkdir(path.dirname(storePath), { recursive: true });
+      await fs.writeFile(storePath, JSON.stringify(sessionStore), "utf-8");
+
+      runEmbeddedPiAgentMock
+        .mockImplementationOnce(async () => {
+          throw new Error(
+            'Context overflow: Summarization failed: 400 {"message":"prompt is too long"}',
+          );
+        })
+        .mockImplementationOnce(async () => ({
+          payloads: [{ text: "ok" }],
+          meta: {},
+        }));
+
+      const callsBefore = runEmbeddedPiAgentMock.mock.calls.length;
+      const { run } = createMinimalRun({
+        sessionEntry,
+        sessionStore,
+        sessionKey: "main",
+        storePath,
+      });
+      const res = await run();
+
+      expect(runEmbeddedPiAgentMock.mock.calls.length - callsBefore).toBe(2);
+      const payload = Array.isArray(res) ? res[0] : res;
+      expect(payload).toMatchObject({ text: "ok" });
+      expect(sessionStore.main.sessionId).not.toBe(sessionId);
+
+      const persisted = JSON.parse(await fs.readFile(storePath, "utf-8"));
+      expect(persisted.main.sessionId).toBe(sessionStore.main.sessionId);
+    } finally {
+      if (prevStateDir) {
+        process.env.CLAWDBOT_STATE_DIR = prevStateDir;
+      } else {
+        delete process.env.CLAWDBOT_STATE_DIR;
+      }
+    }
+  });
+
+  it("retries after context overflow payload by resetting the session", async () => {
+    const prevStateDir = process.env.CLAWDBOT_STATE_DIR;
+    const stateDir = await fs.mkdtemp(
+      path.join(tmpdir(), "clawdbot-session-overflow-reset-"),
+    );
+    process.env.CLAWDBOT_STATE_DIR = stateDir;
+    try {
+      const sessionId = "session";
+      const storePath = path.join(stateDir, "sessions", "sessions.json");
+      const sessionEntry = { sessionId, updatedAt: Date.now() };
+      const sessionStore = { main: sessionEntry };
+
+      await fs.mkdir(path.dirname(storePath), { recursive: true });
+      await fs.writeFile(storePath, JSON.stringify(sessionStore), "utf-8");
+
+      runEmbeddedPiAgentMock
+        .mockImplementationOnce(async () => ({
+          payloads: [
+            { text: "Context overflow: prompt too large", isError: true },
+          ],
+          meta: {
+            durationMs: 1,
+            error: {
+              kind: "context_overflow",
+              message:
+                'Context overflow: Summarization failed: 400 {"message":"prompt is too long"}',
+            },
+          },
+        }))
+        .mockImplementationOnce(async () => ({
+          payloads: [{ text: "ok" }],
+          meta: { durationMs: 1 },
+        }));
+
+      const callsBefore = runEmbeddedPiAgentMock.mock.calls.length;
+      const { run } = createMinimalRun({
+        sessionEntry,
+        sessionStore,
+        sessionKey: "main",
+        storePath,
+      });
+      const res = await run();
+
+      expect(runEmbeddedPiAgentMock.mock.calls.length - callsBefore).toBe(2);
+      const payload = Array.isArray(res) ? res[0] : res;
+      expect(payload).toMatchObject({ text: "ok" });
+      expect(sessionStore.main.sessionId).not.toBe(sessionId);
+
+      const persisted = JSON.parse(await fs.readFile(storePath, "utf-8"));
+      expect(persisted.main.sessionId).toBe(sessionStore.main.sessionId);
     } finally {
       if (prevStateDir) {
         process.env.CLAWDBOT_STATE_DIR = prevStateDir;

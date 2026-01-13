@@ -4,6 +4,10 @@ import { WebSocket } from "ws";
 import { emitAgentEvent } from "../infra/agent-events.js";
 import { emitHeartbeatEvent } from "../infra/heartbeat-events.js";
 import {
+  GATEWAY_CLIENT_MODES,
+  GATEWAY_CLIENT_NAMES,
+} from "../utils/message-channel.js";
+import {
   connectOk,
   getFreePort,
   installGatewayTestHooks,
@@ -34,9 +38,9 @@ describe("gateway server health/presence", () => {
         ws,
         (o) => o.type === "res" && o.id === "presence1",
       );
-      const providersP = onceMessage(
+      const channelsP = onceMessage(
         ws,
-        (o) => o.type === "res" && o.id === "providers1",
+        (o) => o.type === "res" && o.id === "channels1",
       );
 
       const sendReq = (id: string, method: string) =>
@@ -44,16 +48,16 @@ describe("gateway server health/presence", () => {
       sendReq("health1", "health");
       sendReq("status1", "status");
       sendReq("presence1", "system-presence");
-      sendReq("providers1", "providers.status");
+      sendReq("channels1", "channels.status");
 
       const health = await healthP;
       const status = await statusP;
       const presence = await presenceP;
-      const providers = await providersP;
+      const channels = await channelsP;
       expect(health.ok).toBe(true);
       expect(status.ok).toBe(true);
       expect(presence.ok).toBe(true);
-      expect(providers.ok).toBe(true);
+      expect(channels.ok).toBe(true);
       expect(Array.isArray(presence.payload)).toBe(true);
 
       ws.close();
@@ -238,12 +242,12 @@ describe("gateway server health/presence", () => {
     const { server, ws } = await startServerWithClient();
     await connectOk(ws, {
       client: {
-        name: "fingerprint",
+        id: GATEWAY_CLIENT_NAMES.FINGERPRINT,
         version: "9.9.9",
         platform: "test",
         deviceFamily: "iPad",
         modelIdentifier: "iPad16,6",
-        mode: "ui",
+        mode: GATEWAY_CLIENT_MODES.UI,
         instanceId: "abc",
       },
     });
@@ -264,7 +268,7 @@ describe("gateway server health/presence", () => {
     const presenceRes = await presenceP;
     const entries = presenceRes.payload as Array<Record<string, unknown>>;
     const clientEntry = entries.find((e) => e.instanceId === "abc");
-    expect(clientEntry?.host).toBe("fingerprint");
+    expect(clientEntry?.host).toBe(GATEWAY_CLIENT_NAMES.FINGERPRINT);
     expect(clientEntry?.version).toBe("9.9.9");
     expect(clientEntry?.mode).toBe("ui");
     expect(clientEntry?.deviceFamily).toBe("iPad");
@@ -279,10 +283,10 @@ describe("gateway server health/presence", () => {
     const cliId = `cli-${randomUUID()}`;
     await connectOk(ws, {
       client: {
-        name: "cli",
+        id: GATEWAY_CLIENT_NAMES.CLI,
         version: "dev",
         platform: "test",
-        mode: "cli",
+        mode: GATEWAY_CLIENT_MODES.CLI,
         instanceId: cliId,
       },
     });

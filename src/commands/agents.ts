@@ -7,6 +7,16 @@ import {
 } from "../agents/agent-scope.js";
 import { ensureAuthProfileStore } from "../agents/auth-profiles.js";
 import { DEFAULT_IDENTITY_FILENAME } from "../agents/workspace.js";
+import { resolveChannelDefaultAccountId } from "../channels/plugins/helpers.js";
+import {
+  getChannelPlugin,
+  listChannelPlugins,
+} from "../channels/plugins/index.js";
+import {
+  type ChatChannelId,
+  getChatChannelMeta,
+  normalizeChatChannelId,
+} from "../channels/registry.js";
 import type { ClawdbotConfig } from "../config/config.js";
 import {
   CONFIG_PATH_CLAWDBOT,
@@ -14,21 +24,7 @@ import {
   writeConfigFile,
 } from "../config/config.js";
 import { resolveSessionTranscriptsDirForAgent } from "../config/sessions.js";
-import {
-  listDiscordAccountIds,
-  resolveDefaultDiscordAccountId,
-  resolveDiscordAccount,
-} from "../discord/accounts.js";
-import {
-  listIMessageAccountIds,
-  resolveDefaultIMessageAccountId,
-  resolveIMessageAccount,
-} from "../imessage/accounts.js";
-import {
-  type ChatProviderId,
-  getChatProviderMeta,
-  normalizeChatProviderId,
-} from "../providers/registry.js";
+import type { AgentBinding } from "../config/types.js";
 import {
   DEFAULT_ACCOUNT_ID,
   DEFAULT_AGENT_ID,
@@ -36,35 +32,14 @@ import {
 } from "../routing/session-key.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { defaultRuntime } from "../runtime.js";
-import {
-  listSignalAccountIds,
-  resolveDefaultSignalAccountId,
-  resolveSignalAccount,
-} from "../signal/accounts.js";
-import {
-  listSlackAccountIds,
-  resolveDefaultSlackAccountId,
-  resolveSlackAccount,
-} from "../slack/accounts.js";
-import {
-  listTelegramAccountIds,
-  resolveDefaultTelegramAccountId,
-  resolveTelegramAccount,
-} from "../telegram/accounts.js";
 import { resolveUserPath } from "../utils.js";
-import {
-  listWhatsAppAccountIds,
-  resolveDefaultWhatsAppAccountId,
-  resolveWhatsAppAuthDir,
-} from "../web/accounts.js";
-import { webAuthExists } from "../web/session.js";
 import { createClackPrompter } from "../wizard/clack-prompter.js";
 import { WizardCancelledError } from "../wizard/prompts.js";
 import { applyAuthChoice, warnIfModelConfigLooksOff } from "./auth-choice.js";
-import { buildAuthChoiceOptions } from "./auth-choice-options.js";
+import { promptAuthChoiceGrouped } from "./auth-choice-prompt.js";
+import { setupChannels } from "./onboard-channels.js";
 import { ensureWorkspaceAndSessions, moveToTrash } from "./onboard-helpers.js";
-import { setupProviders } from "./onboard-providers.js";
-import type { AuthChoice, ProviderChoice } from "./onboard-types.js";
+import type { ChannelChoice } from "./onboard-types.js";
 
 type AgentsListOptions = {
   json?: boolean;
@@ -103,17 +78,6 @@ export type AgentSummary = {
   isDefault: boolean;
 };
 
-type AgentBinding = {
-  agentId: string;
-  match: {
-    provider: string;
-    accountId?: string;
-    peer?: { kind: "dm" | "group" | "channel"; id: string };
-    guildId?: string;
-    teamId?: string;
-  };
-};
-
 type AgentEntry = NonNullable<
   NonNullable<ClawdbotConfig["agents"]>["list"]
 >[number];
@@ -126,7 +90,7 @@ type AgentIdentity = {
 };
 
 type ProviderAccountStatus = {
-  provider: ChatProviderId;
+  provider: ChatChannelId;
   accountId: string;
   name?: string;
   state:
@@ -168,7 +132,15 @@ function resolveAgentModel(cfg: ClawdbotConfig, agentId: string) {
   const entry = listAgentEntries(cfg).find(
     (agent) => normalizeAgentId(agent.id) === normalizeAgentId(agentId),
   );
-  if (entry?.model?.trim()) return entry.model.trim();
+  if (entry?.model) {
+    if (typeof entry.model === "string" && entry.model.trim()) {
+      return entry.model.trim();
+    }
+    if (typeof entry.model === "object") {
+      const primary = entry.model.primary?.trim();
+      if (primary) return primary;
+    }
+  }
   const raw = cfg.agents?.defaults?.model;
   if (typeof raw === "string") return raw;
   return raw?.primary?.trim() || undefined;
@@ -294,7 +266,7 @@ export function applyAgentConfig(
 function bindingMatchKey(match: AgentBinding["match"]) {
   const accountId = match.accountId?.trim() || DEFAULT_ACCOUNT_ID;
   return [
-    match.provider,
+    match.channel,
     accountId,
     match.peer?.kind ?? "",
     match.peer?.id ?? "",
@@ -456,16 +428,16 @@ function formatSummary(summary: AgentSummary) {
   return lines.join("\n");
 }
 
-function providerAccountKey(provider: ChatProviderId, accountId?: string) {
+function providerAccountKey(provider: ChatChannelId, accountId?: string) {
   return `${provider}:${accountId ?? DEFAULT_ACCOUNT_ID}`;
 }
 
-function formatProviderAccountLabel(params: {
-  provider: ChatProviderId;
+function formatChannelAccountLabel(params: {
+  provider: ChatChannelId;
   accountId: string;
   name?: string;
 }): string {
-  const label = getChatProviderMeta(params.provider).label;
+  const label = getChatChannelMeta(params.provider).label;
   const account = params.name?.trim()
     ? `${params.accountId} (${params.name.trim()})`
     : params.accountId;
@@ -485,83 +457,46 @@ async function buildProviderStatusIndex(
 ): Promise<Map<string, ProviderAccountStatus>> {
   const map = new Map<string, ProviderAccountStatus>();
 
-  for (const accountId of listWhatsAppAccountIds(cfg)) {
-    const { authDir } = resolveWhatsAppAuthDir({ cfg, accountId });
-    const linked = await webAuthExists(authDir);
-    const enabled =
-      cfg.whatsapp?.accounts?.[accountId]?.enabled ?? cfg.web?.enabled ?? true;
-    const hasConfig = Boolean(cfg.whatsapp);
-    map.set(providerAccountKey("whatsapp", accountId), {
-      provider: "whatsapp",
-      accountId,
-      name: cfg.whatsapp?.accounts?.[accountId]?.name,
-      state: linked ? "linked" : "not linked",
-      enabled,
-      configured: linked || hasConfig,
-    });
-  }
-
-  for (const accountId of listTelegramAccountIds(cfg)) {
-    const account = resolveTelegramAccount({ cfg, accountId });
-    const configured = Boolean(account.token);
-    map.set(providerAccountKey("telegram", accountId), {
-      provider: "telegram",
-      accountId,
-      name: account.name,
-      state: configured ? "configured" : "not configured",
-      enabled: account.enabled,
-      configured,
-    });
-  }
-
-  for (const accountId of listDiscordAccountIds(cfg)) {
-    const account = resolveDiscordAccount({ cfg, accountId });
-    const configured = Boolean(account.token);
-    map.set(providerAccountKey("discord", accountId), {
-      provider: "discord",
-      accountId,
-      name: account.name,
-      state: configured ? "configured" : "not configured",
-      enabled: account.enabled,
-      configured,
-    });
-  }
-
-  for (const accountId of listSlackAccountIds(cfg)) {
-    const account = resolveSlackAccount({ cfg, accountId });
-    const configured = Boolean(account.botToken && account.appToken);
-    map.set(providerAccountKey("slack", accountId), {
-      provider: "slack",
-      accountId,
-      name: account.name,
-      state: configured ? "configured" : "not configured",
-      enabled: account.enabled,
-      configured,
-    });
-  }
-
-  for (const accountId of listSignalAccountIds(cfg)) {
-    const account = resolveSignalAccount({ cfg, accountId });
-    map.set(providerAccountKey("signal", accountId), {
-      provider: "signal",
-      accountId,
-      name: account.name,
-      state: account.configured ? "configured" : "not configured",
-      enabled: account.enabled,
-      configured: account.configured,
-    });
-  }
-
-  for (const accountId of listIMessageAccountIds(cfg)) {
-    const account = resolveIMessageAccount({ cfg, accountId });
-    map.set(providerAccountKey("imessage", accountId), {
-      provider: "imessage",
-      accountId,
-      name: account.name,
-      state: account.enabled ? "enabled" : "disabled",
-      enabled: account.enabled,
-      configured: Boolean(cfg.imessage),
-    });
+  for (const plugin of listChannelPlugins()) {
+    const accountIds = plugin.config.listAccountIds(cfg);
+    for (const accountId of accountIds) {
+      const account = plugin.config.resolveAccount(cfg, accountId);
+      const snapshot = plugin.config.describeAccount?.(account, cfg);
+      const enabled = plugin.config.isEnabled
+        ? plugin.config.isEnabled(account, cfg)
+        : typeof snapshot?.enabled === "boolean"
+          ? snapshot.enabled
+          : (account as { enabled?: boolean }).enabled;
+      const configured = plugin.config.isConfigured
+        ? await plugin.config.isConfigured(account, cfg)
+        : snapshot?.configured;
+      const resolvedEnabled = typeof enabled === "boolean" ? enabled : true;
+      const resolvedConfigured =
+        typeof configured === "boolean" ? configured : true;
+      const state =
+        plugin.status?.resolveAccountState?.({
+          account,
+          cfg,
+          configured: resolvedConfigured,
+          enabled: resolvedEnabled,
+        }) ??
+        (typeof snapshot?.linked === "boolean"
+          ? snapshot.linked
+            ? "linked"
+            : "not linked"
+          : resolvedConfigured
+            ? "configured"
+            : "not configured");
+      const name = snapshot?.name ?? (account as { name?: string }).name;
+      map.set(providerAccountKey(plugin.id, accountId), {
+        provider: plugin.id,
+        accountId,
+        name,
+        state,
+        enabled,
+        configured,
+      });
+    }
   }
 
   return map;
@@ -569,39 +504,28 @@ async function buildProviderStatusIndex(
 
 function resolveDefaultAccountId(
   cfg: ClawdbotConfig,
-  provider: ChatProviderId,
+  provider: ChatChannelId,
 ): string {
-  switch (provider) {
-    case "whatsapp":
-      return resolveDefaultWhatsAppAccountId(cfg) || DEFAULT_ACCOUNT_ID;
-    case "telegram":
-      return resolveDefaultTelegramAccountId(cfg) || DEFAULT_ACCOUNT_ID;
-    case "discord":
-      return resolveDefaultDiscordAccountId(cfg) || DEFAULT_ACCOUNT_ID;
-    case "slack":
-      return resolveDefaultSlackAccountId(cfg) || DEFAULT_ACCOUNT_ID;
-    case "signal":
-      return resolveDefaultSignalAccountId(cfg) || DEFAULT_ACCOUNT_ID;
-    case "imessage":
-      return resolveDefaultIMessageAccountId(cfg) || DEFAULT_ACCOUNT_ID;
-  }
+  const plugin = getChannelPlugin(provider);
+  if (!plugin) return DEFAULT_ACCOUNT_ID;
+  return resolveChannelDefaultAccountId({ plugin, cfg });
 }
 
 function shouldShowProviderEntry(
   entry: ProviderAccountStatus,
   cfg: ClawdbotConfig,
 ): boolean {
-  if (entry.provider === "whatsapp") {
-    return entry.state === "linked" || Boolean(cfg.whatsapp);
-  }
-  if (entry.provider === "imessage") {
-    return Boolean(cfg.imessage);
+  const plugin = getChannelPlugin(entry.provider);
+  if (!plugin) return Boolean(entry.configured);
+  if (plugin.meta.showConfigured === false) {
+    const providerConfig = (cfg as Record<string, unknown>)[plugin.id];
+    return Boolean(entry.configured) || Boolean(providerConfig);
   }
   return Boolean(entry.configured);
 }
 
 function formatProviderEntry(entry: ProviderAccountStatus): string {
-  const label = formatProviderAccountLabel({
+  const label = formatChannelAccountLabel({
     provider: entry.provider,
     accountId: entry.accountId,
     name: entry.name,
@@ -616,14 +540,14 @@ function summarizeBindings(
   if (bindings.length === 0) return [];
   const seen = new Map<string, string>();
   for (const binding of bindings) {
-    const provider = normalizeChatProviderId(binding.match.provider);
-    if (!provider) continue;
+    const channel = normalizeChatChannelId(binding.match.channel);
+    if (!channel) continue;
     const accountId =
-      binding.match.accountId ?? resolveDefaultAccountId(cfg, provider);
-    const key = providerAccountKey(provider, accountId);
+      binding.match.accountId ?? resolveDefaultAccountId(cfg, channel);
+    const key = providerAccountKey(channel, accountId);
     if (!seen.has(key)) {
-      const label = formatProviderAccountLabel({
-        provider,
+      const label = formatChannelAccountLabel({
+        provider: channel,
         accountId,
       });
       seen.set(key, label);
@@ -694,11 +618,11 @@ export async function agentsListCommand(
     if (bindings.length > 0) {
       const seen = new Set<string>();
       for (const binding of bindings) {
-        const provider = normalizeChatProviderId(binding.match.provider);
-        if (!provider) continue;
+        const channel = normalizeChatChannelId(binding.match.channel);
+        if (!channel) continue;
         const accountId =
-          binding.match.accountId ?? resolveDefaultAccountId(cfg, provider);
-        const key = providerAccountKey(provider, accountId);
+          binding.match.accountId ?? resolveDefaultAccountId(cfg, channel);
+        const key = providerAccountKey(channel, accountId);
         if (seen.has(key)) continue;
         seen.add(key);
         const status = providerStatus.get(key);
@@ -706,7 +630,7 @@ export async function agentsListCommand(
           providerLines.push(formatProviderEntry(status));
         } else {
           providerLines.push(
-            `${formatProviderAccountLabel({ provider, accountId })}: unknown`,
+            `${formatChannelAccountLabel({ provider: channel, accountId })}: unknown`,
           );
         }
       }
@@ -729,17 +653,17 @@ export async function agentsListCommand(
 
   const lines = ["Agents:", ...summaries.map(formatSummary)];
   lines.push(
-    "Routing rules map provider/account/peer to an agent. Use --bindings for full rules.",
+    "Routing rules map channel/account/peer to an agent. Use --bindings for full rules.",
   );
   lines.push(
-    "Provider status reflects local config/creds. For live health: clawdbot providers status --probe.",
+    "Channel status reflects local config/creds. For live health: clawdbot channels status --probe.",
   );
   runtime.log(lines.join("\n"));
 }
 
 function describeBinding(binding: AgentBinding) {
   const match = binding.match;
-  const parts = [match.provider];
+  const parts = [match.channel];
   if (match.accountId) parts.push(`accountId=${match.accountId}`);
   if (match.peer) parts.push(`peer=${match.peer.kind}:${match.peer.id}`);
   if (match.guildId) parts.push(`guild=${match.guildId}`);
@@ -747,22 +671,24 @@ function describeBinding(binding: AgentBinding) {
   return parts.join(" ");
 }
 
-function buildProviderBindings(params: {
+function buildChannelBindings(params: {
   agentId: string;
-  selection: ProviderChoice[];
+  selection: ChannelChoice[];
   config: ClawdbotConfig;
-  accountIds?: Partial<Record<ProviderChoice, string>>;
+  accountIds?: Partial<Record<ChannelChoice, string>>;
 }): AgentBinding[] {
   const bindings: AgentBinding[] = [];
   const agentId = normalizeAgentId(params.agentId);
-  for (const provider of params.selection) {
-    const match: AgentBinding["match"] = { provider };
-    const accountId = params.accountIds?.[provider]?.trim();
+  for (const channel of params.selection) {
+    const match: AgentBinding["match"] = { channel };
+    const accountId = params.accountIds?.[channel]?.trim();
     if (accountId) {
       match.accountId = accountId;
-    } else if (provider === "whatsapp") {
-      const defaultId = resolveDefaultWhatsAppAccountId(params.config);
-      match.accountId = defaultId || DEFAULT_ACCOUNT_ID;
+    } else {
+      const plugin = getChannelPlugin(channel);
+      if (plugin?.meta.forceAccountBinding) {
+        match.accountId = resolveDefaultAccountId(params.config, channel);
+      }
     }
     bindings.push({ agentId, match });
   }
@@ -781,10 +707,10 @@ function parseBindingSpecs(params: {
   for (const raw of specs) {
     const trimmed = raw?.trim();
     if (!trimmed) continue;
-    const [providerRaw, accountRaw] = trimmed.split(":", 2);
-    const provider = normalizeChatProviderId(providerRaw);
-    if (!provider) {
-      errors.push(`Unknown provider "${providerRaw}".`);
+    const [channelRaw, accountRaw] = trimmed.split(":", 2);
+    const channel = normalizeChatChannelId(channelRaw);
+    if (!channel) {
+      errors.push(`Unknown channel "${channelRaw}".`);
       continue;
     }
     let accountId = accountRaw?.trim();
@@ -792,11 +718,13 @@ function parseBindingSpecs(params: {
       errors.push(`Invalid binding "${trimmed}" (empty account id).`);
       continue;
     }
-    if (!accountId && provider === "whatsapp") {
-      accountId = resolveDefaultWhatsAppAccountId(params.config);
-      if (!accountId) accountId = DEFAULT_ACCOUNT_ID;
+    if (!accountId) {
+      const plugin = getChannelPlugin(channel);
+      if (plugin?.meta.forceAccountBinding) {
+        accountId = resolveDefaultAccountId(params.config, channel);
+      }
     }
-    const match: AgentBinding["match"] = { provider };
+    const match: AgentBinding["match"] = { channel };
     if (accountId) match.accountId = accountId;
     bindings.push({ agentId, match });
   }
@@ -990,14 +918,12 @@ export async function agentsAddCommand(
       const authStore = ensureAuthProfileStore(agentDir, {
         allowKeychainPrompt: false,
       });
-      const authChoice = (await prompter.select({
-        message: "Model/auth choice",
-        options: buildAuthChoiceOptions({
-          store: authStore,
-          includeSkip: true,
-          includeClaudeCliIfMissing: true,
-        }),
-      })) as AuthChoice;
+      const authChoice = await promptAuthChoiceGrouped({
+        prompter,
+        store: authStore,
+        includeSkip: true,
+        includeClaudeCliIfMissing: true,
+      });
 
       const authResult = await applyAuthChoice({
         authChoice,
@@ -1022,30 +948,30 @@ export async function agentsAddCommand(
       agentDir,
     });
 
-    let selection: ProviderChoice[] = [];
-    const providerAccountIds: Partial<Record<ProviderChoice, string>> = {};
-    nextConfig = await setupProviders(nextConfig, runtime, prompter, {
+    let selection: ChannelChoice[] = [];
+    const channelAccountIds: Partial<Record<ChannelChoice, string>> = {};
+    nextConfig = await setupChannels(nextConfig, runtime, prompter, {
       allowSignalInstall: true,
       onSelection: (value) => {
         selection = value;
       },
       promptAccountIds: true,
-      onAccountId: (provider, accountId) => {
-        providerAccountIds[provider] = accountId;
+      onAccountId: (channel, accountId) => {
+        channelAccountIds[channel] = accountId;
       },
     });
 
     if (selection.length > 0) {
       const wantsBindings = await prompter.confirm({
-        message: "Route selected providers to this agent now? (bindings)",
+        message: "Route selected channels to this agent now? (bindings)",
         initialValue: false,
       });
       if (wantsBindings) {
-        const desiredBindings = buildProviderBindings({
+        const desiredBindings = buildChannelBindings({
           agentId,
           selection,
           config: nextConfig,
-          accountIds: providerAccountIds,
+          accountIds: channelAccountIds,
         });
         const result = applyAgentBindings(nextConfig, desiredBindings);
         nextConfig = result.config;

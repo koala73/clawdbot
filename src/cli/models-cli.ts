@@ -1,6 +1,7 @@
 import type { Command } from "commander";
 
 import {
+  githubCopilotLoginCommand,
   modelsAliasesAddCommand,
   modelsAliasesListCommand,
   modelsAliasesRemoveCommand,
@@ -25,6 +26,8 @@ import {
   modelsStatusCommand,
 } from "../commands/models.js";
 import { defaultRuntime } from "../runtime.js";
+import { formatDocsLink } from "../terminal/links.js";
+import { theme } from "../terminal/theme.js";
 
 export function registerModelsCli(program: Command) {
   const models = program
@@ -39,6 +42,14 @@ export function registerModelsCli(program: Command) {
       "--status-plain",
       "Plain output (alias for `models status --plain`)",
       false,
+    )
+    .addHelpText(
+      "after",
+      () =>
+        `\n${theme.muted("Docs:")} ${formatDocsLink(
+          "/models",
+          "docs.clawd.bot/models",
+        )}\n`,
     );
 
   models
@@ -355,6 +366,31 @@ export function registerModelsCli(program: Command) {
             provider: opts.provider as string | undefined,
             profileId: opts.profileId as string | undefined,
             expiresIn: opts.expiresIn as string | undefined,
+          },
+          defaultRuntime,
+        );
+      } catch (err) {
+        defaultRuntime.error(String(err));
+        defaultRuntime.exit(1);
+      }
+    });
+
+  auth
+    .command("login-github-copilot")
+    .description(
+      "Login to GitHub Copilot via GitHub device flow (TTY required)",
+    )
+    .option(
+      "--profile-id <id>",
+      "Auth profile id (default: github-copilot:github)",
+    )
+    .option("--yes", "Overwrite existing profile without prompting", false)
+    .action(async (opts) => {
+      try {
+        await githubCopilotLoginCommand(
+          {
+            profileId: opts.profileId as string | undefined,
+            yes: Boolean(opts.yes),
           },
           defaultRuntime,
         );

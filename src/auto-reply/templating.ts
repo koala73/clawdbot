@@ -1,16 +1,20 @@
-/** Valid provider channels for message routing. */
-export type OriginatingChannelType =
-  | "telegram"
-  | "slack"
-  | "discord"
-  | "signal"
-  | "imessage"
-  | "whatsapp"
-  | "webchat"
-  | "msteams";
+import type { ChannelId } from "../channels/plugins/types.js";
+import type { InternalMessageChannel } from "../utils/message-channel.js";
+
+/** Valid message channels for routing. */
+export type OriginatingChannelType = ChannelId | InternalMessageChannel;
 
 export type MsgContext = {
   Body?: string;
+  /**
+   * Raw message body without structural context (history, sender labels).
+   * Legacy alias for CommandBody. Falls back to Body if not set.
+   */
+  RawBody?: string;
+  /**
+   * Prefer for command detection; RawBody is treated as legacy alias.
+   */
+  CommandBody?: string;
   From?: string;
   To?: string;
   SessionKey?: string;
@@ -41,7 +45,7 @@ export type MsgContext = {
   SenderUsername?: string;
   SenderTag?: string;
   SenderE164?: string;
-  /** Provider label (whatsapp|telegram|discord|imessage|...). */
+  /** Provider label (e.g. whatsapp, telegram). */
   Provider?: string;
   /** Provider surface label (e.g. discord, slack). Prefer this over `Provider` when available. */
   Surface?: string;

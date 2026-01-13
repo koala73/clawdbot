@@ -1,8 +1,14 @@
-import type { ReactionType, ReactionTypeEmoji } from "@grammyjs/types";
+import type {
+  InlineKeyboardButton,
+  InlineKeyboardMarkup,
+  ReactionType,
+  ReactionTypeEmoji,
+} from "@grammyjs/types";
 import { type ApiClientOptions, Bot, InputFile } from "grammy";
 import { loadConfig } from "../config/config.js";
+import { logVerbose } from "../globals.js";
+import { recordChannelActivity } from "../infra/channel-activity.js";
 import { formatErrorMessage } from "../infra/errors.js";
-import { recordProviderActivity } from "../infra/provider-activity.js";
 import type { RetryConfig } from "../infra/retry.js";
 import { createTelegramRetryRunner } from "../infra/retry-policy.js";
 import { mediaKindFromMime } from "../media/constants.js";
@@ -15,6 +21,7 @@ import {
   parseTelegramTarget,
   stripTelegramInternalPrefixes,
 } from "./targets.js";
+import { resolveTelegramVoiceSend } from "./voice.js";
 
 type TelegramSendOpts = {
   token?: string;
@@ -30,6 +37,8 @@ type TelegramSendOpts = {
   replyToMessageId?: number;
   /** Forum topic thread ID (for forum supergroups) */
   messageThreadId?: number;
+  /** Inline keyboard buttons (reply markup). */
+  buttons?: Array<Array<{ text: string; callback_data: string }>>;
 };
 
 type TelegramSendResult = {
@@ -56,7 +65,7 @@ function resolveToken(
   if (explicit?.trim()) return explicit.trim();
   if (!params.token) {
     throw new Error(
-      `Telegram bot token missing for account "${params.accountId}" (set telegram.accounts.${params.accountId}.botToken/tokenFile or TELEGRAM_BOT_TOKEN for default).`,
+      `Telegram bot token missing for account "${params.accountId}" (set channels.telegram.accounts.${params.accountId}.botToken/tokenFile or TELEGRAM_BOT_TOKEN for default).`,
     );
   }
   return params.token.trim();
@@ -103,6 +112,26 @@ function normalizeMessageId(raw: string | number): number {
   throw new Error("Message id is required for Telegram reactions");
 }
 
+export function buildInlineKeyboard(
+  buttons?: TelegramSendOpts["buttons"],
+): InlineKeyboardMarkup | undefined {
+  if (!buttons?.length) return undefined;
+  const rows = buttons
+    .map((row) =>
+      row
+        .filter((button) => button?.text && button?.callback_data)
+        .map(
+          (button): InlineKeyboardButton => ({
+            text: button.text,
+            callback_data: button.callback_data,
+          }),
+        ),
+    )
+    .filter((row) => row.length > 0);
+  if (rows.length === 0) return undefined;
+  return { inline_keyboard: rows };
+}
+
 export async function sendMessageTelegram(
   to: string,
   text: string,
@@ -124,6 +153,7 @@ export async function sendMessageTelegram(
     : undefined;
   const api = opts.api ?? new Bot(token, client ? { client } : undefined).api;
   const mediaUrl = opts.mediaUrl?.trim();
+  const replyMarkup = buildInlineKeyboard(opts.buttons);
 
   // Build optional params for forum topics and reply threading.
   // Only include these if actually provided to keep API calls clean.
@@ -171,8 +201,15 @@ export async function sendMessageTelegram(
     const file = new InputFile(media.buffer, fileName);
     const caption = text?.trim() || undefined;
     const mediaParams = hasThreadParams
-      ? { caption, ...threadParams }
-      : { caption };
+      ? {
+          caption,
+          ...threadParams,
+          ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+        }
+      : {
+          caption,
+          ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+        };
     let result:
       | Awaited<ReturnType<typeof api.sendPhoto>>
       | Awaited<ReturnType<typeof api.sendVideo>>
@@ -202,7 +239,12 @@ export async function sendMessageTelegram(
         throw wrapChatNotFound(err);
       });
     } else if (kind === "audio") {
-      const useVoice = opts.asVoice === true; // default false (backward compatible)
+      const { useVoice } = resolveTelegramVoiceSend({
+        wantsVoice: opts.asVoice === true, // default false (backward compatible)
+        contentType: media.contentType,
+        fileName,
+        logFallback: logVerbose,
+      });
       if (useVoice) {
         result = await request(
           () => api.sendVoice(chatId, file, mediaParams),
@@ -227,8 +269,8 @@ export async function sendMessageTelegram(
       });
     }
     const messageId = String(result?.message_id ?? "unknown");
-    recordProviderActivity({
-      provider: "telegram",
+    recordChannelActivity({
+      channel: "telegram",
       accountId: account.accountId,
       direction: "outbound",
     });
@@ -240,8 +282,15 @@ export async function sendMessageTelegram(
   }
   const htmlText = markdownToTelegramHtml(text);
   const textParams = hasThreadParams
-    ? { parse_mode: "HTML" as const, ...threadParams }
-    : { parse_mode: "HTML" as const };
+    ? {
+        parse_mode: "HTML" as const,
+        ...threadParams,
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+      }
+    : {
+        parse_mode: "HTML" as const,
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+      };
   const res = await request(
     () => api.sendMessage(chatId, htmlText, textParams),
     "message",
@@ -255,10 +304,17 @@ export async function sendMessageTelegram(
           `telegram HTML parse failed, retrying as plain text: ${errText}`,
         );
       }
+      const plainParams =
+        hasThreadParams || replyMarkup
+          ? {
+              ...threadParams,
+              ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+            }
+          : undefined;
       return await request(
         () =>
-          hasThreadParams
-            ? api.sendMessage(chatId, text, threadParams)
+          plainParams
+            ? api.sendMessage(chatId, text, plainParams)
             : api.sendMessage(chatId, text),
         "message-plain",
       ).catch((err2) => {
@@ -268,8 +324,8 @@ export async function sendMessageTelegram(
     throw wrapChatNotFound(err);
   });
   const messageId = String(res?.message_id ?? "unknown");
-  recordProviderActivity({
-    provider: "telegram",
+  recordChannelActivity({
+    channel: "telegram",
     accountId: account.accountId,
     direction: "outbound",
   });

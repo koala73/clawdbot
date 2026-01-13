@@ -204,12 +204,14 @@ final class NodeAppModel {
 
     func connectToBridge(
         endpoint: NWEndpoint,
+        bridgeStableID: String,
         hello: BridgeHello)
     {
         self.bridgeTask?.cancel()
         self.bridgeServerName = nil
         self.bridgeRemoteAddress = nil
-        self.connectedBridgeID = BridgeEndpointID.stableID(endpoint)
+        let id = bridgeStableID.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.connectedBridgeID = id.isEmpty ? BridgeEndpointID.stableID(endpoint) : id
         self.voiceWakeSyncTask?.cancel()
         self.voiceWakeSyncTask = nil
 
@@ -330,8 +332,7 @@ final class NodeAppModel {
             let ui = config["ui"] as? [String: Any]
             let raw = (ui?["seamColor"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let session = config["session"] as? [String: Any]
-            let rawMainKey = (session?["mainKey"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let mainKey = rawMainKey.isEmpty ? "main" : rawMainKey
+            let mainKey = SessionKey.normalizeMainKey(session?["mainKey"] as? String)
             await MainActor.run {
                 self.seamColorHex = raw.isEmpty ? nil : raw
                 self.mainSessionKey = mainKey

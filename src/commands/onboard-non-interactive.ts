@@ -14,11 +14,16 @@ import {
   resolveGatewayPort,
   writeConfigFile,
 } from "../config/config.js";
-import { GATEWAY_LAUNCH_AGENT_LABEL } from "../daemon/constants.js";
+import { resolveGatewayLaunchAgentLabel } from "../daemon/constants.js";
 import { resolveGatewayProgramArguments } from "../daemon/program-args.js";
-import { resolvePreferredNodePath } from "../daemon/runtime-paths.js";
+import {
+  renderSystemNodeWarning,
+  resolvePreferredNodePath,
+  resolveSystemNodeInfo,
+} from "../daemon/runtime-paths.js";
 import { resolveGatewayService } from "../daemon/service.js";
 import { buildServiceEnvironment } from "../daemon/service-env.js";
+import { isSystemdUserServiceAvailable } from "../daemon/systemd.js";
 import { upsertSharedEnvVar } from "../infra/env-file.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { defaultRuntime } from "../runtime.js";
@@ -33,10 +38,19 @@ import {
   applyAuthProfileConfig,
   applyMinimaxApiConfig,
   applyMinimaxConfig,
-  applyMinimaxHostedConfig,
+  applyMoonshotConfig,
+  applyOpencodeZenConfig,
+  applyOpenrouterConfig,
+  applySyntheticConfig,
+  applyZaiConfig,
   setAnthropicApiKey,
   setGeminiApiKey,
   setMinimaxApiKey,
+  setMoonshotApiKey,
+  setOpencodeZenApiKey,
+  setOpenrouterApiKey,
+  setSyntheticApiKey,
+  setZaiApiKey,
 } from "./onboard-auth.js";
 import {
   applyWizardMetadata,
@@ -116,6 +130,13 @@ export async function runNonInteractiveOnboarding(
   runtime: RuntimeEnv = defaultRuntime,
 ) {
   const snapshot = await readConfigFileSnapshot();
+  if (snapshot.exists && !snapshot.valid) {
+    runtime.error(
+      "Config invalid. Run `clawdbot doctor` to repair it, then re-run onboarding.",
+    );
+    runtime.exit(1);
+    return;
+  }
   const baseConfig: ClawdbotConfig = snapshot.valid ? snapshot.config : {};
   const mode = opts.mode ?? "local";
   if (mode !== "local" && mode !== "remote") {
@@ -222,6 +243,25 @@ export async function runNonInteractiveOnboarding(
       mode: "api_key",
     });
     nextConfig = applyGoogleGeminiModelDefault(nextConfig).next;
+  } else if (authChoice === "zai-api-key") {
+    const resolved = await resolveNonInteractiveApiKey({
+      provider: "zai",
+      cfg: baseConfig,
+      flagValue: opts.zaiApiKey,
+      flagName: "--zai-api-key",
+      envVar: "ZAI_API_KEY",
+      runtime,
+    });
+    if (!resolved) return;
+    if (resolved.source !== "profile") {
+      await setZaiApiKey(resolved.key);
+    }
+    nextConfig = applyAuthProfileConfig(nextConfig, {
+      profileId: "zai:default",
+      provider: "zai",
+      mode: "api_key",
+    });
+    nextConfig = applyZaiConfig(nextConfig);
   } else if (authChoice === "openai-api-key") {
     const resolved = await resolveNonInteractiveApiKey({
       provider: "openai",
@@ -240,7 +280,68 @@ export async function runNonInteractiveOnboarding(
     });
     process.env.OPENAI_API_KEY = key;
     runtime.log(`Saved OPENAI_API_KEY to ${result.path}`);
-  } else if (authChoice === "minimax-cloud") {
+  } else if (authChoice === "openrouter-api-key") {
+    const resolved = await resolveNonInteractiveApiKey({
+      provider: "openrouter",
+      cfg: baseConfig,
+      flagValue: opts.openrouterApiKey,
+      flagName: "--openrouter-api-key",
+      envVar: "OPENROUTER_API_KEY",
+      runtime,
+    });
+    if (!resolved) return;
+    if (resolved.source !== "profile") {
+      await setOpenrouterApiKey(resolved.key);
+    }
+    nextConfig = applyAuthProfileConfig(nextConfig, {
+      profileId: "openrouter:default",
+      provider: "openrouter",
+      mode: "api_key",
+    });
+    nextConfig = applyOpenrouterConfig(nextConfig);
+  } else if (authChoice === "moonshot-api-key") {
+    const resolved = await resolveNonInteractiveApiKey({
+      provider: "moonshot",
+      cfg: baseConfig,
+      flagValue: opts.moonshotApiKey,
+      flagName: "--moonshot-api-key",
+      envVar: "MOONSHOT_API_KEY",
+      runtime,
+    });
+    if (!resolved) return;
+    if (resolved.source !== "profile") {
+      await setMoonshotApiKey(resolved.key);
+    }
+    nextConfig = applyAuthProfileConfig(nextConfig, {
+      profileId: "moonshot:default",
+      provider: "moonshot",
+      mode: "api_key",
+    });
+    nextConfig = applyMoonshotConfig(nextConfig);
+  } else if (authChoice === "synthetic-api-key") {
+    const resolved = await resolveNonInteractiveApiKey({
+      provider: "synthetic",
+      cfg: baseConfig,
+      flagValue: opts.syntheticApiKey,
+      flagName: "--synthetic-api-key",
+      envVar: "SYNTHETIC_API_KEY",
+      runtime,
+    });
+    if (!resolved) return;
+    if (resolved.source !== "profile") {
+      await setSyntheticApiKey(resolved.key);
+    }
+    nextConfig = applyAuthProfileConfig(nextConfig, {
+      profileId: "synthetic:default",
+      provider: "synthetic",
+      mode: "api_key",
+    });
+    nextConfig = applySyntheticConfig(nextConfig);
+  } else if (
+    authChoice === "minimax-cloud" ||
+    authChoice === "minimax-api" ||
+    authChoice === "minimax-api-lightning"
+  ) {
     const resolved = await resolveNonInteractiveApiKey({
       provider: "minimax",
       cfg: baseConfig,
@@ -258,26 +359,11 @@ export async function runNonInteractiveOnboarding(
       provider: "minimax",
       mode: "api_key",
     });
-    nextConfig = applyMinimaxHostedConfig(nextConfig);
-  } else if (authChoice === "minimax-api") {
-    const resolved = await resolveNonInteractiveApiKey({
-      provider: "minimax",
-      cfg: baseConfig,
-      flagValue: opts.minimaxApiKey,
-      flagName: "--minimax-api-key",
-      envVar: "MINIMAX_API_KEY",
-      runtime,
-    });
-    if (!resolved) return;
-    if (resolved.source !== "profile") {
-      await setMinimaxApiKey(resolved.key);
-    }
-    nextConfig = applyAuthProfileConfig(nextConfig, {
-      profileId: "minimax:default",
-      provider: "minimax",
-      mode: "api_key",
-    });
-    nextConfig = applyMinimaxApiConfig(nextConfig);
+    const modelId =
+      authChoice === "minimax-api-lightning"
+        ? "MiniMax-M2.1-lightning"
+        : "MiniMax-M2.1";
+    nextConfig = applyMinimaxApiConfig(nextConfig, modelId);
   } else if (authChoice === "claude-cli") {
     const store = ensureAuthProfileStore(undefined, {
       allowKeychainPrompt: false,
@@ -311,9 +397,29 @@ export async function runNonInteractiveOnboarding(
     nextConfig = applyOpenAICodexModelDefault(nextConfig).next;
   } else if (authChoice === "minimax") {
     nextConfig = applyMinimaxConfig(nextConfig);
+  } else if (authChoice === "opencode-zen") {
+    const resolved = await resolveNonInteractiveApiKey({
+      provider: "opencode",
+      cfg: baseConfig,
+      flagValue: opts.opencodeZenApiKey,
+      flagName: "--opencode-zen-api-key",
+      envVar: "OPENCODE_API_KEY (or OPENCODE_ZEN_API_KEY)",
+      runtime,
+    });
+    if (!resolved) return;
+    if (resolved.source !== "profile") {
+      await setOpencodeZenApiKey(resolved.key);
+    }
+    nextConfig = applyAuthProfileConfig(nextConfig, {
+      profileId: "opencode:default",
+      provider: "opencode",
+      mode: "api_key",
+    });
+    nextConfig = applyOpencodeZenConfig(nextConfig);
   } else if (
     authChoice === "token" ||
     authChoice === "oauth" ||
+    authChoice === "chutes" ||
     authChoice === "openai-codex" ||
     authChoice === "antigravity"
   ) {
@@ -341,7 +447,7 @@ export async function runNonInteractiveOnboarding(
     ? (opts.gatewayPort as number)
     : resolveGatewayPort(baseConfig);
   let bind = opts.gatewayBind ?? "loopback";
-  let authMode = opts.gatewayAuth ?? "off";
+  let authMode = opts.gatewayAuth ?? "token";
   const tailscaleMode = opts.tailscale ?? "off";
   const tailscaleResetOnExit = Boolean(opts.tailscaleResetOnExit);
 
@@ -362,7 +468,11 @@ export async function runNonInteractiveOnboarding(
       ...nextConfig,
       gateway: {
         ...nextConfig.gateway,
-        auth: { ...nextConfig.gateway?.auth, mode: "token" },
+        auth: {
+          ...nextConfig.gateway?.auth,
+          mode: "token",
+          token: gatewayToken,
+        },
       },
     };
   }
@@ -429,41 +539,61 @@ export async function runNonInteractiveOnboarding(
   const daemonRuntimeRaw = opts.daemonRuntime ?? DEFAULT_GATEWAY_DAEMON_RUNTIME;
 
   if (opts.installDaemon) {
-    if (!isGatewayDaemonRuntime(daemonRuntimeRaw)) {
-      runtime.error("Invalid --daemon-runtime (use node or bun)");
-      runtime.exit(1);
-      return;
-    }
-    const service = resolveGatewayService();
-    const devMode =
-      process.argv[1]?.includes(`${path.sep}src${path.sep}`) &&
-      process.argv[1]?.endsWith(".ts");
-    const nodePath = await resolvePreferredNodePath({
-      env: process.env,
-      runtime: daemonRuntimeRaw,
-    });
-    const { programArguments, workingDirectory } =
-      await resolveGatewayProgramArguments({
-        port,
-        dev: devMode,
+    const systemdAvailable =
+      process.platform === "linux"
+        ? await isSystemdUserServiceAvailable()
+        : true;
+    if (process.platform === "linux" && !systemdAvailable) {
+      runtime.log(
+        "Systemd user services are unavailable; skipping daemon install.",
+      );
+    } else {
+      if (!isGatewayDaemonRuntime(daemonRuntimeRaw)) {
+        runtime.error("Invalid --daemon-runtime (use node or bun)");
+        runtime.exit(1);
+        return;
+      }
+      const service = resolveGatewayService();
+      const devMode =
+        process.argv[1]?.includes(`${path.sep}src${path.sep}`) &&
+        process.argv[1]?.endsWith(".ts");
+      const nodePath = await resolvePreferredNodePath({
+        env: process.env,
         runtime: daemonRuntimeRaw,
-        nodePath,
       });
-    const environment = buildServiceEnvironment({
-      env: process.env,
-      port,
-      token: gatewayToken,
-      launchdLabel:
-        process.platform === "darwin" ? GATEWAY_LAUNCH_AGENT_LABEL : undefined,
-    });
-    await service.install({
-      env: process.env,
-      stdout: process.stdout,
-      programArguments,
-      workingDirectory,
-      environment,
-    });
-    await ensureSystemdUserLingerNonInteractive({ runtime });
+      const { programArguments, workingDirectory } =
+        await resolveGatewayProgramArguments({
+          port,
+          dev: devMode,
+          runtime: daemonRuntimeRaw,
+          nodePath,
+        });
+      if (daemonRuntimeRaw === "node") {
+        const systemNode = await resolveSystemNodeInfo({ env: process.env });
+        const warning = renderSystemNodeWarning(
+          systemNode,
+          programArguments[0],
+        );
+        if (warning) runtime.log(warning);
+      }
+      const environment = buildServiceEnvironment({
+        env: process.env,
+        port,
+        token: gatewayToken,
+        launchdLabel:
+          process.platform === "darwin"
+            ? resolveGatewayLaunchAgentLabel(process.env.CLAWDBOT_PROFILE)
+            : undefined,
+      });
+      await service.install({
+        env: process.env,
+        stdout: process.stdout,
+        programArguments,
+        workingDirectory,
+        environment,
+      });
+      await ensureSystemdUserLingerNonInteractive({ runtime });
+    }
   }
 
   if (!opts.skipHealth) {

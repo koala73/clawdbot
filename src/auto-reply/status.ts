@@ -8,6 +8,7 @@ import {
 } from "../agents/defaults.js";
 import { resolveModelAuthMode } from "../agents/model-auth.js";
 import { resolveConfiguredModelRef } from "../agents/model-selection.js";
+import { resolveSandboxRuntimeStatus } from "../agents/sandbox.js";
 import {
   derivePromptTokens,
   normalizeUsage,
@@ -28,7 +29,10 @@ import {
   resolveModelCostConfig,
 } from "../utils/usage-format.js";
 import { VERSION } from "../version.js";
-import { listChatCommands } from "./commands-registry.js";
+import {
+  listChatCommands,
+  listChatCommandsForConfig,
+} from "./commands-registry.js";
 import type {
   ElevatedLevel,
   ReasoningLevel,
@@ -245,14 +249,22 @@ export function buildStatusMessage(args: StatusArgs): string {
   const runtime = (() => {
     const sandboxMode = args.agent?.sandbox?.mode ?? "off";
     if (sandboxMode === "off") return { label: "direct" };
-    const sessionScope = args.sessionScope ?? "per-sender";
-    const mainKey = resolveMainSessionKey({
-      session: { scope: sessionScope },
-    });
     const sessionKey = args.sessionKey?.trim();
-    const sandboxed = sessionKey
-      ? sandboxMode === "all" || sessionKey !== mainKey.trim()
-      : false;
+    const sandboxed = (() => {
+      if (!sessionKey) return false;
+      if (sandboxMode === "all") return true;
+      if (args.config) {
+        return resolveSandboxRuntimeStatus({
+          cfg: args.config,
+          sessionKey,
+        }).sandboxed;
+      }
+      const sessionScope = args.sessionScope ?? "per-sender";
+      const mainKey = resolveMainSessionKey({
+        session: { scope: sessionScope },
+      });
+      return sessionKey !== mainKey.trim();
+    })();
     const runtime = sandboxed ? "docker" : sessionKey ? "direct" : "unknown";
     return {
       label: `${runtime}/${sandboxMode}`,
@@ -288,12 +300,14 @@ export function buildStatusMessage(args: StatusArgs): string {
 
   const queueMode = args.queue?.mode ?? "unknown";
   const queueDetails = formatQueueDetails(args.queue);
+  const verboseLabel = verboseLevel === "on" ? "verbose" : null;
+  const elevatedLabel = elevatedLevel === "on" ? "elevated" : null;
   const optionParts = [
     `Runtime: ${runtime.label}`,
     `Think: ${thinkLevel}`,
-    `Verbose: ${verboseLevel}`,
+    verboseLabel,
     reasoningLevel !== "off" ? `Reasoning: ${reasoningLevel}` : null,
-    `Elevated: ${elevatedLevel}`,
+    elevatedLabel,
   ];
   const optionsLine = optionParts.filter(Boolean).join(" · ");
   const activationParts = [
@@ -332,7 +346,7 @@ export function buildStatusMessage(args: StatusArgs): string {
   const authLabel = authLabelValue ? ` · 🔑 ${authLabelValue}` : "";
   const modelLine = `🧠 Model: ${modelLabel}${authLabel}`;
   const commit = resolveCommitHash();
-  const versionLine = `🦞 ClawdBot ${VERSION}${commit ? ` (${commit})` : ""}`;
+  const versionLine = `🦞 Clawdbot ${VERSION}${commit ? ` (${commit})` : ""}`;
   const usagePair = formatUsagePair(inputTokens, outputTokens);
   const costLine = costLabel ? `💵 Cost: ${costLabel}` : null;
   const usageCostLine =
@@ -354,18 +368,29 @@ export function buildStatusMessage(args: StatusArgs): string {
     .join("\n");
 }
 
-export function buildHelpMessage(): string {
+export function buildHelpMessage(cfg?: ClawdbotConfig): string {
+  const options = [
+    "/think <level>",
+    "/verbose on|off",
+    "/reasoning on|off",
+    "/elevated on|off",
+    "/model <id>",
+    "/cost on|off",
+  ];
+  if (cfg?.commands?.config === true) options.push("/config show");
+  if (cfg?.commands?.debug === true) options.push("/debug show");
   return [
     "ℹ️ Help",
     "Shortcuts: /new reset | /compact [instructions] | /restart relink (if enabled)",
-    "Options: /think <level> | /verbose on|off | /reasoning on|off | /elevated on|off | /model <id> | /cost on|off | /debug show",
+    `Options: ${options.join(" | ")}`,
     "More: /commands for all slash commands",
   ].join("\n");
 }
 
-export function buildCommandsMessage(): string {
+export function buildCommandsMessage(cfg?: ClawdbotConfig): string {
   const lines = ["ℹ️ Slash commands"];
-  for (const command of listChatCommands()) {
+  const commands = cfg ? listChatCommandsForConfig(cfg) : listChatCommands();
+  for (const command of commands) {
     const primary = command.nativeName
       ? `/${command.nativeName}`
       : command.textAliases[0]?.trim() || `/${command.key}`;

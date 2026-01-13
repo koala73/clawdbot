@@ -4,6 +4,7 @@ import util from "node:util";
 
 import { Chalk } from "chalk";
 import { Logger as TsLogger } from "tslog";
+import { CHAT_CHANNEL_ORDER } from "./channels/registry.js";
 import { type ClawdbotConfig, loadConfig } from "./config/config.js";
 import { isVerbose } from "./globals.js";
 import { defaultRuntime, type RuntimeEnv } from "./runtime.js";
@@ -115,6 +116,7 @@ function levelToMinLevel(level: Level): number {
 export function isFileLogLevelEnabled(level: LogLevel): boolean {
   const settings = cachedSettings ?? resolveSettings();
   if (!cachedSettings) cachedSettings = settings;
+  if (settings.level === "silent") return false;
   return levelToMinLevel(level) <= levelToMinLevel(settings.level);
 }
 
@@ -388,6 +390,7 @@ type SubsystemLogger = {
 };
 
 function shouldLogToConsole(level: Level, settings: ConsoleSettings): boolean {
+  if (settings.level === "silent") return false;
   const current = levelToMinLevel(level);
   const min = levelToMinLevel(settings.level);
   return current <= min;
@@ -402,7 +405,11 @@ function isRichConsoleEnv(): boolean {
 }
 
 function getColorForConsole(): ChalkInstance {
-  if (process.env.NO_COLOR) return new Chalk({ level: 0 });
+  const hasForceColor =
+    typeof process.env.FORCE_COLOR === "string" &&
+    process.env.FORCE_COLOR.trim().length > 0 &&
+    process.env.FORCE_COLOR.trim() !== "0";
+  if (process.env.NO_COLOR && !hasForceColor) return new Chalk({ level: 0 });
   const hasTty = Boolean(process.stdout.isTTY || process.stderr.isTTY);
   return hasTty || isRichConsoleEnv()
     ? new Chalk({ level: 1 })
@@ -423,8 +430,13 @@ const SUBSYSTEM_COLOR_OVERRIDES: Record<
 > = {
   "gmail-watcher": "blue",
 };
-const SUBSYSTEM_PREFIXES_TO_DROP = ["gateway", "providers"] as const;
+const SUBSYSTEM_PREFIXES_TO_DROP = [
+  "gateway",
+  "channels",
+  "providers",
+] as const;
 const SUBSYSTEM_MAX_SEGMENTS = 2;
+const CHANNEL_SUBSYSTEM_PREFIXES = new Set<string>(CHAT_CHANNEL_ORDER);
 
 function pickSubsystemColor(
   color: ChalkInstance,
@@ -453,13 +465,48 @@ function formatSubsystemForConsole(subsystem: string): string {
     parts.shift();
   }
   if (parts.length === 0) return original;
-  if (parts[0] === "whatsapp" || parts[0] === "telegram") {
+  if (CHANNEL_SUBSYSTEM_PREFIXES.has(parts[0])) {
     return parts[0];
   }
   if (parts.length > SUBSYSTEM_MAX_SEGMENTS) {
     return parts.slice(-SUBSYSTEM_MAX_SEGMENTS).join("/");
   }
   return parts.join("/");
+}
+
+export function stripRedundantSubsystemPrefixForConsole(
+  message: string,
+  displaySubsystem: string,
+): string {
+  if (!displaySubsystem) return message;
+
+  // Common duplication: "[discord] discord: ..." (when a message manually includes the subsystem tag).
+  if (message.startsWith("[")) {
+    const closeIdx = message.indexOf("]");
+    if (closeIdx > 1) {
+      const bracketTag = message.slice(1, closeIdx);
+      if (bracketTag.toLowerCase() === displaySubsystem.toLowerCase()) {
+        let i = closeIdx + 1;
+        while (message[i] === " ") i += 1;
+        return message.slice(i);
+      }
+    }
+  }
+
+  const prefix = message.slice(0, displaySubsystem.length);
+  if (prefix.toLowerCase() !== displaySubsystem.toLowerCase()) return message;
+
+  const next = message.slice(
+    displaySubsystem.length,
+    displaySubsystem.length + 1,
+  );
+  if (next !== ":" && next !== " ") return message;
+
+  let i = displaySubsystem.length;
+  while (message[i] === " ") i += 1;
+  if (message[i] === ":") i += 1;
+  while (message[i] === " ") i += 1;
+  return message.slice(i);
 }
 
 function formatConsoleLine(opts: {
@@ -493,13 +540,17 @@ function formatConsoleLine(opts: {
         : opts.level === "debug" || opts.level === "trace"
           ? color.gray
           : color.cyan;
+  const displayMessage = stripRedundantSubsystemPrefixForConsole(
+    opts.message,
+    displaySubsystem,
+  );
   const time =
     opts.style === "pretty"
       ? color.gray(new Date().toISOString().slice(11, 19))
       : "";
   const prefixToken = prefixColor(prefix);
   const head = [time, prefixToken].filter(Boolean).join(" ");
-  return `${head} ${levelColor(opts.message)}`;
+  return `${head} ${levelColor(displayMessage)}`;
 }
 
 function writeConsoleLine(level: Level, line: string) {

@@ -4,11 +4,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const messageCommand = vi.fn();
 const statusCommand = vi.fn();
 const configureCommand = vi.fn();
+const configureCommandWithSections = vi.fn();
 const setupCommand = vi.fn();
 const onboardCommand = vi.fn();
 const callGateway = vi.fn();
-const runProviderLogin = vi.fn();
-const runProviderLogout = vi.fn();
+const runChannelLogin = vi.fn();
+const runChannelLogout = vi.fn();
+const runTui = vi.fn();
 
 const runtime = {
   log: vi.fn(),
@@ -22,13 +24,28 @@ vi.mock("../commands/message.js", () => ({
   messageCommand,
 }));
 vi.mock("../commands/status.js", () => ({ statusCommand }));
-vi.mock("../commands/configure.js", () => ({ configureCommand }));
+vi.mock("../commands/configure.js", () => ({
+  CONFIGURE_WIZARD_SECTIONS: [
+    "workspace",
+    "model",
+    "gateway",
+    "daemon",
+    "channels",
+    "skills",
+    "health",
+  ],
+  configureCommand,
+  configureCommandWithSections,
+}));
 vi.mock("../commands/setup.js", () => ({ setupCommand }));
 vi.mock("../commands/onboard.js", () => ({ onboardCommand }));
 vi.mock("../runtime.js", () => ({ defaultRuntime: runtime }));
-vi.mock("./provider-auth.js", () => ({
-  runProviderLogin,
-  runProviderLogout,
+vi.mock("./channel-auth.js", () => ({
+  runChannelLogin,
+  runChannelLogout,
+}));
+vi.mock("../tui/tui.js", () => ({
+  runTui,
 }));
 vi.mock("../gateway/call.js", () => ({
   callGateway,
@@ -43,6 +60,7 @@ const { buildProgram } = await import("./program.js");
 describe("cli program", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    runTui.mockResolvedValue(undefined);
   });
 
   it("runs message with required options", async () => {
@@ -60,6 +78,37 @@ describe("cli program", () => {
     const program = buildProgram();
     await program.parseAsync(["status"], { from: "user" });
     expect(statusCommand).toHaveBeenCalled();
+  });
+
+  it("runs tui without overriding timeout", async () => {
+    const program = buildProgram();
+    await program.parseAsync(["tui"], { from: "user" });
+    expect(runTui).toHaveBeenCalledWith(
+      expect.objectContaining({ timeoutMs: undefined }),
+    );
+  });
+
+  it("runs tui with explicit timeout override", async () => {
+    const program = buildProgram();
+    await program.parseAsync(["tui", "--timeout-ms", "45000"], {
+      from: "user",
+    });
+    expect(runTui).toHaveBeenCalledWith(
+      expect.objectContaining({ timeoutMs: 45000 }),
+    );
+  });
+
+  it("warns and ignores invalid tui timeout override", async () => {
+    const program = buildProgram();
+    await program.parseAsync(["tui", "--timeout-ms", "nope"], {
+      from: "user",
+    });
+    expect(runtime.error).toHaveBeenCalledWith(
+      'warning: invalid --timeout-ms "nope"; ignoring',
+    );
+    expect(runTui).toHaveBeenCalledWith(
+      expect.objectContaining({ timeoutMs: undefined }),
+    );
   });
 
   it("runs config alias as configure", async () => {
@@ -84,33 +133,139 @@ describe("cli program", () => {
     expect(setupCommand).not.toHaveBeenCalled();
   });
 
-  it("runs providers login", async () => {
+  it("passes opencode-zen api key to onboard", async () => {
     const program = buildProgram();
-    await program.parseAsync(["providers", "login", "--account", "work"], {
-      from: "user",
-    });
-    expect(runProviderLogin).toHaveBeenCalledWith(
-      { provider: undefined, account: "work", verbose: false },
+    await program.parseAsync(
+      [
+        "onboard",
+        "--non-interactive",
+        "--auth-choice",
+        "opencode-zen",
+        "--opencode-zen-api-key",
+        "sk-opencode-zen-test",
+      ],
+      { from: "user" },
+    );
+    expect(onboardCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        nonInteractive: true,
+        authChoice: "opencode-zen",
+        opencodeZenApiKey: "sk-opencode-zen-test",
+      }),
       runtime,
     );
   });
 
-  it("runs providers logout", async () => {
+  it("passes openrouter api key to onboard", async () => {
     const program = buildProgram();
-    await program.parseAsync(["providers", "logout", "--account", "work"], {
-      from: "user",
-    });
-    expect(runProviderLogout).toHaveBeenCalledWith(
-      { provider: undefined, account: "work" },
+    await program.parseAsync(
+      [
+        "onboard",
+        "--non-interactive",
+        "--auth-choice",
+        "openrouter-api-key",
+        "--openrouter-api-key",
+        "sk-openrouter-test",
+      ],
+      { from: "user" },
+    );
+    expect(onboardCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        nonInteractive: true,
+        authChoice: "openrouter-api-key",
+        openrouterApiKey: "sk-openrouter-test",
+      }),
       runtime,
     );
   });
 
-  it("runs hidden login alias", async () => {
+  it("passes moonshot api key to onboard", async () => {
     const program = buildProgram();
-    await program.parseAsync(["login", "--account", "work"], { from: "user" });
-    expect(runProviderLogin).toHaveBeenCalledWith(
-      { provider: undefined, account: "work", verbose: false },
+    await program.parseAsync(
+      [
+        "onboard",
+        "--non-interactive",
+        "--auth-choice",
+        "moonshot-api-key",
+        "--moonshot-api-key",
+        "sk-moonshot-test",
+      ],
+      { from: "user" },
+    );
+    expect(onboardCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        nonInteractive: true,
+        authChoice: "moonshot-api-key",
+        moonshotApiKey: "sk-moonshot-test",
+      }),
+      runtime,
+    );
+  });
+
+  it("passes synthetic api key to onboard", async () => {
+    const program = buildProgram();
+    await program.parseAsync(
+      [
+        "onboard",
+        "--non-interactive",
+        "--auth-choice",
+        "synthetic-api-key",
+        "--synthetic-api-key",
+        "sk-synthetic-test",
+      ],
+      { from: "user" },
+    );
+    expect(onboardCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        nonInteractive: true,
+        authChoice: "synthetic-api-key",
+        syntheticApiKey: "sk-synthetic-test",
+      }),
+      runtime,
+    );
+  });
+
+  it("passes zai api key to onboard", async () => {
+    const program = buildProgram();
+    await program.parseAsync(
+      [
+        "onboard",
+        "--non-interactive",
+        "--auth-choice",
+        "zai-api-key",
+        "--zai-api-key",
+        "sk-zai-test",
+      ],
+      { from: "user" },
+    );
+    expect(onboardCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        nonInteractive: true,
+        authChoice: "zai-api-key",
+        zaiApiKey: "sk-zai-test",
+      }),
+      runtime,
+    );
+  });
+
+  it("runs channels login", async () => {
+    const program = buildProgram();
+    await program.parseAsync(["channels", "login", "--account", "work"], {
+      from: "user",
+    });
+    expect(runChannelLogin).toHaveBeenCalledWith(
+      { channel: undefined, account: "work", verbose: false },
+      runtime,
+    );
+  });
+
+  it("runs channels logout", async () => {
+    const program = buildProgram();
+    await program.parseAsync(["channels", "logout", "--account", "work"], {
+      from: "user",
+    });
+    expect(runChannelLogout).toHaveBeenCalledWith(
+      { channel: undefined, account: "work" },
       runtime,
     );
   });

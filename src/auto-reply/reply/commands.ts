@@ -1,6 +1,7 @@
 import {
   resolveAgentDir,
   resolveDefaultAgentId,
+  resolveSessionAgentId,
 } from "../../agents/agent-scope.js";
 import {
   ensureAuthProfileStore,
@@ -18,7 +19,19 @@ import {
   isEmbeddedPiRunActive,
   waitForEmbeddedPiRunEnd,
 } from "../../agents/pi-embedded.js";
+import type { ChannelId } from "../../channels/plugins/types.js";
 import type { ClawdbotConfig } from "../../config/config.js";
+import {
+  readConfigFileSnapshot,
+  validateConfigObject,
+  writeConfigFile,
+} from "../../config/config.js";
+import {
+  getConfigValueAtPath,
+  parseConfigPath,
+  setConfigValueAtPath,
+  unsetConfigValueAtPath,
+} from "../../config/config-paths.js";
 import {
   getConfigOverrides,
   resetConfigOverrides,
@@ -26,7 +39,6 @@ import {
   unsetConfigOverride,
 } from "../../config/runtime-overrides.js";
 import {
-  resolveAgentIdFromSessionKey,
   resolveSessionFilePath,
   type SessionEntry,
   type SessionScope,
@@ -45,7 +57,6 @@ import {
 import { enqueueSystemEvent } from "../../infra/system-events.js";
 import { parseAgentSessionKey } from "../../routing/session-key.js";
 import { resolveSendPolicy } from "../../sessions/send-policy.js";
-import { normalizeE164 } from "../../utils.js";
 import { resolveCommandAuthorization } from "../command-auth.js";
 import {
   normalizeCommandBody,
@@ -72,6 +83,8 @@ import type {
 } from "../thinking.js";
 import type { ReplyPayload } from "../types.js";
 import { isAbortTrigger, setAbortMemory } from "./abort.js";
+import { handleBashChatCommand } from "./bash-command.js";
+import { parseConfigCommand } from "./config-commands.js";
 import { parseDebugCommand } from "./debug-commands.js";
 import type { InlineDirectives } from "./directive-handling.js";
 import { stripMentions, stripStructuralPrefixes } from "./mentions.js";
@@ -95,11 +108,11 @@ function resolveSessionEntryForKey(
 
 export type CommandContext = {
   surface: string;
-  provider: string;
-  isWhatsAppProvider: boolean;
+  channel: string;
+  channelId?: ChannelId;
   ownerList: string[];
   isAuthorizedSender: boolean;
-  senderE164?: string;
+  senderId?: string;
   abortKey?: string;
   rawBodyNormalized: string;
   commandBodyNormalized: string;
@@ -111,7 +124,7 @@ export async function buildStatusReply(params: {
   cfg: ClawdbotConfig;
   command: CommandContext;
   sessionEntry?: SessionEntry;
-  sessionKey?: string;
+  sessionKey: string;
   sessionScope?: SessionScope;
   provider: string;
   model: string;
@@ -143,12 +156,12 @@ export async function buildStatusReply(params: {
   } = params;
   if (!command.isAuthorizedSender) {
     logVerbose(
-      `Ignoring /status from unauthorized sender: ${command.senderE164 || "<unknown>"}`,
+      `Ignoring /status from unauthorized sender: ${command.senderId || "<unknown>"}`,
     );
     return undefined;
   }
   const statusAgentId = sessionKey
-    ? resolveAgentIdFromSessionKey(sessionKey)
+    ? resolveSessionAgentId({ sessionKey, config: cfg })
     : resolveDefaultAgentId(cfg);
   const statusAgentDir = resolveAgentDir(cfg, statusAgentId);
   let usageLine: string | null = null;
@@ -176,7 +189,7 @@ export async function buildStatusReply(params: {
   }
   const queueSettings = resolveQueueSettings({
     cfg,
-    provider: command.provider,
+    channel: command.channel,
     sessionEntry,
   });
   const queueKey = sessionKey ?? sessionEntry?.sessionId;
@@ -334,7 +347,7 @@ export function buildCommandContext(params: {
     commandAuthorized: params.commandAuthorized,
   });
   const surface = (ctx.Surface ?? ctx.Provider ?? "").trim().toLowerCase();
-  const provider = (ctx.Provider ?? surface).trim().toLowerCase();
+  const channel = (ctx.Provider ?? surface).trim().toLowerCase();
   const abortKey =
     sessionKey ?? (auth.from || undefined) ?? (auth.to || undefined);
   const rawBodyNormalized = triggerBodyNormalized;
@@ -346,11 +359,11 @@ export function buildCommandContext(params: {
 
   return {
     surface,
-    provider,
-    isWhatsAppProvider: auth.isWhatsAppProvider,
+    channel,
+    channelId: auth.providerId,
     ownerList: auth.ownerList,
     isAuthorizedSender: auth.isAuthorizedSender,
-    senderE164: auth.senderE164,
+    senderId: auth.senderId,
     abortKey,
     rawBodyNormalized,
     commandBodyNormalized,
@@ -388,9 +401,14 @@ export async function handleCommands(params: {
   command: CommandContext;
   agentId?: string;
   directives: InlineDirectives;
+  elevated: {
+    enabled: boolean;
+    allowed: boolean;
+    failures: Array<{ gate: string; key: string }>;
+  };
   sessionEntry?: SessionEntry;
   sessionStore?: Record<string, SessionEntry>;
-  sessionKey?: string;
+  sessionKey: string;
   storePath?: string;
   sessionScope?: SessionScope;
   workspaceDir: string;
@@ -413,6 +431,7 @@ export async function handleCommands(params: {
     cfg,
     command,
     directives,
+    elevated,
     sessionEntry,
     sessionStore,
     sessionKey,
@@ -436,7 +455,7 @@ export async function handleCommands(params: {
     command.commandBodyNormalized === "/new";
   if (resetRequested && !command.isAuthorizedSender) {
     logVerbose(
-      `Ignoring /reset from unauthorized sender: ${command.senderE164 || "<unknown>"}`,
+      `Ignoring /reset from unauthorized sender: ${command.senderId || "<unknown>"}`,
     );
     return { shouldContinue: false };
   }
@@ -453,6 +472,30 @@ export async function handleCommands(params: {
     commandSource: ctx.CommandSource,
   });
 
+  const bashSlashRequested =
+    allowTextCommands &&
+    (command.commandBodyNormalized === "/bash" ||
+      command.commandBodyNormalized.startsWith("/bash "));
+  const bashBangRequested =
+    allowTextCommands && command.commandBodyNormalized.startsWith("!");
+  if (bashSlashRequested || (bashBangRequested && command.isAuthorizedSender)) {
+    if (!command.isAuthorizedSender) {
+      logVerbose(
+        `Ignoring /bash from unauthorized sender: ${command.senderId || "<unknown>"}`,
+      );
+      return { shouldContinue: false };
+    }
+    const reply = await handleBashChatCommand({
+      ctx,
+      cfg,
+      agentId: params.agentId,
+      sessionKey,
+      isGroup,
+      elevated,
+    });
+    return { shouldContinue: false, reply };
+  }
+
   if (allowTextCommands && activationCommand.hasCommand) {
     if (!isGroup) {
       return {
@@ -460,22 +503,9 @@ export async function handleCommands(params: {
         reply: { text: "⚙️ Group activation only applies to group chats." },
       };
     }
-    const activationOwnerList = command.ownerList;
-    const activationSenderE164 = command.senderE164
-      ? normalizeE164(command.senderE164)
-      : "";
-    const isActivationOwner =
-      !command.isWhatsAppProvider || activationOwnerList.length === 0
-        ? command.isAuthorizedSender
-        : Boolean(activationSenderE164) &&
-          activationOwnerList.includes(activationSenderE164);
-
-    if (
-      !command.isAuthorizedSender ||
-      (command.isWhatsAppProvider && !isActivationOwner)
-    ) {
+    if (!command.isAuthorizedSender) {
       logVerbose(
-        `Ignoring /activation from unauthorized sender in group: ${command.senderE164 || "<unknown>"}`,
+        `Ignoring /activation from unauthorized sender in group: ${command.senderId || "<unknown>"}`,
       );
       return { shouldContinue: false };
     }
@@ -503,7 +533,7 @@ export async function handleCommands(params: {
   if (allowTextCommands && sendPolicyCommand.hasCommand) {
     if (!command.isAuthorizedSender) {
       logVerbose(
-        `Ignoring /send from unauthorized sender: ${command.senderE164 || "<unknown>"}`,
+        `Ignoring /send from unauthorized sender: ${command.senderId || "<unknown>"}`,
       );
       return { shouldContinue: false };
     }
@@ -540,7 +570,7 @@ export async function handleCommands(params: {
   if (allowTextCommands && command.commandBodyNormalized === "/restart") {
     if (!command.isAuthorizedSender) {
       logVerbose(
-        `Ignoring /restart from unauthorized sender: ${command.senderE164 || "<unknown>"}`,
+        `Ignoring /restart from unauthorized sender: ${command.senderId || "<unknown>"}`,
       );
       return { shouldContinue: false };
     }
@@ -586,28 +616,37 @@ export async function handleCommands(params: {
   if (allowTextCommands && helpRequested) {
     if (!command.isAuthorizedSender) {
       logVerbose(
-        `Ignoring /help from unauthorized sender: ${command.senderE164 || "<unknown>"}`,
+        `Ignoring /help from unauthorized sender: ${command.senderId || "<unknown>"}`,
       );
       return { shouldContinue: false };
     }
-    return { shouldContinue: false, reply: { text: buildHelpMessage() } };
+    return { shouldContinue: false, reply: { text: buildHelpMessage(cfg) } };
   }
 
   const commandsRequested = command.commandBodyNormalized === "/commands";
   if (allowTextCommands && commandsRequested) {
     if (!command.isAuthorizedSender) {
       logVerbose(
-        `Ignoring /commands from unauthorized sender: ${command.senderE164 || "<unknown>"}`,
+        `Ignoring /commands from unauthorized sender: ${command.senderId || "<unknown>"}`,
       );
       return { shouldContinue: false };
     }
-    return { shouldContinue: false, reply: { text: buildCommandsMessage() } };
+    return {
+      shouldContinue: false,
+      reply: { text: buildCommandsMessage(cfg) },
+    };
   }
 
   const statusRequested =
     directives.hasStatusDirective ||
     command.commandBodyNormalized === "/status";
   if (allowTextCommands && statusRequested) {
+    if (!command.isAuthorizedSender) {
+      logVerbose(
+        `Ignoring /status from unauthorized sender: ${command.senderId || "<unknown>"}`,
+      );
+      return { shouldContinue: false };
+    }
     const reply = await buildStatusReply({
       cfg,
       command,
@@ -628,15 +667,185 @@ export async function handleCommands(params: {
     return { shouldContinue: false, reply };
   }
 
+  const whoamiRequested = command.commandBodyNormalized === "/whoami";
+  if (allowTextCommands && whoamiRequested) {
+    if (!command.isAuthorizedSender) {
+      logVerbose(
+        `Ignoring /whoami from unauthorized sender: ${command.senderId || "<unknown>"}`,
+      );
+      return { shouldContinue: false };
+    }
+    const senderId = ctx.SenderId ?? "";
+    const senderUsername = ctx.SenderUsername ?? "";
+    const lines = ["🧭 Identity", `Channel: ${command.channel}`];
+    if (senderId) lines.push(`User id: ${senderId}`);
+    if (senderUsername) {
+      const handle = senderUsername.startsWith("@")
+        ? senderUsername
+        : `@${senderUsername}`;
+      lines.push(`Username: ${handle}`);
+    }
+    if (ctx.ChatType === "group" && ctx.From) {
+      lines.push(`Chat: ${ctx.From}`);
+    }
+    if (ctx.MessageThreadId != null) {
+      lines.push(`Thread: ${ctx.MessageThreadId}`);
+    }
+    if (senderId) {
+      lines.push(`AllowFrom: ${senderId}`);
+    }
+    return { shouldContinue: false, reply: { text: lines.join("\n") } };
+  }
+
+  const configCommand = allowTextCommands
+    ? parseConfigCommand(command.commandBodyNormalized)
+    : null;
+  if (configCommand) {
+    if (!command.isAuthorizedSender) {
+      logVerbose(
+        `Ignoring /config from unauthorized sender: ${command.senderId || "<unknown>"}`,
+      );
+      return { shouldContinue: false };
+    }
+    if (cfg.commands?.config !== true) {
+      return {
+        shouldContinue: false,
+        reply: {
+          text: "⚠️ /config is disabled. Set commands.config=true to enable.",
+        },
+      };
+    }
+    if (configCommand.action === "error") {
+      return {
+        shouldContinue: false,
+        reply: { text: `⚠️ ${configCommand.message}` },
+      };
+    }
+    const snapshot = await readConfigFileSnapshot();
+    if (
+      !snapshot.valid ||
+      !snapshot.parsed ||
+      typeof snapshot.parsed !== "object"
+    ) {
+      return {
+        shouldContinue: false,
+        reply: {
+          text: "⚠️ Config file is invalid; fix it before using /config.",
+        },
+      };
+    }
+    const parsedBase = structuredClone(
+      snapshot.parsed as Record<string, unknown>,
+    );
+
+    if (configCommand.action === "show") {
+      const pathRaw = configCommand.path?.trim();
+      if (pathRaw) {
+        const parsedPath = parseConfigPath(pathRaw);
+        if (!parsedPath.ok || !parsedPath.path) {
+          return {
+            shouldContinue: false,
+            reply: { text: `⚠️ ${parsedPath.error ?? "Invalid path."}` },
+          };
+        }
+        const value = getConfigValueAtPath(parsedBase, parsedPath.path);
+        const rendered = JSON.stringify(value ?? null, null, 2);
+        return {
+          shouldContinue: false,
+          reply: {
+            text: `⚙️ Config ${pathRaw}:\n\`\`\`json\n${rendered}\n\`\`\``,
+          },
+        };
+      }
+      const json = JSON.stringify(parsedBase, null, 2);
+      return {
+        shouldContinue: false,
+        reply: { text: `⚙️ Config (raw):\n\`\`\`json\n${json}\n\`\`\`` },
+      };
+    }
+
+    if (configCommand.action === "unset") {
+      const parsedPath = parseConfigPath(configCommand.path);
+      if (!parsedPath.ok || !parsedPath.path) {
+        return {
+          shouldContinue: false,
+          reply: { text: `⚠️ ${parsedPath.error ?? "Invalid path."}` },
+        };
+      }
+      const removed = unsetConfigValueAtPath(parsedBase, parsedPath.path);
+      if (!removed) {
+        return {
+          shouldContinue: false,
+          reply: { text: `⚙️ No config value found for ${configCommand.path}.` },
+        };
+      }
+      const validated = validateConfigObject(parsedBase);
+      if (!validated.ok) {
+        const issue = validated.issues[0];
+        return {
+          shouldContinue: false,
+          reply: {
+            text: `⚠️ Config invalid after unset (${issue.path}: ${issue.message}).`,
+          },
+        };
+      }
+      await writeConfigFile(validated.config);
+      return {
+        shouldContinue: false,
+        reply: { text: `⚙️ Config updated: ${configCommand.path} removed.` },
+      };
+    }
+
+    if (configCommand.action === "set") {
+      const parsedPath = parseConfigPath(configCommand.path);
+      if (!parsedPath.ok || !parsedPath.path) {
+        return {
+          shouldContinue: false,
+          reply: { text: `⚠️ ${parsedPath.error ?? "Invalid path."}` },
+        };
+      }
+      setConfigValueAtPath(parsedBase, parsedPath.path, configCommand.value);
+      const validated = validateConfigObject(parsedBase);
+      if (!validated.ok) {
+        const issue = validated.issues[0];
+        return {
+          shouldContinue: false,
+          reply: {
+            text: `⚠️ Config invalid after set (${issue.path}: ${issue.message}).`,
+          },
+        };
+      }
+      await writeConfigFile(validated.config);
+      const valueLabel =
+        typeof configCommand.value === "string"
+          ? `"${configCommand.value}"`
+          : JSON.stringify(configCommand.value);
+      return {
+        shouldContinue: false,
+        reply: {
+          text: `⚙️ Config updated: ${configCommand.path}=${valueLabel ?? "null"}`,
+        },
+      };
+    }
+  }
+
   const debugCommand = allowTextCommands
     ? parseDebugCommand(command.commandBodyNormalized)
     : null;
   if (debugCommand) {
     if (!command.isAuthorizedSender) {
       logVerbose(
-        `Ignoring /debug from unauthorized sender: ${command.senderE164 || "<unknown>"}`,
+        `Ignoring /debug from unauthorized sender: ${command.senderId || "<unknown>"}`,
       );
       return { shouldContinue: false };
+    }
+    if (cfg.commands?.debug !== true) {
+      return {
+        shouldContinue: false,
+        reply: {
+          text: "⚠️ /debug is disabled. Set commands.debug=true to enable.",
+        },
+      };
     }
     if (debugCommand.action === "error") {
       return {
@@ -714,7 +923,7 @@ export async function handleCommands(params: {
   if (allowTextCommands && stopRequested) {
     if (!command.isAuthorizedSender) {
       logVerbose(
-        `Ignoring /stop from unauthorized sender: ${command.senderE164 || "<unknown>"}`,
+        `Ignoring /stop from unauthorized sender: ${command.senderId || "<unknown>"}`,
       );
       return { shouldContinue: false };
     }
@@ -746,7 +955,7 @@ export async function handleCommands(params: {
   if (compactRequested) {
     if (!command.isAuthorizedSender) {
       logVerbose(
-        `Ignoring /compact from unauthorized sender: ${command.senderE164 || "<unknown>"}`,
+        `Ignoring /compact from unauthorized sender: ${command.senderId || "<unknown>"}`,
       );
       return { shouldContinue: false };
     }
@@ -762,7 +971,7 @@ export async function handleCommands(params: {
       await waitForEmbeddedPiRunEnd(sessionId, 15_000);
     }
     const customInstructions = extractCompactInstructions({
-      rawBody: ctx.Body,
+      rawBody: ctx.CommandBody ?? ctx.RawBody ?? ctx.Body,
       ctx,
       cfg,
       agentId: params.agentId,
@@ -771,7 +980,7 @@ export async function handleCommands(params: {
     const result = await compactEmbeddedPiSession({
       sessionId,
       sessionKey,
-      messageProvider: command.provider,
+      messageChannel: command.channel,
       sessionFile: resolveSessionFilePath(sessionId, sessionEntry),
       workspaceDir,
       config: cfg,
@@ -815,7 +1024,7 @@ export async function handleCommands(params: {
     const line = reason
       ? `${compactLabel}: ${reason} • ${contextSummary}`
       : `${compactLabel} • ${contextSummary}`;
-    enqueueSystemEvent(line);
+    enqueueSystemEvent(line, { sessionKey });
     return { shouldContinue: false, reply: { text: `⚙️ ${line}` } };
   }
 
@@ -847,7 +1056,7 @@ export async function handleCommands(params: {
     cfg,
     entry: sessionEntry,
     sessionKey,
-    provider: sessionEntry?.provider ?? command.provider,
+    channel: sessionEntry?.channel ?? command.channel,
     chatType: sessionEntry?.chatType,
   });
   if (sendPolicy === "deny") {

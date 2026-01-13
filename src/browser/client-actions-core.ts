@@ -23,6 +23,7 @@ export type BrowserActRequest =
       doubleClick?: boolean;
       button?: string;
       modifiers?: string[];
+      timeoutMs?: number;
     }
   | {
       kind: "type";
@@ -31,15 +32,35 @@ export type BrowserActRequest =
       targetId?: string;
       submit?: boolean;
       slowly?: boolean;
+      timeoutMs?: number;
     }
-  | { kind: "press"; key: string; targetId?: string }
-  | { kind: "hover"; ref: string; targetId?: string }
-  | { kind: "drag"; startRef: string; endRef: string; targetId?: string }
-  | { kind: "select"; ref: string; values: string[]; targetId?: string }
+  | { kind: "press"; key: string; targetId?: string; delayMs?: number }
+  | { kind: "hover"; ref: string; targetId?: string; timeoutMs?: number }
+  | {
+      kind: "scrollIntoView";
+      ref: string;
+      targetId?: string;
+      timeoutMs?: number;
+    }
+  | {
+      kind: "drag";
+      startRef: string;
+      endRef: string;
+      targetId?: string;
+      timeoutMs?: number;
+    }
+  | {
+      kind: "select";
+      ref: string;
+      values: string[];
+      targetId?: string;
+      timeoutMs?: number;
+    }
   | {
       kind: "fill";
       fields: BrowserFormField[];
       targetId?: string;
+      timeoutMs?: number;
     }
   | { kind: "resize"; width: number; height: number; targetId?: string }
   | {
@@ -47,7 +68,12 @@ export type BrowserActRequest =
       timeMs?: number;
       text?: string;
       textGone?: string;
+      selector?: string;
+      url?: string;
+      loadState?: "load" | "domcontentloaded" | "networkidle";
+      fn?: string;
       targetId?: string;
+      timeoutMs?: number;
     }
   | { kind: "evaluate"; fn: string; ref?: string; targetId?: string }
   | { kind: "close"; targetId?: string };
@@ -57,6 +83,12 @@ export type BrowserActResponse = {
   targetId: string;
   url?: string;
   result?: unknown;
+};
+
+export type BrowserDownloadPayload = {
+  url: string;
+  suggestedFilename: string;
+  path: string;
 };
 
 export async function browserNavigate(
@@ -131,6 +163,60 @@ export async function browserArmFileChooser(
       timeoutMs: 20000,
     },
   );
+}
+
+export async function browserWaitForDownload(
+  baseUrl: string,
+  opts: {
+    path?: string;
+    targetId?: string;
+    timeoutMs?: number;
+    profile?: string;
+  },
+): Promise<{ ok: true; targetId: string; download: BrowserDownloadPayload }> {
+  const q = buildProfileQuery(opts.profile);
+  return await fetchBrowserJson<{
+    ok: true;
+    targetId: string;
+    download: BrowserDownloadPayload;
+  }>(`${baseUrl}/wait/download${q}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      targetId: opts.targetId,
+      path: opts.path,
+      timeoutMs: opts.timeoutMs,
+    }),
+    timeoutMs: 20000,
+  });
+}
+
+export async function browserDownload(
+  baseUrl: string,
+  opts: {
+    ref: string;
+    path: string;
+    targetId?: string;
+    timeoutMs?: number;
+    profile?: string;
+  },
+): Promise<{ ok: true; targetId: string; download: BrowserDownloadPayload }> {
+  const q = buildProfileQuery(opts.profile);
+  return await fetchBrowserJson<{
+    ok: true;
+    targetId: string;
+    download: BrowserDownloadPayload;
+  }>(`${baseUrl}/download${q}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      targetId: opts.targetId,
+      ref: opts.ref,
+      path: opts.path,
+      timeoutMs: opts.timeoutMs,
+    }),
+    timeoutMs: 20000,
+  });
 }
 
 export async function browserAct(

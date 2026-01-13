@@ -2,6 +2,7 @@
 // unintentionally breaking on newlines. Using [\s\S] keeps newlines inside
 // the chunk so messages are only split when they truly exceed the limit.
 
+import type { ChannelId } from "../channels/plugins/types.js";
 import type { ClawdbotConfig } from "../config/config.js";
 import {
   findFenceSpanAt,
@@ -9,79 +10,63 @@ import {
   parseFenceSpans,
 } from "../markdown/fences.js";
 import { normalizeAccountId } from "../routing/session-key.js";
+import { INTERNAL_MESSAGE_CHANNEL } from "../utils/message-channel.js";
 
-export type TextChunkProvider =
-  | "whatsapp"
-  | "telegram"
-  | "discord"
-  | "slack"
-  | "signal"
-  | "imessage"
-  | "webchat"
-  | "msteams";
+export type TextChunkProvider = ChannelId | typeof INTERNAL_MESSAGE_CHANNEL;
 
-const DEFAULT_CHUNK_LIMIT_BY_PROVIDER: Record<TextChunkProvider, number> = {
-  whatsapp: 4000,
-  telegram: 4000,
-  discord: 2000,
-  slack: 4000,
-  signal: 4000,
-  imessage: 4000,
-  webchat: 4000,
-  msteams: 4000,
+const DEFAULT_CHUNK_LIMIT = 4000;
+
+type ProviderChunkConfig = {
+  textChunkLimit?: number;
+  accounts?: Record<string, { textChunkLimit?: number }>;
 };
+
+function resolveChunkLimitForProvider(
+  cfgSection: ProviderChunkConfig | undefined,
+  accountId?: string | null,
+): number | undefined {
+  if (!cfgSection) return undefined;
+  const normalizedAccountId = normalizeAccountId(accountId);
+  const accounts = cfgSection.accounts;
+  if (accounts && typeof accounts === "object") {
+    const direct = accounts[normalizedAccountId];
+    if (typeof direct?.textChunkLimit === "number") {
+      return direct.textChunkLimit;
+    }
+    const matchKey = Object.keys(accounts).find(
+      (key) => key.toLowerCase() === normalizedAccountId.toLowerCase(),
+    );
+    const match = matchKey ? accounts[matchKey] : undefined;
+    if (typeof match?.textChunkLimit === "number") {
+      return match.textChunkLimit;
+    }
+  }
+  return cfgSection.textChunkLimit;
+}
 
 export function resolveTextChunkLimit(
   cfg: ClawdbotConfig | undefined,
   provider?: TextChunkProvider,
   accountId?: string | null,
+  opts?: { fallbackLimit?: number },
 ): number {
+  const fallback =
+    typeof opts?.fallbackLimit === "number" && opts.fallbackLimit > 0
+      ? opts.fallbackLimit
+      : DEFAULT_CHUNK_LIMIT;
   const providerOverride = (() => {
-    if (!provider) return undefined;
-    const normalizedAccountId = normalizeAccountId(accountId);
-    if (provider === "whatsapp") {
-      return cfg?.whatsapp?.textChunkLimit;
-    }
-    if (provider === "telegram") {
-      return (
-        cfg?.telegram?.accounts?.[normalizedAccountId]?.textChunkLimit ??
-        cfg?.telegram?.textChunkLimit
-      );
-    }
-    if (provider === "discord") {
-      return (
-        cfg?.discord?.accounts?.[normalizedAccountId]?.textChunkLimit ??
-        cfg?.discord?.textChunkLimit
-      );
-    }
-    if (provider === "slack") {
-      return (
-        cfg?.slack?.accounts?.[normalizedAccountId]?.textChunkLimit ??
-        cfg?.slack?.textChunkLimit
-      );
-    }
-    if (provider === "signal") {
-      return (
-        cfg?.signal?.accounts?.[normalizedAccountId]?.textChunkLimit ??
-        cfg?.signal?.textChunkLimit
-      );
-    }
-    if (provider === "imessage") {
-      return (
-        cfg?.imessage?.accounts?.[normalizedAccountId]?.textChunkLimit ??
-        cfg?.imessage?.textChunkLimit
-      );
-    }
-    if (provider === "msteams") {
-      return cfg?.msteams?.textChunkLimit;
-    }
-    return undefined;
+    if (!provider || provider === INTERNAL_MESSAGE_CHANNEL) return undefined;
+    const channelsConfig = cfg?.channels as Record<string, unknown> | undefined;
+    const providerConfig = (channelsConfig?.[provider] ??
+      (cfg as Record<string, unknown> | undefined)?.[provider]) as
+      | ProviderChunkConfig
+      | undefined;
+    return resolveChunkLimitForProvider(providerConfig, accountId);
   })();
   if (typeof providerOverride === "number" && providerOverride > 0) {
     return providerOverride;
   }
-  if (provider) return DEFAULT_CHUNK_LIMIT_BY_PROVIDER[provider];
-  return 4000;
+  return fallback;
 }
 
 export function chunkText(text: string, limit: number): string[] {

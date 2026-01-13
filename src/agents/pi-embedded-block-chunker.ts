@@ -53,6 +53,14 @@ export class EmbeddedBlockChunker {
     const maxChars = Math.max(minChars, Math.floor(this.#chunking.maxChars));
     if (this.#buffer.length < minChars && !force) return;
 
+    if (force && this.#buffer.length <= maxChars) {
+      if (this.#buffer.trim().length > 0) {
+        emit(this.#buffer);
+      }
+      this.#buffer = "";
+      return;
+    }
+
     while (
       this.#buffer.length >= minChars ||
       (force && this.#buffer.length > 0)
@@ -60,7 +68,7 @@ export class EmbeddedBlockChunker {
       const breakResult =
         force && this.#buffer.length <= maxChars
           ? this.#pickSoftBreakIndex(this.#buffer, 1)
-          : this.#pickBreakIndex(this.#buffer);
+          : this.#pickBreakIndex(this.#buffer, force ? 1 : undefined);
       if (breakResult.index <= 0) {
         if (force) {
           emit(this.#buffer);
@@ -121,11 +129,13 @@ export class EmbeddedBlockChunker {
     if (preference === "paragraph") {
       let paragraphIdx = buffer.indexOf("\n\n");
       while (paragraphIdx !== -1) {
-        if (
-          paragraphIdx >= minChars &&
-          isSafeFenceBreak(fenceSpans, paragraphIdx)
-        ) {
-          return { index: paragraphIdx };
+        const candidates = [paragraphIdx, paragraphIdx + 1];
+        for (const candidate of candidates) {
+          if (candidate < minChars) continue;
+          if (candidate < 0 || candidate >= buffer.length) continue;
+          if (isSafeFenceBreak(fenceSpans, candidate)) {
+            return { index: candidate };
+          }
         }
         paragraphIdx = buffer.indexOf("\n\n", paragraphIdx + 2);
       }
@@ -161,8 +171,11 @@ export class EmbeddedBlockChunker {
     return { index: -1 };
   }
 
-  #pickBreakIndex(buffer: string): BreakResult {
-    const minChars = Math.max(1, Math.floor(this.#chunking.minChars));
+  #pickBreakIndex(buffer: string, minCharsOverride?: number): BreakResult {
+    const minChars = Math.max(
+      1,
+      Math.floor(minCharsOverride ?? this.#chunking.minChars),
+    );
     const maxChars = Math.max(minChars, Math.floor(this.#chunking.maxChars));
     if (buffer.length < minChars) return { index: -1 };
     const window = buffer.slice(0, Math.min(maxChars, buffer.length));
@@ -172,8 +185,13 @@ export class EmbeddedBlockChunker {
     if (preference === "paragraph") {
       let paragraphIdx = window.lastIndexOf("\n\n");
       while (paragraphIdx >= minChars) {
-        if (isSafeFenceBreak(fenceSpans, paragraphIdx)) {
-          return { index: paragraphIdx };
+        const candidates = [paragraphIdx, paragraphIdx + 1];
+        for (const candidate of candidates) {
+          if (candidate < minChars) continue;
+          if (candidate < 0 || candidate >= buffer.length) continue;
+          if (isSafeFenceBreak(fenceSpans, candidate)) {
+            return { index: candidate };
+          }
         }
         paragraphIdx = window.lastIndexOf("\n\n", paragraphIdx - 1);
       }
@@ -201,6 +219,10 @@ export class EmbeddedBlockChunker {
         }
       }
       if (sentenceIdx >= minChars) return { index: sentenceIdx };
+    }
+
+    if (preference === "newline" && buffer.length < maxChars) {
+      return { index: -1 };
     }
 
     for (let i = window.length - 1; i >= minChars; i--) {

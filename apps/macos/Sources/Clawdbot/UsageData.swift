@@ -21,12 +21,18 @@ struct GatewayUsageSummary: Codable {
 
 struct UsageRow: Identifiable {
     let id: String
+    let providerId: String
     let displayName: String
     let plan: String?
     let windowLabel: String?
     let usedPercent: Double?
     let resetAt: Date?
     let error: String?
+
+    var hasError: Bool {
+        if let error, !error.isEmpty { return true }
+        return false
+    }
 
     var titleText: String {
         if let plan, !plan.isEmpty { return "\(self.displayName) (\(plan))" }
@@ -40,7 +46,6 @@ struct UsageRow: Identifiable {
     }
 
     func detailText(now: Date = .init()) -> String {
-        if let error, !error.isEmpty { return error }
         guard let remaining = self.remainingPercent else { return "No data" }
         var parts = ["\(remaining)% left"]
         if let windowLabel, !windowLabel.isEmpty { parts.append(windowLabel) }
@@ -73,6 +78,7 @@ extension GatewayUsageSummary {
             if let error = provider.error, provider.windows.isEmpty {
                 return UsageRow(
                     id: provider.provider,
+                    providerId: provider.provider,
                     displayName: provider.displayName,
                     plan: provider.plan,
                     windowLabel: nil,
@@ -87,6 +93,7 @@ extension GatewayUsageSummary {
 
             return UsageRow(
                 id: "\(provider.provider)-\(window.label)",
+                providerId: provider.provider,
                 displayName: provider.displayName,
                 plan: provider.plan,
                 windowLabel: window.label,

@@ -7,6 +7,7 @@ import type { WebClient as SlackWebClient } from "@slack/web-api";
 import {
   resolveAckReaction,
   resolveEffectiveMessagesConfig,
+  resolveHumanDelayConfig,
 } from "../agents/identity.js";
 import {
   chunkMarkdownText,
@@ -15,7 +16,7 @@ import {
 import { hasControlCommand } from "../auto-reply/command-detection.js";
 import {
   buildCommandText,
-  listNativeCommandSpecs,
+  listNativeCommandSpecsForConfig,
   shouldHandleTextCommands,
 } from "../auto-reply/commands-registry.js";
 import {
@@ -24,13 +25,21 @@ import {
 } from "../auto-reply/envelope.js";
 import { dispatchReplyFromConfig } from "../auto-reply/reply/dispatch-from-config.js";
 import {
+  buildHistoryContextFromMap,
+  clearHistoryEntries,
+  DEFAULT_GROUP_HISTORY_LIMIT,
+  type HistoryEntry,
+} from "../auto-reply/reply/history.js";
+import {
   buildMentionRegexes,
   matchesMentionPatterns,
 } from "../auto-reply/reply/mentions.js";
+import { dispatchReplyWithDispatcher } from "../auto-reply/reply/provider-dispatcher.js";
 import { createReplyDispatcherWithTyping } from "../auto-reply/reply/reply-dispatcher.js";
-import { getReplyFromConfig } from "../auto-reply/reply.js";
-import { SILENT_REPLY_TOKEN } from "../auto-reply/tokens.js";
+import { createReplyReferencePlanner } from "../auto-reply/reply/reply-reference.js";
+import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../auto-reply/tokens.js";
 import type { ReplyPayload } from "../auto-reply/types.js";
+import { resolveNativeCommandsEnabled } from "../config/commands.js";
 import type {
   ClawdbotConfig,
   SlackReactionNotificationMode,
@@ -43,20 +52,24 @@ import {
   updateLastRoute,
 } from "../config/sessions.js";
 import { danger, logVerbose, shouldLogVerbose } from "../globals.js";
+import { createDedupeCache } from "../infra/dedupe.js";
 import { enqueueSystemEvent } from "../infra/system-events.js";
 import { getChildLogger } from "../logging.js";
-import { detectMime } from "../media/mime.js";
+import { type FetchLike, fetchRemoteMedia } from "../media/fetch.js";
 import { saveMediaBuffer } from "../media/store.js";
 import { buildPairingReply } from "../pairing/pairing-messages.js";
 import {
-  readProviderAllowFromStore,
-  upsertProviderPairingRequest,
+  readChannelAllowFromStore,
+  upsertChannelPairingRequest,
 } from "../pairing/pairing-store.js";
 import { resolveAgentRoute } from "../routing/resolve-route.js";
-import { resolveThreadSessionKeys } from "../routing/session-key.js";
+import {
+  normalizeMainKey,
+  resolveThreadSessionKeys,
+} from "../routing/session-key.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { resolveSlackAccount } from "./accounts.js";
-import { reactSlackMessage } from "./actions.js";
+import { reactSlackMessage, removeSlackReaction } from "./actions.js";
 import { sendMessageSlack } from "./send.js";
 import { resolveSlackThreadTargets } from "./threading.js";
 import { resolveSlackAppToken, resolveSlackBotToken } from "./token.js";
@@ -160,6 +173,15 @@ function normalizeSlackSlug(raw?: string) {
   return cleaned.replace(/-{2,}/g, "-").replace(/^[-.]+|[-.]+$/g, "");
 }
 
+function normalizeSlackSlashCommandName(raw: string) {
+  return raw.replace(/^\/+/, "");
+}
+
+export function buildSlackSlashCommandMatcher(name: string) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^/?${escaped}$`);
+}
+
 function normalizeAllowList(list?: Array<string | number>) {
   return (list ?? []).map((entry) => String(entry).trim()).filter(Boolean);
 }
@@ -214,9 +236,13 @@ function resolveSlackUserAllowed(params: {
 function resolveSlackSlashCommandConfig(
   raw?: SlackSlashCommandConfig,
 ): Required<SlackSlashCommandConfig> {
+  const normalizedName = normalizeSlackSlashCommandName(
+    raw?.name?.trim() || "clawd",
+  );
+  const name = normalizedName || "clawd";
   return {
     enabled: raw?.enabled === true,
-    name: raw?.name?.trim() || "clawd",
+    name,
     sessionPrefix: raw?.sessionPrefix?.trim() || "slack:slash",
     ephemeral: raw?.ephemeral !== false,
   };
@@ -352,27 +378,28 @@ async function resolveSlackMedia(params: {
     const url = file.url_private_download ?? file.url_private;
     if (!url) continue;
     try {
-      const res = await fetch(url, {
-        headers: { Authorization: `Bearer ${params.token}` },
+      const fetchImpl: FetchLike = (input, init) => {
+        const headers = new Headers(init?.headers);
+        headers.set("Authorization", `Bearer ${params.token}`);
+        return fetch(input, { ...init, headers });
+      };
+      const fetched = await fetchRemoteMedia({
+        url,
+        fetchImpl,
+        filePathHint: file.name,
       });
-      if (!res.ok) continue;
-      const buffer = Buffer.from(await res.arrayBuffer());
-      if (buffer.byteLength > params.maxBytes) continue;
-      const contentType = await detectMime({
-        buffer,
-        headerMime: res.headers.get("content-type"),
-        filePath: file.name,
-      });
+      if (fetched.buffer.byteLength > params.maxBytes) continue;
       const saved = await saveMediaBuffer(
-        buffer,
-        contentType ?? file.mimetype,
+        fetched.buffer,
+        fetched.contentType ?? file.mimetype,
         "inbound",
         params.maxBytes,
       );
+      const label = fetched.fileName ?? file.name;
       return {
         path: saved.path,
         contentType: saved.contentType,
-        placeholder: file.name ? `[Slack file: ${file.name}]` : "[Slack file]",
+        placeholder: label ? `[Slack file: ${label}]` : "[Slack file]",
       };
     } catch {
       // Ignore download failures and fall through to the next file.
@@ -425,9 +452,16 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
     cfg,
     accountId: opts.accountId,
   });
+  const historyLimit = Math.max(
+    0,
+    account.config.historyLimit ??
+      cfg.messages?.groupChat?.historyLimit ??
+      DEFAULT_GROUP_HISTORY_LIMIT,
+  );
+  const channelHistories = new Map<string, HistoryEntry[]>();
   const sessionCfg = cfg.session;
   const sessionScope = sessionCfg?.scope ?? "per-sender";
-  const mainKey = (sessionCfg?.mainKey ?? "main").trim() || "main";
+  const mainKey = normalizeMainKey(sessionCfg?.mainKey);
 
   const resolveSlackSystemEventSessionKey = (params: {
     channelId?: string | null;
@@ -454,7 +488,7 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
   const appToken = resolveSlackAppToken(opts.appToken ?? account.appToken);
   if (!botToken || !appToken) {
     throw new Error(
-      `Slack bot + app tokens missing for account "${account.accountId}" (set slack.accounts.${account.accountId}.botToken/appToken or SLACK_BOT_TOKEN/SLACK_APP_TOKEN for default).`,
+      `Slack bot + app tokens missing for account "${account.accountId}" (set channels.slack.accounts.${account.accountId}.botToken/appToken or SLACK_BOT_TOKEN/SLACK_APP_TOKEN for default).`,
     );
   }
 
@@ -498,24 +532,11 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
     }
   >();
   const userCache = new Map<string, { name?: string }>();
-  const seenMessages = new Map<string, number>();
+  const seenMessages = createDedupeCache({ ttlMs: 60_000, maxSize: 500 });
 
   const markMessageSeen = (channelId: string | undefined, ts?: string) => {
     if (!channelId || !ts) return false;
-    const key = `${channelId}:${ts}`;
-    if (seenMessages.has(key)) return true;
-    seenMessages.set(key, Date.now());
-    if (seenMessages.size > 500) {
-      const cutoff = Date.now() - 60_000;
-      for (const [entry, seenAt] of seenMessages) {
-        if (seenAt < cutoff || seenMessages.size > 450) {
-          seenMessages.delete(entry);
-        } else {
-          break;
-        }
-      }
-    }
-    return false;
+    return seenMessages.check(`${channelId}:${ts}`);
   };
 
   const app = new App({
@@ -724,7 +745,7 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
     const allowBots =
       channelConfig?.allowBots ??
       account.config?.allowBots ??
-      cfg.slack?.allowBots ??
+      cfg.channels?.slack?.allowBots ??
       false;
     const isBotMessage = Boolean(message.bot_id);
     if (isBotMessage) {
@@ -758,7 +779,7 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
       return;
     }
 
-    const storeAllowFrom = await readProviderAllowFromStore("slack").catch(
+    const storeAllowFrom = await readChannelAllowFromStore("slack").catch(
       () => [],
     );
     const effectiveAllowFrom = normalizeAllowList([
@@ -786,8 +807,8 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
           if (dmPolicy === "pairing") {
             const sender = await resolveUserName(directUserId);
             const senderName = sender?.name ?? undefined;
-            const { code, created } = await upsertProviderPairingRequest({
-              provider: "slack",
+            const { code, created } = await upsertChannelPairingRequest({
+              channel: "slack",
               id: directUserId,
               meta: { name: senderName },
             });
@@ -799,7 +820,7 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
                 await sendMessageSlack(
                   message.channel,
                   buildPairingReply({
-                    provider: "slack",
+                    channel: "slack",
                     idLine: `Your Slack user id: ${directUserId}`,
                     code,
                   }),
@@ -827,7 +848,7 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
 
     const route = resolveAgentRoute({
       cfg,
-      provider: "slack",
+      channel: "slack",
       accountId: account.accountId,
       teamId: teamId || undefined,
       peer: {
@@ -885,7 +906,7 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
       !wasMentioned &&
       !hasAnyMention &&
       commandAuthorized &&
-      hasControlCommand(message.text ?? "");
+      hasControlCommand(message.text ?? "", cfg);
     const effectiveWasMentioned = wasMentioned || shouldBypassMention;
     const canDetectMention = Boolean(botUserId) || mentionRegexes.length > 0;
     if (
@@ -910,6 +931,8 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
     const rawBody = (message.text ?? "").trim() || media?.placeholder || "";
     if (!rawBody) return;
     const ackReaction = resolveAckReaction(cfg, route.agentId);
+    const ackReactionValue = ackReaction ?? "";
+    const removeAckAfterReply = cfg.messages?.removeAckAfterReply ?? false;
     const shouldAckReaction = () => {
       if (!ackReaction) return false;
       if (ackReactionScope === "all") return true;
@@ -924,18 +947,42 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
       }
       return false;
     };
-    if (shouldAckReaction() && message.ts) {
-      reactSlackMessage(message.channel, message.ts, ackReaction, {
-        token: botToken,
-        client: app.client,
-      }).catch((err) => {
-        logVerbose(
-          `slack react failed for channel ${message.channel}: ${String(err)}`,
-        );
-      });
-    }
+    const ackReactionMessageTs = message.ts;
+    const ackReactionPromise =
+      shouldAckReaction() && ackReactionMessageTs && ackReactionValue
+        ? reactSlackMessage(
+            message.channel,
+            ackReactionMessageTs,
+            ackReactionValue,
+            {
+              token: botToken,
+              client: app.client,
+            },
+          ).then(
+            () => true,
+            (err) => {
+              logVerbose(
+                `slack react failed for channel ${message.channel}: ${String(err)}`,
+              );
+              return false;
+            },
+          )
+        : null;
 
     const roomLabel = channelName ? `#${channelName}` : `#${message.channel}`;
+    const isRoomish = isRoom || isGroupDm;
+    const historyKey = message.channel;
+    const historyEntry =
+      isRoomish && historyLimit > 0
+        ? {
+            sender: senderName,
+            body: rawBody,
+            timestamp: message.ts
+              ? Math.round(Number(message.ts) * 1000)
+              : undefined,
+            messageId: message.ts,
+          }
+        : undefined;
 
     const preview = rawBody.replace(/\s+/g, " ").slice(0, 160);
     const inboundLabel = isDirectMessage
@@ -965,13 +1012,33 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
 
     const textWithId = `${rawBody}\n[slack message id: ${message.ts} channel: ${message.channel}]`;
     const body = formatAgentEnvelope({
-      provider: "Slack",
+      channel: "Slack",
       from: senderName,
       timestamp: message.ts ? Math.round(Number(message.ts) * 1000) : undefined,
       body: textWithId,
     });
 
-    const isRoomish = isRoom || isGroupDm;
+    let combinedBody = body;
+    if (isRoomish && historyLimit > 0) {
+      combinedBody = buildHistoryContextFromMap({
+        historyMap: channelHistories,
+        historyKey,
+        limit: historyLimit,
+        entry: historyEntry,
+        currentMessage: combinedBody,
+        formatEntry: (entry) =>
+          formatAgentEnvelope({
+            channel: "Slack",
+            from: roomLabel,
+            timestamp: entry.timestamp,
+            body: `${entry.sender}: ${entry.body}${
+              entry.messageId
+                ? ` [id:${entry.messageId} channel:${message.channel}]`
+                : ""
+            }`,
+          }),
+      });
+    }
     const slackTo = isDirectMessage
       ? `user:${message.user}`
       : `channel:${message.channel}`;
@@ -1001,7 +1068,7 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
         const starterName = starterUser?.name ?? starter.userId ?? "Unknown";
         const starterWithId = `${starter.text}\n[slack message id: ${starter.ts ?? threadTs} channel: ${message.channel}]`;
         threadStarterBody = formatThreadStarterEnvelope({
-          provider: "Slack",
+          channel: "Slack",
           author: starterName,
           timestamp: starter.ts
             ? Math.round(Number(starter.ts) * 1000)
@@ -1015,7 +1082,9 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
       }
     }
     const ctxPayload = {
-      Body: body,
+      Body: combinedBody,
+      RawBody: rawBody,
+      CommandBody: rawBody,
       From: slackFrom,
       To: slackTo,
       SessionKey: sessionKey,
@@ -1057,7 +1126,7 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
       await updateLastRoute({
         storePath,
         sessionKey: route.mainSessionKey,
-        provider: "slack",
+        channel: "slack",
         to: `user:${message.user}`,
         accountId: route.accountId,
       });
@@ -1069,11 +1138,23 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
       );
     }
 
-    const { replyThreadTs, statusThreadTs } = resolveSlackThreadTargets({
+    // Use helper for status thread; compute baseThreadTs for "first" mode support
+    const { statusThreadTs } = resolveSlackThreadTargets({
       message,
       replyToMode,
     });
+    const messageTs = message.ts ?? message.event_ts;
+    const incomingThreadTs = message.thread_ts;
     let didSetStatus = false;
+    // Shared mutable ref for tracking if a reply was sent (used by both
+    // auto-reply path and tool path for "first" threading mode).
+    const hasRepliedRef = { value: false };
+    const replyPlan = createSlackReplyDeliveryPlan({
+      replyToMode,
+      incomingThreadTs,
+      messageTs,
+      hasRepliedRef,
+    });
     const onReplyStart = async () => {
       didSetStatus = true;
       await setSlackThreadStatus({
@@ -1082,11 +1163,14 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
         status: "is typing...",
       });
     };
+    let didSendReply = false;
     const { dispatcher, replyOptions, markDispatchIdle } =
       createReplyDispatcherWithTyping({
         responsePrefix: resolveEffectiveMessagesConfig(cfg, route.agentId)
           .responsePrefix,
+        humanDelay: resolveHumanDelayConfig(cfg, route.agentId),
         deliver: async (payload) => {
+          const replyThreadTs = replyPlan.nextThreadTs();
           await deliverReplies({
             replies: [payload],
             target: replyTarget,
@@ -1096,6 +1180,8 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
             textLimit,
             replyThreadTs,
           });
+          didSendReply = true;
+          replyPlan.markSent();
         },
         onError: (err, info) => {
           runtime.error?.(
@@ -1119,6 +1205,7 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
       replyOptions: {
         ...replyOptions,
         skillFilter: channelConfig?.skills,
+        hasRepliedRef,
         disableBlockStreaming:
           typeof account.config.blockStreaming === "boolean"
             ? !account.config.blockStreaming
@@ -1133,12 +1220,34 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
         status: "",
       });
     }
-    if (!queuedFinal) return;
+    if (!queuedFinal) {
+      if (isRoomish && historyLimit > 0 && didSendReply) {
+        clearHistoryEntries({ historyMap: channelHistories, historyKey });
+      }
+      return;
+    }
     if (shouldLogVerbose()) {
       const finalCount = counts.final;
       logVerbose(
         `slack: delivered ${finalCount} reply${finalCount === 1 ? "" : "ies"} to ${replyTarget}`,
       );
+    }
+    if (removeAckAfterReply && ackReactionPromise && ackReactionMessageTs) {
+      const messageTs = ackReactionMessageTs;
+      void ackReactionPromise.then((didAck) => {
+        if (!didAck) return;
+        removeSlackReaction(message.channel, messageTs, ackReactionValue, {
+          token: botToken,
+          client: app.client,
+        }).catch((err) => {
+          logVerbose(
+            `slack: failed to remove ack reaction from ${message.channel}/${message.ts}: ${String(err)}`,
+          );
+        });
+      });
+    }
+    if (isRoomish && historyLimit > 0 && didSendReply) {
+      clearHistoryEntries({ historyMap: channelHistories, historyKey });
     }
   };
 
@@ -1662,7 +1771,7 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
         }
       }
 
-      const storeAllowFrom = await readProviderAllowFromStore("slack").catch(
+      const storeAllowFrom = await readChannelAllowFromStore("slack").catch(
         () => [],
       );
       const effectiveAllowFrom = normalizeAllowList([
@@ -1692,15 +1801,15 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
           });
           if (!permitted) {
             if (dmPolicy === "pairing") {
-              const { code, created } = await upsertProviderPairingRequest({
-                provider: "slack",
+              const { code, created } = await upsertChannelPairingRequest({
+                channel: "slack",
                 id: command.user_id,
                 meta: { name: senderName },
               });
               if (created) {
                 await respond({
                   text: buildPairingReply({
-                    provider: "slack",
+                    channel: "slack",
                     idLine: `Your Slack user id: ${command.user_id}`,
                     code,
                   }),
@@ -1773,7 +1882,7 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
       const isRoomish = isRoom || isGroupDm;
       const route = resolveAgentRoute({
         cfg,
-        provider: "slack",
+        channel: "slack",
         accountId: account.accountId,
         teamId: teamId || undefined,
         peer: {
@@ -1825,23 +1934,36 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
         OriginatingTo: `user:${command.user_id}`,
       };
 
-      const replyResult = await getReplyFromConfig(
-        ctxPayload,
-        { skillFilter: channelConfig?.skills },
+      const { counts } = await dispatchReplyWithDispatcher({
+        ctx: ctxPayload,
         cfg,
-      );
-      const replies = replyResult
-        ? Array.isArray(replyResult)
-          ? replyResult
-          : [replyResult]
-        : [];
-
-      await deliverSlackSlashReplies({
-        replies,
-        respond,
-        ephemeral: slashCommand.ephemeral,
-        textLimit,
+        dispatcherOptions: {
+          responsePrefix: resolveEffectiveMessagesConfig(cfg, route.agentId)
+            .responsePrefix,
+          deliver: async (payload) => {
+            await deliverSlackSlashReplies({
+              replies: [payload],
+              respond,
+              ephemeral: slashCommand.ephemeral,
+              textLimit,
+            });
+          },
+          onError: (err, info) => {
+            runtime.error?.(
+              danger(`slack slash ${info.kind} reply failed: ${String(err)}`),
+            );
+          },
+        },
+        replyOptions: { skillFilter: channelConfig?.skills },
       });
+      if (counts.final + counts.tool + counts.block === 0) {
+        await deliverSlackSlashReplies({
+          replies: [],
+          respond,
+          ephemeral: slashCommand.ephemeral,
+          textLimit,
+        });
+      }
     } catch (err) {
       runtime.error?.(danger(`slack slash handler failed: ${String(err)}`));
       await respond({
@@ -1851,8 +1973,14 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
     }
   };
 
-  const nativeCommands =
-    cfg.commands?.native === true ? listNativeCommandSpecs() : [];
+  const nativeEnabled = resolveNativeCommandsEnabled({
+    providerId: "slack",
+    providerSetting: account.config.commands?.native,
+    globalSetting: cfg.commands?.native,
+  });
+  const nativeCommands = nativeEnabled
+    ? listNativeCommandSpecsForConfig(cfg)
+    : [];
   if (nativeCommands.length > 0) {
     for (const command of nativeCommands) {
       app.command(
@@ -1865,7 +1993,7 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts = {}) {
     }
   } else if (slashCommand.enabled) {
     app.command(
-      slashCommand.name,
+      buildSlackSlashCommandMatcher(slashCommand.name),
       async ({ command, ack, respond }: SlackCommandMiddlewareArgs) => {
         await handleSlashCommand({
           command,
@@ -1917,7 +2045,8 @@ async function deliverReplies(params: {
     if (mediaList.length === 0) {
       for (const chunk of chunkMarkdownText(text, chunkLimit)) {
         const trimmed = chunk.trim();
-        if (!trimmed || trimmed === SILENT_REPLY_TOKEN) continue;
+        if (!trimmed || isSilentReplyText(trimmed, SILENT_REPLY_TOKEN))
+          continue;
         await sendMessageSlack(params.target, trimmed, {
           token: params.token,
           threadTs,
@@ -1958,6 +2087,67 @@ export function isSlackRoomAllowedByPolicy(params: {
   return channelAllowed;
 }
 
+/**
+ * Compute effective threadTs for a Slack reply based on replyToMode.
+ * - "off": stay in thread if already in one, otherwise main channel
+ * - "first": first reply goes to thread, subsequent replies to main channel
+ * - "all": all replies go to thread
+ */
+export function resolveSlackThreadTs(params: {
+  replyToMode: "off" | "first" | "all";
+  incomingThreadTs: string | undefined;
+  messageTs: string | undefined;
+  hasReplied: boolean;
+}): string | undefined {
+  const planner = createSlackReplyReferencePlanner({
+    replyToMode: params.replyToMode,
+    incomingThreadTs: params.incomingThreadTs,
+    messageTs: params.messageTs,
+    hasReplied: params.hasReplied,
+  });
+  return planner.use();
+}
+
+type SlackReplyDeliveryPlan = {
+  nextThreadTs: () => string | undefined;
+  markSent: () => void;
+};
+
+function createSlackReplyReferencePlanner(params: {
+  replyToMode: "off" | "first" | "all";
+  incomingThreadTs: string | undefined;
+  messageTs: string | undefined;
+  hasReplied?: boolean;
+}) {
+  return createReplyReferencePlanner({
+    replyToMode: params.replyToMode,
+    existingId: params.incomingThreadTs,
+    startId: params.messageTs,
+    hasReplied: params.hasReplied,
+  });
+}
+
+function createSlackReplyDeliveryPlan(params: {
+  replyToMode: "off" | "first" | "all";
+  incomingThreadTs: string | undefined;
+  messageTs: string | undefined;
+  hasRepliedRef: { value: boolean };
+}): SlackReplyDeliveryPlan {
+  const replyReference = createSlackReplyReferencePlanner({
+    replyToMode: params.replyToMode,
+    incomingThreadTs: params.incomingThreadTs,
+    messageTs: params.messageTs,
+    hasReplied: params.hasRepliedRef.value,
+  });
+  return {
+    nextThreadTs: () => replyReference.use(),
+    markSent: () => {
+      replyReference.markSent();
+      params.hasRepliedRef.value = replyReference.hasReplied();
+    },
+  };
+}
+
 async function deliverSlackSlashReplies(params: {
   replies: ReplyPayload[];
   respond: SlackRespondFn;
@@ -1969,7 +2159,9 @@ async function deliverSlackSlashReplies(params: {
   for (const payload of params.replies) {
     const textRaw = payload.text?.trim() ?? "";
     const text =
-      textRaw && textRaw !== SILENT_REPLY_TOKEN ? textRaw : undefined;
+      textRaw && !isSilentReplyText(textRaw, SILENT_REPLY_TOKEN)
+        ? textRaw
+        : undefined;
     const mediaList =
       payload.mediaUrls ?? (payload.mediaUrl ? [payload.mediaUrl] : []);
     const combined = [

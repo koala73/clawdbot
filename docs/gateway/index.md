@@ -28,13 +28,15 @@ pnpm gateway:watch
   - Disable with `gateway.reload.mode="off"`.
 - Binds WebSocket control plane to `127.0.0.1:<port>` (default 18789).
 - The same port also serves HTTP (control UI, hooks, A2UI). Single-port multiplex.
+  - OpenAI Chat Completions (HTTP): [`/v1/chat/completions`](/gateway/openai-http-api).
 - Starts a Canvas file server by default on `canvasHost.port` (default `18793`), serving `http://<gateway-host>:18793/__clawdbot__/canvas/` from `~/clawd/canvas`. Disable with `canvasHost.enabled=false` or `CLAWDBOT_SKIP_CANVAS_HOST=1`.
 - Logs to stdout; use launchd/systemd to keep it alive and rotate logs.
 - Pass `--verbose` to mirror debug logging (handshakes, req/res, events) from the log file into stdio when troubleshooting.
 - `--force` uses `lsof` to find listeners on the chosen port, sends SIGTERM, logs what it killed, then starts the gateway (fails fast if `lsof` is missing).
 - If you run under a supervisor (launchd/systemd/mac app child-process mode), a stop/restart typically sends **SIGTERM**; older builds may surface this as `pnpm` `ELIFECYCLE` exit code **143** (SIGTERM), which is a normal shutdown, not a crash.
 - **SIGUSR1** triggers an in-process restart (no external supervisor required). This is what the `gateway` agent tool uses.
-- Optional shared secret: pass `--token <value>` or set `CLAWDBOT_GATEWAY_TOKEN` to require clients to send `connect.params.auth.token`.
+- Gateway auth: set `gateway.auth.mode=token` + `gateway.auth.token` (or pass `--token <value>` / `CLAWDBOT_GATEWAY_TOKEN`) to require clients to send `connect.params.auth.token`.
+- The wizard now generates a token by default, even on loopback.
 - Port precedence: `--port` > `CLAWDBOT_GATEWAY_PORT` > `gateway.port` > default `18789`.
 
 ## Remote access
@@ -47,7 +49,19 @@ pnpm gateway:watch
 
 ## Multiple gateways (same host)
 
+Usually unnecessary: one Gateway can serve multiple messaging channels and agents. Use multiple Gateways only for redundancy or strict isolation (ex: rescue bot).
+
 Supported if you isolate state + config and use unique ports.
+
+Service names are profile-aware:
+- macOS: `com.clawdbot.<profile>`
+- Linux: `clawdbot-gateway-<profile>.service`
+- Windows: `Clawdbot Gateway (<profile>)`
+
+Install metadata is embedded in the service config:
+- `CLAWDBOT_SERVICE_MARKER=clawdbot`
+- `CLAWDBOT_SERVICE_KIND=gateway`
+- `CLAWDBOT_SERVICE_VERSION=<version>`
 
 ### Dev profile (`--dev`)
 
@@ -84,6 +98,12 @@ Checklist per instance:
 - unique `agents.defaults.workspace`
 - separate WhatsApp numbers (if using WA)
 
+Daemon install per profile:
+```bash
+clawdbot --profile main daemon install
+clawdbot --profile rescue daemon install
+```
+
 Example:
 ```bash
 CLAWDBOT_CONFIG_PATH=~/.clawdbot/a.json CLAWDBOT_STATE_DIR=~/.clawdbot-a clawdbot gateway --port 19001
@@ -91,12 +111,13 @@ CLAWDBOT_CONFIG_PATH=~/.clawdbot/b.json CLAWDBOT_STATE_DIR=~/.clawdbot-b clawdbo
 ```
 
 ## Protocol (operator view)
-- Mandatory first frame from client: `req {type:"req", id, method:"connect", params:{minProtocol,maxProtocol,client:{name,version,platform,deviceFamily?,modelIdentifier?,mode,instanceId}, caps, auth?, locale?, userAgent? } }`.
+- Full docs: [Gateway protocol](/gateway/protocol) and [Bridge protocol](/gateway/bridge-protocol).
+- Mandatory first frame from client: `req {type:"req", id, method:"connect", params:{minProtocol,maxProtocol,client:{id,displayName?,version,platform,deviceFamily?,modelIdentifier?,mode,instanceId?}, caps, auth?, locale?, userAgent? } }`.
 - Gateway replies `res {type:"res", id, ok:true, payload:hello-ok }` (or `ok:false` with an error, then closes).
 - After handshake:
   - Requests: `{type:"req", id, method, params}` → `{type:"res", id, ok, payload|error}`
   - Events: `{type:"event", event, payload, seq?, stateVersion?}`
-- Structured presence entries: `{host, ip, version, platform?, deviceFamily?, modelIdentifier?, mode, lastInputSeconds?, ts, reason?, tags?[], instanceId? }`.
+- Structured presence entries: `{host, ip, version, platform?, deviceFamily?, modelIdentifier?, mode, lastInputSeconds?, ts, reason?, tags?[], instanceId? }` (for WS clients, `instanceId` comes from `connect.client.instanceId`).
 - `agent` responses are two-stage: first `res` ack `{runId,status:"accepted"}`, then a final `res` `{runId,status:"ok"|"error",summary}` after the run finishes; streamed output arrives as `event:"agent"`.
 
 ## Methods (initial set)
@@ -104,14 +125,14 @@ CLAWDBOT_CONFIG_PATH=~/.clawdbot/b.json CLAWDBOT_STATE_DIR=~/.clawdbot-b clawdbo
 - `status` — short summary.
 - `system-presence` — current presence list.
 - `system-event` — post a presence/system note (structured).
-- `send` — send a message via the active provider(s).
+- `send` — send a message via the active channel(s).
 - `agent` — run an agent turn (streams events back on same connection).
 - `node.list` — list paired + currently-connected bridge nodes (includes `caps`, `deviceFamily`, `modelIdentifier`, `paired`, `connected`, and advertised `commands`).
 - `node.describe` — describe a node (capabilities + supported `node.invoke` commands; works for paired nodes and for currently-connected unpaired nodes).
 - `node.invoke` — invoke a command on a node (e.g. `canvas.*`, `camera.*`).
 - `node.pair.*` — pairing lifecycle (`request`, `list`, `approve`, `reject`, `verify`).
 
-See also: [`docs/presence.md`](/concepts/presence) for how presence is produced/deduped and why `instanceId` matters.
+See also: [Presence](/concepts/presence) for how presence is produced/deduped and why a stable `client.instanceId` matters.
 
 ## Events
 - `agent` — streamed tool/output events from the agent run (seq-tagged).
@@ -158,7 +179,8 @@ See also: [`docs/presence.md`](/concepts/presence) for how presence is produced/
   - StandardOut/Err: file paths or `syslog`
 - On failure, launchd restarts; fatal misconfig should keep exiting so the operator notices.
 - LaunchAgents are per-user and require a logged-in session; for headless setups use a custom LaunchDaemon (not shipped).
-  - `clawdbot daemon install` writes `~/Library/LaunchAgents/com.clawdbot.gateway.plist`.
+  - `clawdbot daemon install` writes `~/Library/LaunchAgents/com.clawdbot.gateway.plist`
+    (or `com.clawdbot.<profile>.plist`).
   - `clawdbot doctor` audits the LaunchAgent config and can update it to current defaults.
 
 ## Daemon management (CLI)
@@ -182,15 +204,18 @@ Notes:
 - `daemon status` prints config path + probe target to avoid “localhost vs LAN bind” confusion and profile mismatches.
 - `daemon status` includes the last gateway error line when the service looks running but the port is closed.
 - `logs` tails the Gateway file log via RPC (no manual `tail`/`grep` needed).
-- If other gateway-like services are detected, the CLI warns. We recommend **one gateway per machine**; one gateway can host multiple agents.
+- If other gateway-like services are detected, the CLI warns unless they are Clawdbot profile services.
+  We still recommend **one gateway per machine** unless you need redundant profiles.
   - Cleanup: `clawdbot daemon uninstall` (current service) and `clawdbot doctor` (legacy migrations).
 - `daemon install` is a no-op when already installed; use `clawdbot daemon install --force` to reinstall (profile/env/path changes).
 
 Bundled mac app:
-- Clawdbot.app can bundle a bun-compiled gateway binary and install a per-user LaunchAgent labeled `com.clawdbot.gateway`.
+- Clawdbot.app can bundle a Node-based gateway relay and install a per-user LaunchAgent labeled
+  `com.clawdbot.gateway` (or `com.clawdbot.<profile>`).
 - To stop it cleanly, use `clawdbot daemon stop` (or `launchctl bootout gui/$UID/com.clawdbot.gateway`).
 - To restart, use `clawdbot daemon restart` (or `launchctl kickstart -k gui/$UID/com.clawdbot.gateway`).
   - `launchctl` only works if the LaunchAgent is installed; otherwise use `clawdbot daemon install` first.
+  - Replace the label with `com.clawdbot.<profile>` when running a named profile.
 
 ## Supervision (systemd user unit)
 Clawdbot installs a **systemd user service** by default on Linux/WSL2. We
@@ -201,10 +226,10 @@ required, shared supervision).
 `clawdbot daemon install` writes the user unit. `clawdbot doctor` audits the
 unit and can update it to match the current recommended defaults.
 
-Create `~/.config/systemd/user/clawdbot-gateway.service`:
+Create `~/.config/systemd/user/clawdbot-gateway[-<profile>].service`:
 ```
 [Unit]
-Description=Clawdbot Gateway
+Description=Clawdbot Gateway (profile: <profile>, v<version>)
 After=network-online.target
 Wants=network-online.target
 
@@ -225,16 +250,16 @@ sudo loginctl enable-linger youruser
 Onboarding runs this on Linux/WSL2 (may prompt for sudo; writes `/var/lib/systemd/linger`).
 Then enable the service:
 ```
-systemctl --user enable --now clawdbot-gateway.service
+systemctl --user enable --now clawdbot-gateway[-<profile>].service
 ```
 
 **Alternative (system service)** - for always-on or multi-user servers, you can
 install a systemd **system** unit instead of a user unit (no lingering needed).
-Create `/etc/systemd/system/clawdbot-gateway.service` (copy the unit above,
+Create `/etc/systemd/system/clawdbot-gateway[-<profile>].service` (copy the unit above,
 switch `WantedBy=multi-user.target`, set `User=` + `WorkingDirectory=`), then:
 ```
 sudo systemctl daemon-reload
-sudo systemctl enable --now clawdbot-gateway.service
+sudo systemctl enable --now clawdbot-gateway[-<profile>].service
 ```
 
 ## Windows (WSL2)
@@ -243,11 +268,11 @@ Windows installs should use **WSL2** and follow the Linux systemd section above.
 
 ## Operational checks
 - Liveness: open WS and send `req:connect` → expect `res` with `payload.type="hello-ok"` (with snapshot).
-- Readiness: call `health` → expect `ok: true` and `web.linked=true`.
+- Readiness: call `health` → expect `ok: true` and a linked channel in `linkChannel` (when applicable).
 - Debug: subscribe to `tick` and `presence` events; ensure `status` shows linked/auth age; presence entries show Gateway host and connected clients.
 
 ## Safety guarantees
-- Only one Gateway per host; all sends/agent calls must go through it.
+- Assume one Gateway per host by default; if you run multiple profiles, isolate ports/state and target the right instance.
 - No fallback to direct Baileys connections; if the Gateway is down, sends fail fast.
 - Non-connect first frames or malformed JSON are rejected and the socket is closed.
 - Graceful shutdown: emit `shutdown` event before closing; clients must handle close + reconnect.

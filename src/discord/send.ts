@@ -18,7 +18,7 @@ import {
 } from "discord-api-types/v10";
 
 import { loadConfig } from "../config/config.js";
-import { recordProviderActivity } from "../infra/provider-activity.js";
+import { recordChannelActivity } from "../infra/channel-activity.js";
 import type { RetryConfig } from "../infra/retry.js";
 import {
   createDiscordRetryRunner,
@@ -304,6 +304,11 @@ function parseRecipient(raw: string): DiscordRecipient {
       );
     }
     return { kind: "user", id: candidate };
+  }
+  if (/^\d+$/.test(trimmed)) {
+    throw new Error(
+      `Ambiguous Discord recipient "${trimmed}". Use "user:${trimmed}" for DMs or "channel:${trimmed}" for channel messages.`,
+    );
   }
   return { kind: "channel", id: trimmed };
 }
@@ -625,8 +630,8 @@ export async function sendMessageDiscord(
     });
   }
 
-  recordProviderActivity({
-    provider: "discord",
+  recordChannelActivity({
+    channel: "discord",
     accountId: accountInfo.accountId,
     direction: "outbound",
   });
@@ -896,6 +901,17 @@ export async function readMessagesDiscord(
     Routes.channelMessages(channelId),
     params,
   )) as APIMessage[];
+}
+
+export async function fetchMessageDiscord(
+  channelId: string,
+  messageId: string,
+  opts: DiscordReactOpts = {},
+): Promise<APIMessage> {
+  const rest = resolveDiscordRest(opts);
+  return (await rest.get(
+    Routes.channelMessage(channelId, messageId),
+  )) as APIMessage;
 }
 
 export async function editMessageDiscord(

@@ -1,13 +1,16 @@
 ---
-summary: "Bun workflow (preferred): installs, patches, and gotchas vs pnpm"
+summary: "Bun workflow (experimental): installs, patches, and gotchas vs pnpm"
 read_when:
   - You want the fastest local dev loop (bun + watch)
   - You hit Bun install/patch/lifecycle script issues
 ---
 
-# Bun
+# Bun (experimental)
 
-Goal: run this repo with **Bun** (optional) without losing pnpm patch behavior.
+Goal: run this repo with **Bun** (optional, not recommended for WhatsApp/Telegram)
+without losing pnpm patch behavior.
+
+⚠️ **Not recommended for Gateway runtime** (WhatsApp/Telegram bugs). Use Node for production.
 
 ## Status
 
@@ -39,9 +42,10 @@ bun run vitest run
 ## pnpm patchedDependencies under Bun
 
 pnpm supports `package.json#pnpm.patchedDependencies` and records it in `pnpm-lock.yaml`.
-Bun does not support pnpm patches, so we apply them in `postinstall` when Bun is detected:
+Bun (and npm/yarn) do not support pnpm patches, so we apply them in `postinstall` when pnpm is **not** the installer:
 
-- [`scripts/postinstall.js`](https://github.com/clawdbot/clawdbot/blob/main/scripts/postinstall.js) runs only for Bun installs and applies every entry from `package.json#pnpm.patchedDependencies` into `node_modules/...` using `git apply` (idempotent).
+- [`scripts/postinstall.js`](https://github.com/clawdbot/clawdbot/blob/main/scripts/postinstall.js) detects the package manager via `npm_config_user_agent` and applies every entry from `package.json#pnpm.patchedDependencies` into `node_modules/...` using a built-in JS patcher (no `git`/system `patch` dependency).
+- Under pnpm, this fallback is skipped because pnpm already applies `patchedDependencies` itself.
 
 To add a new patch that works in both pnpm + Bun:
 

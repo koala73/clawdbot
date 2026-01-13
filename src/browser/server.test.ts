@@ -2,6 +2,7 @@ import { type AddressInfo, createServer } from "node:net";
 import { fetch as realFetch } from "undici";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_AI_SNAPSHOT_MAX_CHARS } from "./constants.js";
 
 let testPort = 0;
 let cdpBaseUrl = "";
@@ -24,14 +25,26 @@ const pwMocks = vi.hoisted(() => ({
   clickViaPlaywright: vi.fn(async () => {}),
   closePageViaPlaywright: vi.fn(async () => {}),
   closePlaywrightBrowserConnection: vi.fn(async () => {}),
+  downloadViaPlaywright: vi.fn(async () => ({
+    url: "https://example.com/report.pdf",
+    suggestedFilename: "report.pdf",
+    path: "/tmp/report.pdf",
+  })),
   dragViaPlaywright: vi.fn(async () => {}),
   evaluateViaPlaywright: vi.fn(async () => "ok"),
   fillFormViaPlaywright: vi.fn(async () => {}),
   getConsoleMessagesViaPlaywright: vi.fn(async () => []),
   hoverViaPlaywright: vi.fn(async () => {}),
+  scrollIntoViewViaPlaywright: vi.fn(async () => {}),
   navigateViaPlaywright: vi.fn(async () => ({ url: "https://example.com" })),
   pdfViaPlaywright: vi.fn(async () => ({ buffer: Buffer.from("pdf") })),
   pressKeyViaPlaywright: vi.fn(async () => {}),
+  responseBodyViaPlaywright: vi.fn(async () => ({
+    url: "https://example.com/api/data",
+    status: 200,
+    headers: { "content-type": "application/json" },
+    body: '{"ok":true}',
+  })),
   resizeViewportViaPlaywright: vi.fn(async () => {}),
   selectOptionViaPlaywright: vi.fn(async () => {}),
   setInputFilesViaPlaywright: vi.fn(async () => {}),
@@ -40,6 +53,11 @@ const pwMocks = vi.hoisted(() => ({
     buffer: Buffer.from("png"),
   })),
   typeViaPlaywright: vi.fn(async () => {}),
+  waitForDownloadViaPlaywright: vi.fn(async () => ({
+    url: "https://example.com/report.pdf",
+    suggestedFilename: "report.pdf",
+    path: "/tmp/report.pdf",
+  })),
   waitForViaPlaywright: vi.fn(async () => {}),
 }));
 
@@ -312,6 +330,7 @@ describe("browser control server", () => {
     expect(pwMocks.snapshotAiViaPlaywright).toHaveBeenCalledWith({
       cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
+      maxChars: DEFAULT_AI_SNAPSHOT_MAX_CHARS,
     });
 
     const nav = (await realFetch(`${base}/navigate`, {
@@ -395,6 +414,18 @@ describe("browser control server", () => {
     }).then((r) => r.json())) as { ok: boolean };
     expect(hover.ok).toBe(true);
     expect(pwMocks.hoverViaPlaywright).toHaveBeenCalledWith({
+      cdpUrl: cdpBaseUrl,
+      targetId: "abcd1234",
+      ref: "2",
+    });
+
+    const scroll = (await realFetch(`${base}/act`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: "scrollIntoView", ref: "2" }),
+    }).then((r) => r.json())) as { ok: boolean };
+    expect(scroll.ok).toBe(true);
+    expect(pwMocks.scrollIntoViewViaPlaywright).toHaveBeenCalledWith({
       cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
       ref: "2",
@@ -558,6 +589,51 @@ describe("browser control server", () => {
       timeoutMs: 5678,
     });
 
+    const waitDownload = await realFetch(`${base}/wait/download`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: "/tmp/report.pdf", timeoutMs: 1111 }),
+    }).then((r) => r.json());
+    expect(waitDownload).toMatchObject({ ok: true });
+    expect(pwMocks.waitForDownloadViaPlaywright).toHaveBeenCalledWith({
+      cdpUrl: cdpBaseUrl,
+      targetId: "abcd1234",
+      path: "/tmp/report.pdf",
+      timeoutMs: 1111,
+    });
+
+    const download = await realFetch(`${base}/download`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ref: "e12", path: "/tmp/report.pdf" }),
+    }).then((r) => r.json());
+    expect(download).toMatchObject({ ok: true });
+    expect(pwMocks.downloadViaPlaywright).toHaveBeenCalledWith({
+      cdpUrl: cdpBaseUrl,
+      targetId: "abcd1234",
+      ref: "e12",
+      path: "/tmp/report.pdf",
+      timeoutMs: undefined,
+    });
+
+    const responseBody = await realFetch(`${base}/response/body`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        url: "**/api/data",
+        timeoutMs: 2222,
+        maxChars: 10,
+      }),
+    }).then((r) => r.json());
+    expect(responseBody).toMatchObject({ ok: true });
+    expect(pwMocks.responseBodyViaPlaywright).toHaveBeenCalledWith({
+      cdpUrl: cdpBaseUrl,
+      targetId: "abcd1234",
+      url: "**/api/data",
+      timeoutMs: 2222,
+      maxChars: 10,
+    });
+
     const consoleRes = (await realFetch(`${base}/console?level=error`).then(
       (r) => r.json(),
     )) as { ok: boolean; messages?: unknown[] };
@@ -611,6 +687,25 @@ describe("browser control server", () => {
     expect(stopped.stopped).toBe(true);
   });
 
+  it("skips default maxChars when explicitly set to zero", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+    await realFetch(`${base}/start`, { method: "POST" }).then((r) => r.json());
+
+    const snapAi = (await realFetch(
+      `${base}/snapshot?format=ai&maxChars=0`,
+    ).then((r) => r.json())) as { ok: boolean; format?: string };
+    expect(snapAi.ok).toBe(true);
+    expect(snapAi.format).toBe("ai");
+
+    const [call] = pwMocks.snapshotAiViaPlaywright.mock.calls.at(-1) ?? [];
+    expect(call).toEqual({
+      cdpUrl: cdpBaseUrl,
+      targetId: "abcd1234",
+    });
+  });
+
   it("validates agent inputs (agent routes)", async () => {
     const { startBrowserControlServerFromConfig } = await import("./server.js");
     await startBrowserControlServerFromConfig();
@@ -637,6 +732,20 @@ describe("browser control server", () => {
       body: JSON.stringify({ kind: "click" }),
     });
     expect(clickMissingRef.status).toBe(400);
+
+    const scrollMissingRef = await realFetch(`${base}/act`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: "scrollIntoView" }),
+    });
+    expect(scrollMissingRef.status).toBe(400);
+
+    const scrollSelectorUnsupported = await realFetch(`${base}/act`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: "scrollIntoView", selector: "button.save" }),
+    });
+    expect(scrollSelectorUnsupported.status).toBe(400);
 
     const clickBadButton = await realFetch(`${base}/act`, {
       method: "POST",
@@ -705,6 +814,50 @@ describe("browser control server", () => {
       method: "POST",
     }).then((r) => r.json())) as { error?: string };
     expect(started.error ?? "").toMatch(/attachOnly/i);
+  });
+
+  it("allows attachOnly servers to ensure reachability via callback", async () => {
+    cfgAttachOnly = true;
+    reachable = false;
+    const { startBrowserBridgeServer } = await import("./bridge-server.js");
+
+    const ensured = vi.fn(async () => {
+      reachable = true;
+    });
+
+    const bridge = await startBrowserBridgeServer({
+      resolved: {
+        enabled: true,
+        controlUrl: "http://127.0.0.1:0",
+        controlHost: "127.0.0.1",
+        controlPort: 0,
+        cdpProtocol: "http",
+        cdpHost: "127.0.0.1",
+        cdpIsLoopback: true,
+        color: "#FF4500",
+        headless: true,
+        noSandbox: false,
+        attachOnly: true,
+        defaultProfile: "clawd",
+        profiles: {
+          clawd: { cdpPort: testPort + 1, color: "#FF4500" },
+        },
+      },
+      onEnsureAttachTarget: ensured,
+    });
+
+    const started = (await realFetch(`${bridge.baseUrl}/start`, {
+      method: "POST",
+    }).then((r) => r.json())) as { ok?: boolean; error?: string };
+    expect(started.error).toBeUndefined();
+    expect(started.ok).toBe(true);
+    const status = (await realFetch(`${bridge.baseUrl}/`).then((r) =>
+      r.json(),
+    )) as { running?: boolean };
+    expect(status.running).toBe(true);
+    expect(ensured).toHaveBeenCalledTimes(1);
+
+    await new Promise<void>((resolve) => bridge.server.close(() => resolve()));
   });
 
   it("opens tabs via CDP createTarget path", async () => {

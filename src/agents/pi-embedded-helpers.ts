@@ -10,29 +10,100 @@ import {
   normalizeThinkLevel,
   type ThinkLevel,
 } from "../auto-reply/thinking.js";
-
+import type { ClawdbotConfig } from "../config/config.js";
+import { formatSandboxToolPolicyBlockedMessage } from "./sandbox.js";
+import {
+  isValidCloudCodeAssistToolId,
+  sanitizeToolCallId,
+  sanitizeToolCallIdsForCloudCodeAssist,
+} from "./tool-call-id.js";
 import { sanitizeContentBlocksImages } from "./tool-images.js";
 import type { WorkspaceBootstrapFile } from "./workspace.js";
 
 export type EmbeddedContextFile = { path: string; content: string };
 
-const MAX_BOOTSTRAP_CHARS = 4000;
-const BOOTSTRAP_HEAD_CHARS = 2800;
-const BOOTSTRAP_TAIL_CHARS = 800;
+// ── Cross-provider thought_signature sanitization ──────────────────────────────
+// Claude's extended thinking feature generates thought_signature fields (message IDs
+// like "msg_abc123...") in content blocks. When these are sent to Google's Gemini API,
+// it expects Base64-encoded bytes and rejects Claude's format with a 400 error.
+// This function strips thought_signature fields to enable cross-provider session sharing.
 
-function trimBootstrapContent(content: string, fileName: string): string {
+type ContentBlockWithSignature = {
+  thought_signature?: unknown;
+  [key: string]: unknown;
+};
+
+/**
+ * Strips Claude-style thought_signature fields from content blocks.
+ *
+ * Gemini expects thought signatures as base64-encoded bytes, but Claude stores message ids
+ * like "msg_abc123...". We only strip "msg_*" to preserve any provider-valid signatures.
+ */
+export function stripThoughtSignatures<T>(content: T): T {
+  if (!Array.isArray(content)) return content;
+  return content.map((block) => {
+    if (!block || typeof block !== "object") return block;
+    const rec = block as ContentBlockWithSignature;
+    const signature = rec.thought_signature;
+    if (typeof signature !== "string" || !signature.startsWith("msg_")) {
+      return block;
+    }
+    const { thought_signature: _signature, ...rest } = rec;
+    return rest;
+  }) as T;
+}
+
+export const DEFAULT_BOOTSTRAP_MAX_CHARS = 20_000;
+const BOOTSTRAP_HEAD_RATIO = 0.7;
+const BOOTSTRAP_TAIL_RATIO = 0.2;
+
+type TrimBootstrapResult = {
+  content: string;
+  truncated: boolean;
+  maxChars: number;
+  originalLength: number;
+};
+
+export function resolveBootstrapMaxChars(cfg?: ClawdbotConfig): number {
+  const raw = cfg?.agents?.defaults?.bootstrapMaxChars;
+  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+    return Math.floor(raw);
+  }
+  return DEFAULT_BOOTSTRAP_MAX_CHARS;
+}
+
+function trimBootstrapContent(
+  content: string,
+  fileName: string,
+  maxChars: number,
+): TrimBootstrapResult {
   const trimmed = content.trimEnd();
-  if (trimmed.length <= MAX_BOOTSTRAP_CHARS) return trimmed;
+  if (trimmed.length <= maxChars) {
+    return {
+      content: trimmed,
+      truncated: false,
+      maxChars,
+      originalLength: trimmed.length,
+    };
+  }
 
-  const head = trimmed.slice(0, BOOTSTRAP_HEAD_CHARS);
-  const tail = trimmed.slice(-BOOTSTRAP_TAIL_CHARS);
-  return [
+  const headChars = Math.max(1, Math.floor(maxChars * BOOTSTRAP_HEAD_RATIO));
+  const tailChars = Math.max(1, Math.floor(maxChars * BOOTSTRAP_TAIL_RATIO));
+  const head = trimmed.slice(0, headChars);
+  const tail = trimmed.slice(-tailChars);
+  const contentWithMarker = [
     head,
     "",
     `[...truncated, read ${fileName} for full content...]`,
     "",
     tail,
   ].join("\n");
+  return {
+    content: contentWithMarker,
+    truncated: true,
+    maxChars,
+    originalLength: trimmed.length,
+  };
 }
 
 export async function ensureSessionHeader(params: {
@@ -85,11 +156,16 @@ function isEmptyAssistantErrorMessage(
 export async function sanitizeSessionMessagesImages(
   messages: AgentMessage[],
   label: string,
+  options?: { sanitizeToolCallIds?: boolean; enforceToolCallLast?: boolean },
 ): Promise<AgentMessage[]> {
   // We sanitize historical session messages because Anthropic can reject a request
   // if the transcript contains oversized base64 images (see MAX_IMAGE_DIMENSION_PX).
+  const sanitizedIds = options?.sanitizeToolCallIds
+    ? sanitizeToolCallIdsForCloudCodeAssist(messages)
+    : messages;
+  const base = sanitizedIds;
   const out: AgentMessage[] = [];
-  for (const msg of messages) {
+  for (const msg of base) {
     if (!msg || typeof msg !== "object") {
       out.push(msg);
       continue;
@@ -127,20 +203,42 @@ export async function sanitizeSessionMessagesImages(
       }
       const content = assistantMsg.content;
       if (Array.isArray(content)) {
-        const filteredContent = content.filter((block) => {
+        // Strip thought_signature fields to enable cross-provider session sharing
+        const strippedContent = stripThoughtSignatures(content);
+        const filteredContent = strippedContent.filter((block) => {
           if (!block || typeof block !== "object") return true;
           const rec = block as { type?: unknown; text?: unknown };
           if (rec.type !== "text" || typeof rec.text !== "string") return true;
           return rec.text.trim().length > 0;
         });
-        const sanitizedContent = (await sanitizeContentBlocksImages(
-          filteredContent as unknown as ContentBlock[],
+        const normalizedContent = options?.enforceToolCallLast
+          ? (() => {
+              let lastToolIndex = -1;
+              for (let i = filteredContent.length - 1; i >= 0; i -= 1) {
+                const block = filteredContent[i];
+                if (!block || typeof block !== "object") continue;
+                const type = (block as { type?: unknown }).type;
+                if (
+                  type === "functionCall" ||
+                  type === "toolUse" ||
+                  type === "toolCall"
+                ) {
+                  lastToolIndex = i;
+                  break;
+                }
+              }
+              if (lastToolIndex === -1) return filteredContent;
+              return filteredContent.slice(0, lastToolIndex + 1);
+            })()
+          : filteredContent;
+        const finalContent = (await sanitizeContentBlocksImages(
+          normalizedContent as unknown as ContentBlock[],
           label,
         )) as unknown as typeof assistantMsg.content;
-        if (sanitizedContent.length === 0) {
+        if (finalContent.length === 0) {
           continue;
         }
-        out.push({ ...assistantMsg, content: sanitizedContent });
+        out.push({ ...assistantMsg, content: finalContent });
         continue;
       }
     }
@@ -153,7 +251,11 @@ export async function sanitizeSessionMessagesImages(
 const GOOGLE_TURN_ORDER_BOOTSTRAP_TEXT = "(session bootstrap)";
 
 export function isGoogleModelApi(api?: string | null): boolean {
-  return api === "google-gemini-cli" || api === "google-generative-ai";
+  return (
+    api === "google-gemini-cli" ||
+    api === "google-generative-ai" ||
+    api === "google-antigravity"
+  );
 }
 
 export function sanitizeGoogleTurnOrdering(
@@ -186,7 +288,9 @@ export function sanitizeGoogleTurnOrdering(
 
 export function buildBootstrapContextFiles(
   files: WorkspaceBootstrapFile[],
+  opts?: { warn?: (message: string) => void; maxChars?: number },
 ): EmbeddedContextFile[] {
+  const maxChars = opts?.maxChars ?? DEFAULT_BOOTSTRAP_MAX_CHARS;
   const result: EmbeddedContextFile[] = [];
   for (const file of files) {
     if (file.missing) {
@@ -196,11 +300,20 @@ export function buildBootstrapContextFiles(
       });
       continue;
     }
-    const trimmed = trimBootstrapContent(file.content ?? "", file.name);
-    if (!trimmed) continue;
+    const trimmed = trimBootstrapContent(
+      file.content ?? "",
+      file.name,
+      maxChars,
+    );
+    if (!trimmed.content) continue;
+    if (trimmed.truncated) {
+      opts?.warn?.(
+        `workspace bootstrap file ${file.name} is ${trimmed.originalLength} chars (limit ${trimmed.maxChars}); truncating in injected context`,
+      );
+    }
     result.push({
       path: file.name,
-      content: trimmed,
+      content: trimmed.content,
     });
   }
   return result;
@@ -214,22 +327,61 @@ export function isContextOverflowError(errorMessage?: string): boolean {
     lower.includes("request exceeds the maximum size") ||
     lower.includes("context length exceeded") ||
     lower.includes("maximum context length") ||
+    lower.includes("prompt is too long") ||
+    lower.includes("context overflow") ||
     (lower.includes("413") && lower.includes("too large"))
+  );
+}
+
+export function isCompactionFailureError(errorMessage?: string): boolean {
+  if (!errorMessage) return false;
+  if (!isContextOverflowError(errorMessage)) return false;
+  const lower = errorMessage.toLowerCase();
+  return (
+    lower.includes("summarization failed") ||
+    lower.includes("auto-compaction") ||
+    lower.includes("compaction failed") ||
+    lower.includes("compaction")
   );
 }
 
 export function formatAssistantErrorText(
   msg: AssistantMessage,
+  opts?: { cfg?: ClawdbotConfig; sessionKey?: string },
 ): string | undefined {
   if (msg.stopReason !== "error") return undefined;
   const raw = (msg.errorMessage ?? "").trim();
   if (!raw) return "LLM request failed with an unknown error.";
 
+  const unknownTool =
+    raw.match(/unknown tool[:\s]+["']?([a-z0-9_-]+)["']?/i) ??
+    raw.match(
+      /tool\s+["']?([a-z0-9_-]+)["']?\s+(?:not found|is not available)/i,
+    );
+  if (unknownTool?.[1]) {
+    const rewritten = formatSandboxToolPolicyBlockedMessage({
+      cfg: opts?.cfg,
+      sessionKey: opts?.sessionKey,
+      toolName: unknownTool[1],
+    });
+    if (rewritten) return rewritten;
+  }
+
   // Check for context overflow (413) errors
   if (isContextOverflowError(raw)) {
     return (
-      "Context overflow: the conversation history is too large. " +
-      "Use /new or /reset to start a fresh session."
+      "Context overflow: prompt too large for the model. " +
+      "Try again with less input or a larger-context model."
+    );
+  }
+
+  // Check for role ordering errors (Anthropic 400 "Incorrect role information")
+  // This typically happens when consecutive user messages are sent without
+  // an assistant response between them, often due to steering/queueing timing.
+  if (/incorrect role information|roles must alternate/i.test(raw)) {
+    return (
+      "Message ordering conflict - please try again. " +
+      "If this persists, use /new to start a fresh session."
     );
   }
 
@@ -240,6 +392,11 @@ export function formatAssistantErrorText(
     return `LLM request rejected: ${invalidRequest[1]}`;
   }
 
+  // Check for overloaded errors (Anthropic API capacity)
+  if (isOverloadedErrorMessage(raw)) {
+    return "The AI service is temporarily overloaded. Please try again in a moment.";
+  }
+
   // Keep it short for WhatsApp.
   return raw.length > 600 ? `${raw.slice(0, 600)}…` : raw;
 }
@@ -248,33 +405,112 @@ export function isRateLimitAssistantError(
   msg: AssistantMessage | undefined,
 ): boolean {
   if (!msg || msg.stopReason !== "error") return false;
-  const raw = (msg.errorMessage ?? "").toLowerCase();
+  return isRateLimitErrorMessage(msg.errorMessage ?? "");
+}
+
+type ErrorPattern = RegExp | string;
+
+const ERROR_PATTERNS = {
+  rateLimit: [
+    /rate[_ ]limit|too many requests|429/,
+    "exceeded your current quota",
+    "resource has been exhausted",
+    "quota exceeded",
+    "resource_exhausted",
+    "usage limit",
+  ],
+  overloaded: [
+    /overloaded_error|"type"\s*:\s*"overloaded_error"/i,
+    "overloaded",
+  ],
+  timeout: [
+    "timeout",
+    "timed out",
+    "deadline exceeded",
+    "context deadline exceeded",
+  ],
+  billing: [
+    /\b402\b/,
+    "payment required",
+    "insufficient credits",
+    "credit balance",
+    "plans & billing",
+  ],
+  auth: [
+    /invalid[_ ]?api[_ ]?key/,
+    "incorrect api key",
+    "invalid token",
+    "authentication",
+    "unauthorized",
+    "forbidden",
+    "access denied",
+    "expired",
+    "token has expired",
+    /\b401\b/,
+    /\b403\b/,
+    // Credential validation failures should trigger fallback (#761)
+    "no credentials found",
+    "no api key found",
+  ],
+  format: [
+    "invalid_request_error",
+    "string should match pattern",
+    "tool_use.id",
+    "tool_use_id",
+    "messages.1.content.1.tool_use.id",
+    "invalid request format",
+  ],
+} as const;
+
+function matchesErrorPatterns(
+  raw: string,
+  patterns: readonly ErrorPattern[],
+): boolean {
   if (!raw) return false;
-  return isRateLimitErrorMessage(raw);
+  const value = raw.toLowerCase();
+  return patterns.some((pattern) =>
+    pattern instanceof RegExp ? pattern.test(value) : value.includes(pattern),
+  );
 }
 
 export function isRateLimitErrorMessage(raw: string): boolean {
+  return matchesErrorPatterns(raw, ERROR_PATTERNS.rateLimit);
+}
+
+export function isTimeoutErrorMessage(raw: string): boolean {
+  return matchesErrorPatterns(raw, ERROR_PATTERNS.timeout);
+}
+
+export function isBillingErrorMessage(raw: string): boolean {
   const value = raw.toLowerCase();
+  if (!value) return false;
+  if (matchesErrorPatterns(value, ERROR_PATTERNS.billing)) return true;
   return (
-    /rate[_ ]limit|too many requests|429/.test(value) ||
-    value.includes("exceeded your current quota")
+    value.includes("billing") &&
+    (value.includes("upgrade") ||
+      value.includes("credits") ||
+      value.includes("payment") ||
+      value.includes("plan"))
   );
 }
 
+export function isBillingAssistantError(
+  msg: AssistantMessage | undefined,
+): boolean {
+  if (!msg || msg.stopReason !== "error") return false;
+  return isBillingErrorMessage(msg.errorMessage ?? "");
+}
+
 export function isAuthErrorMessage(raw: string): boolean {
-  const value = raw.toLowerCase();
-  if (!value) return false;
-  return (
-    /invalid[_ ]?api[_ ]?key/.test(value) ||
-    value.includes("incorrect api key") ||
-    value.includes("invalid token") ||
-    value.includes("authentication") ||
-    value.includes("unauthorized") ||
-    value.includes("forbidden") ||
-    value.includes("access denied") ||
-    /\b401\b/.test(value) ||
-    /\b403\b/.test(value)
-  );
+  return matchesErrorPatterns(raw, ERROR_PATTERNS.auth);
+}
+
+export function isOverloadedErrorMessage(raw: string): boolean {
+  return matchesErrorPatterns(raw, ERROR_PATTERNS.overloaded);
+}
+
+export function isCloudCodeAssistFormatError(raw: string): boolean {
+  return matchesErrorPatterns(raw, ERROR_PATTERNS.format);
 }
 
 export function isAuthAssistantError(
@@ -282,6 +518,35 @@ export function isAuthAssistantError(
 ): boolean {
   if (!msg || msg.stopReason !== "error") return false;
   return isAuthErrorMessage(msg.errorMessage ?? "");
+}
+
+export type FailoverReason =
+  | "auth"
+  | "format"
+  | "rate_limit"
+  | "billing"
+  | "timeout"
+  | "unknown";
+
+export function classifyFailoverReason(raw: string): FailoverReason | null {
+  if (isRateLimitErrorMessage(raw)) return "rate_limit";
+  if (isOverloadedErrorMessage(raw)) return "rate_limit"; // Treat overloaded as rate limit for failover
+  if (isCloudCodeAssistFormatError(raw)) return "format";
+  if (isBillingErrorMessage(raw)) return "billing";
+  if (isTimeoutErrorMessage(raw)) return "timeout";
+  if (isAuthErrorMessage(raw)) return "auth";
+  return null;
+}
+
+export function isFailoverErrorMessage(raw: string): boolean {
+  return classifyFailoverReason(raw) !== null;
+}
+
+export function isFailoverAssistantError(
+  msg: AssistantMessage | undefined,
+): boolean {
+  if (!msg || msg.stopReason !== "error") return false;
+  return isFailoverErrorMessage(msg.errorMessage ?? "");
 }
 
 function extractSupportedValues(raw: string): string[] {
@@ -393,8 +658,85 @@ export function validateGeminiTurns(messages: AgentMessage[]): AgentMessage[] {
   return result;
 }
 
+export function mergeConsecutiveUserTurns(
+  previous: Extract<AgentMessage, { role: "user" }>,
+  current: Extract<AgentMessage, { role: "user" }>,
+): Extract<AgentMessage, { role: "user" }> {
+  const mergedContent = [
+    ...(Array.isArray(previous.content) ? previous.content : []),
+    ...(Array.isArray(current.content) ? current.content : []),
+  ];
+
+  // Preserve newest metadata while backfilling timestamp if the latest is missing.
+  return {
+    ...current, // newest wins for metadata
+    content: mergedContent,
+    timestamp: current.timestamp ?? previous.timestamp,
+  };
+}
+
+/**
+ * Validates and fixes conversation turn sequences for Anthropic API.
+ * Anthropic requires strict alternating user→assistant pattern.
+ * This function:
+ * 1. Detects consecutive user messages
+ * 2. Merges consecutive user messages together
+ * 3. Preserves timestamps from the later message
+ *
+ * This prevents the "400 Incorrect role information" error that occurs
+ * when steering messages are injected during streaming and create
+ * consecutive user messages.
+ */
+export function validateAnthropicTurns(
+  messages: AgentMessage[],
+): AgentMessage[] {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return messages;
+  }
+
+  const result: AgentMessage[] = [];
+  let lastRole: string | undefined;
+
+  for (const msg of messages) {
+    if (!msg || typeof msg !== "object") {
+      result.push(msg);
+      continue;
+    }
+
+    const msgRole = (msg as { role?: unknown }).role as string | undefined;
+    if (!msgRole) {
+      result.push(msg);
+      continue;
+    }
+
+    // Check if this message has the same role as the last one
+    if (msgRole === lastRole && lastRole === "user") {
+      // Merge consecutive user messages. Base on the newest message so we keep
+      // fresh metadata (attachments, timestamps, future fields) while
+      // appending prior content.
+      const lastMsg = result[result.length - 1];
+      const currentMsg = msg as Extract<AgentMessage, { role: "user" }>;
+
+      if (lastMsg && typeof lastMsg === "object") {
+        const lastUser = lastMsg as Extract<AgentMessage, { role: "user" }>;
+        const merged = mergeConsecutiveUserTurns(lastUser, currentMsg);
+
+        // Replace the last message with merged version
+        result[result.length - 1] = merged;
+        continue;
+      }
+    }
+
+    // Not a consecutive duplicate, add normally
+    result.push(msg);
+    lastRole = msgRole;
+  }
+
+  return result;
+}
+
 // ── Messaging tool duplicate detection ──────────────────────────────────────
-// When the agent uses a messaging tool (telegram, discord, slack, sessions_send)
+// When the agent uses a messaging tool (telegram, discord, slack, message, sessions_send)
 // to send a message, we track the text so we can suppress duplicate block replies.
 // The LLM sometimes elaborates or wraps the same content, so we use substring matching.
 
@@ -416,11 +758,34 @@ export function normalizeTextForComparison(text: string): string {
     .trim();
 }
 
+export function isMessagingToolDuplicateNormalized(
+  normalized: string,
+  normalizedSentTexts: string[],
+): boolean {
+  if (normalizedSentTexts.length === 0) return false;
+  if (!normalized || normalized.length < MIN_DUPLICATE_TEXT_LENGTH)
+    return false;
+  return normalizedSentTexts.some((normalizedSent) => {
+    if (!normalizedSent || normalizedSent.length < MIN_DUPLICATE_TEXT_LENGTH)
+      return false;
+    return (
+      normalized.includes(normalizedSent) || normalizedSent.includes(normalized)
+    );
+  });
+}
+
 /**
  * Check if a text is a duplicate of any previously sent messaging tool text.
  * Uses substring matching to handle LLM elaboration (e.g., wrapping in quotes,
  * adding context, or slight rephrasing that includes the original).
  */
+// ── Tool Call ID Sanitization (Google Cloud Code Assist) ───────────────────────
+// Google Cloud Code Assist rejects tool call IDs that contain invalid characters.
+// OpenAI Codex generates IDs like "call_abc123|item_456" with pipe characters,
+// but Google requires IDs matching ^[a-zA-Z0-9_-]+$ pattern.
+// This function sanitizes tool call IDs by replacing invalid characters with underscores.
+export { sanitizeToolCallId, isValidCloudCodeAssistToolId };
+
 export function isMessagingToolDuplicate(
   text: string,
   sentTexts: string[],
@@ -429,13 +794,153 @@ export function isMessagingToolDuplicate(
   const normalized = normalizeTextForComparison(text);
   if (!normalized || normalized.length < MIN_DUPLICATE_TEXT_LENGTH)
     return false;
-  return sentTexts.some((sent) => {
-    const normalizedSent = normalizeTextForComparison(sent);
-    if (!normalizedSent || normalizedSent.length < MIN_DUPLICATE_TEXT_LENGTH)
-      return false;
-    // Substring match: either text contains the other
-    return (
-      normalized.includes(normalizedSent) || normalizedSent.includes(normalized)
-    );
-  });
+  return isMessagingToolDuplicateNormalized(
+    normalized,
+    sentTexts.map(normalizeTextForComparison),
+  );
+}
+
+/**
+ * Downgrades tool calls that are missing `thought_signature` (required by Gemini)
+ * into text representations, to prevent 400 INVALID_ARGUMENT errors.
+ * Also converts corresponding tool results into user messages.
+ */
+type GeminiToolCallBlock = {
+  type?: unknown;
+  thought_signature?: unknown;
+  id?: unknown;
+  toolCallId?: unknown;
+  name?: unknown;
+  toolName?: unknown;
+  arguments?: unknown;
+  input?: unknown;
+};
+
+export function downgradeGeminiHistory(
+  messages: AgentMessage[],
+): AgentMessage[] {
+  const downgradedIds = new Set<string>();
+  const out: AgentMessage[] = [];
+
+  const resolveToolResultId = (
+    msg: Extract<AgentMessage, { role: "toolResult" }>,
+  ): string | undefined => {
+    const toolCallId = (msg as { toolCallId?: unknown }).toolCallId;
+    if (typeof toolCallId === "string" && toolCallId) return toolCallId;
+    const toolUseId = (msg as { toolUseId?: unknown }).toolUseId;
+    if (typeof toolUseId === "string" && toolUseId) return toolUseId;
+    return undefined;
+  };
+
+  for (const msg of messages) {
+    if (!msg || typeof msg !== "object") {
+      out.push(msg);
+      continue;
+    }
+
+    const role = (msg as { role?: unknown }).role;
+
+    if (role === "assistant") {
+      const assistantMsg = msg as Extract<AgentMessage, { role: "assistant" }>;
+      if (!Array.isArray(assistantMsg.content)) {
+        out.push(msg);
+        continue;
+      }
+
+      let hasDowngraded = false;
+      const newContent = assistantMsg.content.map((block) => {
+        if (!block || typeof block !== "object") return block;
+        const blockRecord = block as GeminiToolCallBlock;
+        const type = blockRecord.type;
+
+        // Check for tool calls / function calls
+        if (
+          type === "toolCall" ||
+          type === "functionCall" ||
+          type === "toolUse"
+        ) {
+          // Check if thought_signature is missing
+          // Note: TypeScript doesn't know about thought_signature on standard types
+          const hasSignature = Boolean(blockRecord.thought_signature);
+
+          if (!hasSignature) {
+            const id =
+              typeof blockRecord.id === "string"
+                ? blockRecord.id
+                : typeof blockRecord.toolCallId === "string"
+                  ? blockRecord.toolCallId
+                  : undefined;
+            const name =
+              typeof blockRecord.name === "string"
+                ? blockRecord.name
+                : typeof blockRecord.toolName === "string"
+                  ? blockRecord.toolName
+                  : undefined;
+            const args =
+              blockRecord.arguments !== undefined
+                ? blockRecord.arguments
+                : blockRecord.input;
+
+            if (id) downgradedIds.add(id);
+            hasDowngraded = true;
+
+            const argsText =
+              typeof args === "string" ? args : JSON.stringify(args, null, 2);
+
+            return {
+              type: "text",
+              text: `[Tool Call: ${name ?? "unknown"}${
+                id ? ` (ID: ${id})` : ""
+              }]\nArguments: ${argsText}`,
+            };
+          }
+        }
+        return block;
+      });
+
+      if (hasDowngraded) {
+        out.push({ ...assistantMsg, content: newContent } as AgentMessage);
+      } else {
+        out.push(msg);
+      }
+      continue;
+    }
+
+    if (role === "toolResult") {
+      const toolMsg = msg as Extract<AgentMessage, { role: "toolResult" }>;
+      const toolResultId = resolveToolResultId(toolMsg);
+      if (toolResultId && downgradedIds.has(toolResultId)) {
+        // Convert to User message
+        let textContent = "";
+        if (Array.isArray(toolMsg.content)) {
+          textContent = toolMsg.content
+            .map((entry) => {
+              if (entry && typeof entry === "object") {
+                const text = (entry as { text?: unknown }).text;
+                if (typeof text === "string") return text;
+              }
+              return JSON.stringify(entry);
+            })
+            .join("\n");
+        } else {
+          textContent = JSON.stringify(toolMsg.content);
+        }
+
+        out.push({
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `[Tool Result for ID ${toolResultId}]\n${textContent}`,
+            },
+          ],
+        } as AgentMessage);
+
+        continue;
+      }
+    }
+
+    out.push(msg);
+  }
+  return out;
 }

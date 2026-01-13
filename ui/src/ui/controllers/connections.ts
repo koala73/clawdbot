@@ -1,6 +1,6 @@
 import type { GatewayBrowserClient } from "../gateway";
 import { parseList } from "../format";
-import type { ConfigSnapshot, ProvidersStatusSnapshot } from "../types";
+import type { ChannelsStatusSnapshot, ConfigSnapshot } from "../types";
 import {
   defaultDiscordActions,
   defaultSlackActions,
@@ -18,10 +18,10 @@ import {
 export type ConnectionsState = {
   client: GatewayBrowserClient | null;
   connected: boolean;
-  providersLoading: boolean;
-  providersSnapshot: ProvidersStatusSnapshot | null;
-  providersError: string | null;
-  providersLastSuccess: number | null;
+  channelsLoading: boolean;
+  channelsSnapshot: ChannelsStatusSnapshot | null;
+  channelsError: string | null;
+  channelsLastSuccess: number | null;
   whatsappLoginMessage: string | null;
   whatsappLoginQrDataUrl: string | null;
   whatsappLoginConnected: boolean | null;
@@ -48,26 +48,32 @@ export type ConnectionsState = {
   configSnapshot: ConfigSnapshot | null;
 };
 
-export async function loadProviders(state: ConnectionsState, probe: boolean) {
+export async function loadChannels(state: ConnectionsState, probe: boolean) {
   if (!state.client || !state.connected) return;
-  if (state.providersLoading) return;
-  state.providersLoading = true;
-  state.providersError = null;
+  if (state.channelsLoading) return;
+  state.channelsLoading = true;
+  state.channelsError = null;
   try {
-    const res = (await state.client.request("providers.status", {
+    const res = (await state.client.request("channels.status", {
       probe,
       timeoutMs: 8000,
-    })) as ProvidersStatusSnapshot;
-    state.providersSnapshot = res;
-    state.providersLastSuccess = Date.now();
-    state.telegramTokenLocked = res.telegram.tokenSource === "env";
-    state.discordTokenLocked = res.discord?.tokenSource === "env";
-    state.slackTokenLocked = res.slack?.botTokenSource === "env";
-    state.slackAppTokenLocked = res.slack?.appTokenSource === "env";
+    })) as ChannelsStatusSnapshot;
+    state.channelsSnapshot = res;
+    state.channelsLastSuccess = Date.now();
+    const channels = res.channels as Record<string, unknown>;
+    const telegram = channels.telegram as { tokenSource?: string | null };
+    const discord = channels.discord as { tokenSource?: string | null } | null;
+    const slack = channels.slack as
+      | { botTokenSource?: string | null; appTokenSource?: string | null }
+      | null;
+    state.telegramTokenLocked = telegram?.tokenSource === "env";
+    state.discordTokenLocked = discord?.tokenSource === "env";
+    state.slackTokenLocked = slack?.botTokenSource === "env";
+    state.slackAppTokenLocked = slack?.appTokenSource === "env";
   } catch (err) {
-    state.providersError = String(err);
+    state.channelsError = String(err);
   } finally {
-    state.providersLoading = false;
+    state.channelsLoading = false;
   }
 }
 
@@ -113,7 +119,7 @@ export async function logoutWhatsApp(state: ConnectionsState) {
   if (!state.client || !state.connected || state.whatsappBusy) return;
   state.whatsappBusy = true;
   try {
-    await state.client.request("web.logout", {});
+    await state.client.request("channels.logout", { channel: "whatsapp" });
     state.whatsappLoginMessage = "Logged out.";
     state.whatsappLoginQrDataUrl = null;
     state.whatsappLoginConnected = null;
@@ -181,6 +187,15 @@ export async function saveTelegramConfig(state: ConnectionsState) {
   state.telegramSaving = true;
   state.telegramConfigStatus = null;
   try {
+    if (state.telegramForm.groupsWildcardEnabled) {
+      const confirmed = window.confirm(
+        'Telegram groups wildcard "*" allows all groups. Continue?',
+      );
+      if (!confirmed) {
+        state.telegramConfigStatus = "Save cancelled.";
+        return;
+      }
+    }
     const base = state.configSnapshot?.config ?? {};
     const config = { ...base } as Record<string, unknown>;
     const telegram = { ...(config.telegram ?? {}) } as Record<string, unknown>;
@@ -196,16 +211,22 @@ export async function saveTelegramConfig(state: ConnectionsState) {
             unknown
           >)
         : {};
-    const defaultGroup =
-      groups["*"] && typeof groups["*"] === "object"
-        ? ({ ...(groups["*"] as Record<string, unknown>) } as Record<
-            string,
-            unknown
-          >)
-        : {};
-    defaultGroup.requireMention = state.telegramForm.requireMention;
-    groups["*"] = defaultGroup;
-    telegram.groups = groups;
+    if (state.telegramForm.groupsWildcardEnabled) {
+      const defaultGroup =
+        groups["*"] && typeof groups["*"] === "object"
+          ? ({ ...(groups["*"] as Record<string, unknown>) } as Record<
+              string,
+              unknown
+            >)
+          : {};
+      defaultGroup.requireMention = state.telegramForm.requireMention;
+      groups["*"] = defaultGroup;
+      telegram.groups = groups;
+    } else if (groups["*"]) {
+      delete groups["*"];
+      if (Object.keys(groups).length > 0) telegram.groups = groups;
+      else delete telegram.groups;
+    }
     delete telegram.requireMention;
     const allowFrom = parseList(state.telegramForm.allowFrom);
     if (allowFrom.length > 0) telegram.allowFrom = allowFrom;

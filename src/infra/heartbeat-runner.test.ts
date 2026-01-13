@@ -17,6 +17,9 @@ import {
 } from "./heartbeat-runner.js";
 import { resolveHeartbeatDeliveryTarget } from "./outbound/targets.js";
 
+// Avoid pulling optional runtime deps during isolated runs.
+vi.mock("jiti", () => ({ createJiti: () => () => ({}) }));
+
 describe("resolveHeartbeatIntervalMs", () => {
   it("returns default when unset", () => {
     expect(resolveHeartbeatIntervalMs({})).toBe(30 * 60_000);
@@ -78,7 +81,7 @@ describe("resolveHeartbeatDeliveryTarget", () => {
       agents: { defaults: { heartbeat: { target: "none" } } },
     };
     expect(resolveHeartbeatDeliveryTarget({ cfg, entry: baseEntry })).toEqual({
-      provider: "none",
+      channel: "none",
       reason: "target-none",
     });
   });
@@ -87,12 +90,27 @@ describe("resolveHeartbeatDeliveryTarget", () => {
     const cfg: ClawdbotConfig = {};
     const entry = {
       ...baseEntry,
-      lastProvider: "whatsapp" as const,
+      lastChannel: "whatsapp" as const,
       lastTo: "+1555",
     };
     expect(resolveHeartbeatDeliveryTarget({ cfg, entry })).toEqual({
-      provider: "whatsapp",
+      channel: "whatsapp",
       to: "+1555",
+    });
+  });
+
+  it("normalizes explicit WhatsApp targets when allowFrom is '*'", () => {
+    const cfg: ClawdbotConfig = {
+      agents: {
+        defaults: {
+          heartbeat: { target: "whatsapp", to: "whatsapp:(555) 123" },
+        },
+      },
+      channels: { whatsapp: { allowFrom: ["*"] } },
+    };
+    expect(resolveHeartbeatDeliveryTarget({ cfg, entry: baseEntry })).toEqual({
+      channel: "whatsapp",
+      to: "+555123",
     });
   });
 
@@ -100,11 +118,11 @@ describe("resolveHeartbeatDeliveryTarget", () => {
     const cfg: ClawdbotConfig = {};
     const entry = {
       ...baseEntry,
-      lastProvider: "webchat" as const,
+      lastChannel: "webchat" as const,
       lastTo: "web",
     };
     expect(resolveHeartbeatDeliveryTarget({ cfg, entry })).toEqual({
-      provider: "none",
+      channel: "none",
       reason: "no-target",
     });
   });
@@ -112,17 +130,47 @@ describe("resolveHeartbeatDeliveryTarget", () => {
   it("applies allowFrom fallback for WhatsApp targets", () => {
     const cfg: ClawdbotConfig = {
       agents: { defaults: { heartbeat: { target: "whatsapp", to: "+1999" } } },
-      whatsapp: { allowFrom: ["+1555", "+1666"] },
+      channels: { whatsapp: { allowFrom: ["+1555", "+1666"] } },
     };
     const entry = {
       ...baseEntry,
-      lastProvider: "whatsapp" as const,
+      lastChannel: "whatsapp" as const,
       lastTo: "+1222",
     };
     expect(resolveHeartbeatDeliveryTarget({ cfg, entry })).toEqual({
-      provider: "whatsapp",
+      channel: "whatsapp",
       to: "+1555",
       reason: "allowFrom-fallback",
+    });
+  });
+
+  it("keeps WhatsApp group targets even with allowFrom set", () => {
+    const cfg: ClawdbotConfig = {
+      channels: { whatsapp: { allowFrom: ["+1555"] } },
+    };
+    const entry = {
+      ...baseEntry,
+      lastChannel: "whatsapp" as const,
+      lastTo: "120363401234567890@g.us",
+    };
+    expect(resolveHeartbeatDeliveryTarget({ cfg, entry })).toEqual({
+      channel: "whatsapp",
+      to: "120363401234567890@g.us",
+    });
+  });
+
+  it("normalizes prefixed WhatsApp group targets for heartbeat delivery", () => {
+    const cfg: ClawdbotConfig = {
+      channels: { whatsapp: { allowFrom: ["+1555"] } },
+    };
+    const entry = {
+      ...baseEntry,
+      lastChannel: "whatsapp" as const,
+      lastTo: "whatsapp:group:120363401234567890@G.US",
+    };
+    expect(resolveHeartbeatDeliveryTarget({ cfg, entry })).toEqual({
+      channel: "whatsapp",
+      to: "120363401234567890@g.us",
     });
   });
 
@@ -131,7 +179,7 @@ describe("resolveHeartbeatDeliveryTarget", () => {
       agents: { defaults: { heartbeat: { target: "telegram", to: "123" } } },
     };
     expect(resolveHeartbeatDeliveryTarget({ cfg, entry: baseEntry })).toEqual({
-      provider: "telegram",
+      channel: "telegram",
       to: "123",
     });
   });
@@ -150,7 +198,7 @@ describe("runHeartbeatOnce", () => {
             main: {
               sessionId: "sid",
               updatedAt: Date.now(),
-              lastProvider: "whatsapp",
+              lastChannel: "whatsapp",
               lastTo: "+1555",
             },
           },
@@ -165,7 +213,7 @@ describe("runHeartbeatOnce", () => {
             heartbeat: { every: "5m", target: "whatsapp", to: "+1555" },
           },
         },
-        whatsapp: { allowFrom: ["*"] },
+        channels: { whatsapp: { allowFrom: ["*"] } },
         session: { store: storePath },
       };
 
@@ -201,6 +249,150 @@ describe("runHeartbeatOnce", () => {
     }
   });
 
+  it("can include reasoning payloads when enabled", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-hb-"));
+    const storePath = path.join(tmpDir, "sessions.json");
+    const replySpy = vi.spyOn(replyModule, "getReplyFromConfig");
+    try {
+      await fs.writeFile(
+        storePath,
+        JSON.stringify(
+          {
+            main: {
+              sessionId: "sid",
+              updatedAt: Date.now(),
+              lastProvider: "whatsapp",
+              lastTo: "+1555",
+            },
+          },
+          null,
+          2,
+        ),
+      );
+
+      const cfg: ClawdbotConfig = {
+        agents: {
+          defaults: {
+            heartbeat: {
+              every: "5m",
+              target: "whatsapp",
+              to: "+1555",
+              includeReasoning: true,
+            },
+          },
+        },
+        channels: { whatsapp: { allowFrom: ["*"] } },
+        session: { store: storePath },
+      };
+
+      replySpy.mockResolvedValue([
+        { text: "Reasoning:\n_Because it helps_" },
+        { text: "Final alert" },
+      ]);
+      const sendWhatsApp = vi.fn().mockResolvedValue({
+        messageId: "m1",
+        toJid: "jid",
+      });
+
+      await runHeartbeatOnce({
+        cfg,
+        deps: {
+          sendWhatsApp,
+          getQueueSize: () => 0,
+          nowMs: () => 0,
+          webAuthExists: async () => true,
+          hasActiveWebListener: () => true,
+        },
+      });
+
+      expect(sendWhatsApp).toHaveBeenCalledTimes(2);
+      expect(sendWhatsApp).toHaveBeenNthCalledWith(
+        1,
+        "+1555",
+        "Reasoning:\n_Because it helps_",
+        expect.any(Object),
+      );
+      expect(sendWhatsApp).toHaveBeenNthCalledWith(
+        2,
+        "+1555",
+        "Final alert",
+        expect.any(Object),
+      );
+    } finally {
+      replySpy.mockRestore();
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("delivers reasoning even when the main heartbeat reply is HEARTBEAT_OK", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-hb-"));
+    const storePath = path.join(tmpDir, "sessions.json");
+    const replySpy = vi.spyOn(replyModule, "getReplyFromConfig");
+    try {
+      await fs.writeFile(
+        storePath,
+        JSON.stringify(
+          {
+            main: {
+              sessionId: "sid",
+              updatedAt: Date.now(),
+              lastProvider: "whatsapp",
+              lastTo: "+1555",
+            },
+          },
+          null,
+          2,
+        ),
+      );
+
+      const cfg: ClawdbotConfig = {
+        agents: {
+          defaults: {
+            heartbeat: {
+              every: "5m",
+              target: "whatsapp",
+              to: "+1555",
+              includeReasoning: true,
+            },
+          },
+        },
+        channels: { whatsapp: { allowFrom: ["*"] } },
+        session: { store: storePath },
+      };
+
+      replySpy.mockResolvedValue([
+        { text: "Reasoning:\n_Because it helps_" },
+        { text: "HEARTBEAT_OK" },
+      ]);
+      const sendWhatsApp = vi.fn().mockResolvedValue({
+        messageId: "m1",
+        toJid: "jid",
+      });
+
+      await runHeartbeatOnce({
+        cfg,
+        deps: {
+          sendWhatsApp,
+          getQueueSize: () => 0,
+          nowMs: () => 0,
+          webAuthExists: async () => true,
+          hasActiveWebListener: () => true,
+        },
+      });
+
+      expect(sendWhatsApp).toHaveBeenCalledTimes(1);
+      expect(sendWhatsApp).toHaveBeenNthCalledWith(
+        1,
+        "+1555",
+        "Reasoning:\n_Because it helps_",
+        expect.any(Object),
+      );
+    } finally {
+      replySpy.mockRestore();
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it("loads the default agent session from templated stores", async () => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-hb-"));
     const storeTemplate = path.join(
@@ -216,7 +408,7 @@ describe("runHeartbeatOnce", () => {
           defaults: { heartbeat: { every: "5m" } },
           list: [{ id: "work", default: true }],
         },
-        whatsapp: { allowFrom: ["*"] },
+        channels: { whatsapp: { allowFrom: ["*"] } },
         session: { store: storeTemplate },
       };
       const sessionKey = resolveMainSessionKey(cfg);
@@ -301,7 +493,7 @@ describe("runHeartbeatOnce", () => {
             },
           },
         },
-        whatsapp: { allowFrom: ["*"] },
+        channels: { whatsapp: { allowFrom: ["*"] } },
         session: { store: storePath },
       };
 
@@ -323,6 +515,65 @@ describe("runHeartbeatOnce", () => {
       });
 
       expect(sendWhatsApp).toHaveBeenCalled();
+    } finally {
+      replySpy.mockRestore();
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("skips delivery for markup-wrapped HEARTBEAT_OK", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-hb-"));
+    const storePath = path.join(tmpDir, "sessions.json");
+    const replySpy = vi.spyOn(replyModule, "getReplyFromConfig");
+    try {
+      await fs.writeFile(
+        storePath,
+        JSON.stringify(
+          {
+            main: {
+              sessionId: "sid",
+              updatedAt: Date.now(),
+              lastProvider: "whatsapp",
+              lastTo: "+1555",
+            },
+          },
+          null,
+          2,
+        ),
+      );
+
+      const cfg: ClawdbotConfig = {
+        agents: {
+          defaults: {
+            heartbeat: {
+              every: "5m",
+              target: "whatsapp",
+              to: "+1555",
+            },
+          },
+        },
+        channels: { whatsapp: { allowFrom: ["*"] } },
+        session: { store: storePath },
+      };
+
+      replySpy.mockResolvedValue({ text: "<b>HEARTBEAT_OK</b>" });
+      const sendWhatsApp = vi.fn().mockResolvedValue({
+        messageId: "m1",
+        toJid: "jid",
+      });
+
+      await runHeartbeatOnce({
+        cfg,
+        deps: {
+          sendWhatsApp,
+          getQueueSize: () => 0,
+          nowMs: () => 0,
+          webAuthExists: async () => true,
+          hasActiveWebListener: () => true,
+        },
+      });
+
+      expect(sendWhatsApp).not.toHaveBeenCalled();
     } finally {
       replySpy.mockRestore();
       await fs.rm(tmpDir, { recursive: true, force: true });
@@ -356,7 +607,7 @@ describe("runHeartbeatOnce", () => {
             heartbeat: { every: "5m", target: "whatsapp", to: "+1555" },
           },
         },
-        whatsapp: { allowFrom: ["*"] },
+        channels: { whatsapp: { allowFrom: ["*"] } },
         session: { store: storePath },
       };
 
@@ -415,7 +666,7 @@ describe("runHeartbeatOnce", () => {
             heartbeat: { every: "5m", target: "telegram", to: "123456" },
           },
         },
-        telegram: { botToken: "test-bot-token-123" },
+        channels: { telegram: { botToken: "test-bot-token-123" } },
         session: { store: storePath },
       };
 
@@ -480,9 +731,11 @@ describe("runHeartbeatOnce", () => {
             heartbeat: { every: "5m", target: "telegram", to: "123456" },
           },
         },
-        telegram: {
-          accounts: {
-            work: { botToken: "test-bot-token-123" },
+        channels: {
+          telegram: {
+            accounts: {
+              work: { botToken: "test-bot-token-123" },
+            },
           },
         },
         session: { store: storePath },

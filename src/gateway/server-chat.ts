@@ -1,4 +1,9 @@
-import type { AgentEventPayload } from "../infra/agent-events.js";
+import { normalizeVerboseLevel } from "../auto-reply/thinking.js";
+import {
+  type AgentEventPayload,
+  getAgentRunContext,
+} from "../infra/agent-events.js";
+import { loadSessionEntry } from "./session-utils.js";
 import { formatForLog } from "./ws-log.js";
 
 export type ChatRunEntry = {
@@ -69,6 +74,7 @@ export type ChatRunState = {
   registry: ChatRunRegistry;
   buffers: Map<string, string>;
   deltaSentAt: Map<string, number>;
+  abortedRuns: Map<string, number>;
   clear: () => void;
 };
 
@@ -76,17 +82,20 @@ export function createChatRunState(): ChatRunState {
   const registry = createChatRunRegistry();
   const buffers = new Map<string, string>();
   const deltaSentAt = new Map<string, number>();
+  const abortedRuns = new Map<string, number>();
 
   const clear = () => {
     registry.clear();
     buffers.clear();
     deltaSentAt.clear();
+    abortedRuns.clear();
   };
 
   return {
     registry,
     buffers,
     deltaSentAt,
+    abortedRuns,
     clear,
   };
 }
@@ -185,13 +194,39 @@ export function createAgentEventHandler({
     bridgeSendToSession(sessionKey, "chat", payload);
   };
 
+  const shouldEmitToolEvents = (runId: string, sessionKey?: string) => {
+    const runContext = getAgentRunContext(runId);
+    const runVerbose = normalizeVerboseLevel(runContext?.verboseLevel);
+    if (runVerbose) return runVerbose === "on";
+    if (!sessionKey) return false;
+    try {
+      const { cfg, entry } = loadSessionEntry(sessionKey);
+      const sessionVerbose = normalizeVerboseLevel(entry?.verboseLevel);
+      if (sessionVerbose) return sessionVerbose === "on";
+      const defaultVerbose = normalizeVerboseLevel(
+        cfg.agents?.defaults?.verboseDefault,
+      );
+      return defaultVerbose === "on";
+    } catch {
+      return false;
+    }
+  };
+
   return (evt: AgentEventPayload) => {
     const chatLink = chatRunState.registry.peek(evt.runId);
     const sessionKey =
       chatLink?.sessionKey ?? resolveSessionKeyForRun(evt.runId);
+    const clientRunId = chatLink?.clientRunId ?? evt.runId;
+    const isAborted =
+      chatRunState.abortedRuns.has(clientRunId) ||
+      chatRunState.abortedRuns.has(evt.runId);
     // Include sessionKey so Control UI can filter tool streams per session.
     const agentPayload = sessionKey ? { ...evt, sessionKey } : evt;
     const last = agentRunSeq.get(evt.runId) ?? 0;
+    if (evt.stream === "tool" && !shouldEmitToolEvents(evt.runId, sessionKey)) {
+      agentRunSeq.set(evt.runId, evt.seq);
+      return;
+    }
     if (evt.seq !== last + 1) {
       broadcast("agent", {
         runId: evt.runId,
@@ -215,10 +250,16 @@ export function createAgentEventHandler({
 
     if (sessionKey) {
       bridgeSendToSession(sessionKey, "agent", agentPayload);
-      if (evt.stream === "assistant" && typeof evt.data?.text === "string") {
-        const clientRunId = chatLink?.clientRunId ?? evt.runId;
+      if (
+        !isAborted &&
+        evt.stream === "assistant" &&
+        typeof evt.data?.text === "string"
+      ) {
         emitChatDelta(sessionKey, clientRunId, evt.seq, evt.data.text);
-      } else if (lifecyclePhase === "end" || lifecyclePhase === "error") {
+      } else if (
+        !isAborted &&
+        (lifecyclePhase === "end" || lifecyclePhase === "error")
+      ) {
         if (chatLink) {
           const finished = chatRunState.registry.shift(evt.runId);
           if (!finished) {
@@ -240,6 +281,17 @@ export function createAgentEventHandler({
             lifecyclePhase === "error" ? "error" : "done",
             evt.data?.error,
           );
+        }
+      } else if (
+        isAborted &&
+        (lifecyclePhase === "end" || lifecyclePhase === "error")
+      ) {
+        chatRunState.abortedRuns.delete(clientRunId);
+        chatRunState.abortedRuns.delete(evt.runId);
+        chatRunState.buffers.delete(clientRunId);
+        chatRunState.deltaSentAt.delete(clientRunId);
+        if (chatLink) {
+          chatRunState.registry.remove(evt.runId, clientRunId, sessionKey);
         }
       }
     }

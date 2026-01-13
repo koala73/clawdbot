@@ -7,10 +7,13 @@ import {
   isDiscordGroupAllowedByPolicy,
   normalizeDiscordAllowList,
   normalizeDiscordSlug,
+  registerDiscordListener,
   resolveDiscordChannelConfig,
   resolveDiscordGuildEntry,
   resolveDiscordReplyTarget,
+  resolveDiscordShouldRequireMention,
   resolveGroupDmAllow,
+  sanitizeDiscordThreadName,
   shouldEmitDiscordReactionNotification,
 } from "./monitor.js";
 
@@ -31,6 +34,18 @@ const makeEntries = (
   }
   return out;
 };
+
+describe("registerDiscordListener", () => {
+  class FakeListener {}
+
+  it("dedupes listeners by constructor", () => {
+    const listeners: object[] = [];
+
+    expect(registerDiscordListener(listeners, new FakeListener())).toBe(true);
+    expect(registerDiscordListener(listeners, new FakeListener())).toBe(false);
+    expect(listeners).toHaveLength(1);
+  });
+});
 
 describe("discord allowlist helpers", () => {
   it("normalizes slugs", () => {
@@ -103,6 +118,7 @@ describe("discord guild/channel resolution", () => {
           enabled: false,
           users: ["123"],
           systemPrompt: "Use short answers.",
+          autoThread: true,
         },
       },
     };
@@ -127,6 +143,7 @@ describe("discord guild/channel resolution", () => {
     expect(help?.enabled).toBe(false);
     expect(help?.users).toEqual(["123"]);
     expect(help?.systemPrompt).toBe("Use short answers.");
+    expect(help?.autoThread).toBe(true);
   });
 
   it("denies channel when config present but no match", () => {
@@ -142,6 +159,54 @@ describe("discord guild/channel resolution", () => {
       channelSlug: "random",
     });
     expect(channel?.allowed).toBe(false);
+  });
+});
+
+describe("discord mention gating", () => {
+  it("requires mention by default", () => {
+    const guildInfo: DiscordGuildEntryResolved = {
+      requireMention: true,
+      channels: {
+        general: { allow: true },
+      },
+    };
+    const channelConfig = resolveDiscordChannelConfig({
+      guildInfo,
+      channelId: "1",
+      channelName: "General",
+      channelSlug: "general",
+    });
+    expect(
+      resolveDiscordShouldRequireMention({
+        isGuildMessage: true,
+        isThread: false,
+        channelConfig,
+        guildInfo,
+      }),
+    ).toBe(true);
+  });
+
+  it("does not require mention inside autoThread threads", () => {
+    const guildInfo: DiscordGuildEntryResolved = {
+      requireMention: true,
+      channels: {
+        general: { allow: true, autoThread: true },
+      },
+    };
+    const channelConfig = resolveDiscordChannelConfig({
+      guildInfo,
+      channelId: "1",
+      channelName: "General",
+      channelSlug: "general",
+    });
+    expect(
+      resolveDiscordShouldRequireMention({
+        isGuildMessage: true,
+        isThread: true,
+        channelConfig,
+        guildInfo,
+      }),
+    ).toBe(false);
   });
 });
 
@@ -272,6 +337,21 @@ describe("discord reply target selection", () => {
         hasReplied: true,
       }),
     ).toBe("123");
+  });
+});
+
+describe("discord autoThread name sanitization", () => {
+  it("strips mentions and collapses whitespace", () => {
+    const name = sanitizeDiscordThreadName(
+      "  <@123>  <@&456> <#789>  Help   here  ",
+      "msg-1",
+    );
+    expect(name).toBe("Help here");
+  });
+
+  it("falls back to thread + id when empty after cleaning", () => {
+    const name = sanitizeDiscordThreadName("   <@123>", "abc");
+    expect(name).toBe("Thread abc");
   });
 });
 

@@ -69,7 +69,6 @@ final class GatewayProcessManager {
 
     func ensureLaunchAgentEnabledIfNeeded() async {
         guard !CommandResolver.connectionModeIsRemote() else { return }
-        guard !AppStateStore.attachExistingGatewayOnly else { return }
         let enabled = await GatewayLaunchAgentManager.isLoaded()
         guard !enabled else { return }
         let bundlePath = Bundle.main.bundleURL.path
@@ -95,15 +94,6 @@ final class GatewayProcessManager {
         Task { [weak self] in
             guard let self else { return }
             if await self.attachExistingGatewayIfAvailable() {
-                return
-            }
-            // Respect debug toggle: only attach, never spawn, when enabled.
-            if AppStateStore.attachExistingGatewayOnly {
-                await MainActor.run {
-                    self.status = .failed("Attach-only enabled; no gateway to attach")
-                    self.appendLog("[gateway] attach-only enabled; not spawning local gateway\n")
-                    self.logger.warning("gateway attach-only enabled; not spawning")
-                }
                 return
             }
             await self.enableLaunchdGateway()
@@ -221,9 +211,21 @@ final class GatewayProcessManager {
     private func describe(details instance: String?, port: Int, snap: HealthSnapshot?) -> String {
         let instanceText = instance ?? "pid unknown"
         if let snap {
-            let linked = snap.web.linked ? "linked" : "not linked"
-            let authAge = snap.web.authAgeMs.flatMap(msToAge) ?? "unknown age"
-            return "port \(port), \(linked), auth \(authAge), \(instanceText)"
+            let linkId = snap.channelOrder?.first(where: {
+                if let summary = snap.channels[$0] { return summary.linked != nil }
+                return false
+            }) ?? snap.channels.keys.first(where: {
+                if let summary = snap.channels[$0] { return summary.linked != nil }
+                return false
+            })
+            let linked = linkId.flatMap { snap.channels[$0]?.linked } ?? false
+            let authAge = linkId.flatMap { snap.channels[$0]?.authAgeMs }.flatMap(msToAge) ?? "unknown age"
+            let label =
+                linkId.flatMap { snap.channelLabels?[$0] } ??
+                linkId?.capitalized ??
+                "channel"
+            let linkText = linked ? "linked" : "not linked"
+            return "port \(port), \(label) \(linkText), auth \(authAge), \(instanceText)"
         }
         return "port \(port), health probe succeeded, \(instanceText)"
     }
@@ -239,7 +241,7 @@ final class GatewayProcessManager {
         let lower = message.lowercased()
         if self.isGatewayAuthFailure(error) {
             return """
-            Gateway on port \(port) rejected auth. Set CLAWDBOT_GATEWAY_TOKEN in the app \
+            Gateway on port \(port) rejected auth. Set gateway.auth.token (or CLAWDBOT_GATEWAY_TOKEN) \
             to match the running gateway (or clear it on the gateway) and retry.
             """
         }

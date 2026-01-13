@@ -1,8 +1,13 @@
+import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 import type { Server as HttpServer } from "node:http";
 import os from "node:os";
 import chalk from "chalk";
 import { type WebSocket, WebSocketServer } from "ws";
+import {
+  resolveAgentWorkspaceDir,
+  resolveDefaultAgentId,
+} from "../agents/agent-scope.js";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../agents/defaults.js";
 import {
   loadModelCatalog,
@@ -10,11 +15,11 @@ import {
   resetModelCatalogCacheForTest,
 } from "../agents/model-catalog.js";
 import {
-  buildAllowedModelSet,
-  modelKey,
+  getModelRefStatus,
   resolveConfiguredModelRef,
   resolveHooksGmailModel,
 } from "../agents/model-selection.js";
+import { initSubagentRegistry } from "../agents/subagent-registry.js";
 import { resolveAnnounceTargetFromKey } from "../agents/tools/sessions-send-helpers.js";
 import { CANVAS_HOST_PATH } from "../canvas-host/a2ui.js";
 import {
@@ -23,6 +28,11 @@ import {
   createCanvasHostHandler,
   startCanvasHost,
 } from "../canvas-host/server.js";
+import {
+  type ChannelId,
+  listChannelPlugins,
+  normalizeChannelId,
+} from "../channels/plugins/index.js";
 import { createDefaultDeps } from "../cli/deps.js";
 import { agentCommand } from "../commands/agent.js";
 import { getHealthSnapshot, type HealthSummary } from "../commands/health.js";
@@ -41,7 +51,8 @@ import {
 } from "../config/port-defaults.js";
 import {
   loadSessionStore,
-  resolveMainSessionKey,
+  resolveAgentMainSessionKey,
+  resolveMainSessionKeyFromConfig,
   resolveStorePath,
 } from "../config/sessions.js";
 import { runCronIsolatedAgentTurn } from "../cron/isolated-agent.js";
@@ -61,7 +72,10 @@ import { startNodeBridgeServer } from "../infra/bridge/server.js";
 import { resolveCanvasHostUrl } from "../infra/canvas-host-url.js";
 import { GatewayLockError } from "../infra/gateway-lock.js";
 import { onHeartbeatEvent } from "../infra/heartbeat-events.js";
-import { startHeartbeatRunner } from "../infra/heartbeat-runner.js";
+import {
+  runHeartbeatOnce,
+  startHeartbeatRunner,
+} from "../infra/heartbeat-runner.js";
 import { requestHeartbeatNow } from "../infra/heartbeat-wake.js";
 import { getMachineDisplayName } from "../infra/machine-name.js";
 import { resolveOutboundTarget } from "../infra/outbound/targets.js";
@@ -100,8 +114,18 @@ import {
   getResolvedLoggerSettings,
   runtimeForLogger,
 } from "../logging.js";
+import { loadClawdbotPlugins } from "../plugins/loader.js";
+import {
+  type PluginServicesHandle,
+  startPluginServices,
+} from "../plugins/services.js";
 import { setCommandLaneConcurrency } from "../process/command-queue.js";
-import { defaultRuntime } from "../runtime.js";
+import { normalizeAgentId } from "../routing/session-key.js";
+import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
+import {
+  isGatewayCliClient,
+  isWebchatClient,
+} from "../utils/message-channel.js";
 import { runOnboardingWizard } from "../wizard/onboarding.js";
 import type { WizardSession } from "../wizard/session.js";
 import {
@@ -111,12 +135,16 @@ import {
   resolveGatewayAuth,
 } from "./auth.js";
 import {
+  abortChatRunById,
+  type ChatAbortControllerEntry,
+} from "./chat-abort.js";
+import {
+  type ChannelKind,
   type GatewayReloadPlan,
-  type ProviderKind,
   startGatewayConfigReloader,
 } from "./config-reload.js";
 import { normalizeControlUiBasePath } from "./control-ui.js";
-import { type HookMessageProvider, resolveHooksConfig } from "./hooks.js";
+import { type HookMessageChannel, resolveHooksConfig } from "./hooks.js";
 import {
   isLoopbackAddress,
   isLoopbackHost,
@@ -141,6 +169,7 @@ import {
   createBridgeSubscriptionManager,
 } from "./server-bridge-subscriptions.js";
 import { startBrowserControlServerIfEnabled } from "./server-browser.js";
+import { createChannelManager } from "./server-channels.js";
 import { createAgentEventHandler, createChatRunState } from "./server-chat.js";
 import {
   DEDUPE_MAX,
@@ -161,8 +190,7 @@ import {
   createGatewayHttpServer,
   createHooksRequestHandler,
 } from "./server-http.js";
-import { handleGatewayRequest } from "./server-methods.js";
-import { createProviderManager } from "./server-providers.js";
+import { coreGatewayHandlers, handleGatewayRequest } from "./server-methods.js";
 import type { DedupeEntry } from "./server-shared.js";
 import { formatError } from "./server-utils.js";
 import { loadSessionEntry } from "./session-utils.js";
@@ -175,28 +203,26 @@ const logCanvas = log.child("canvas");
 const logBridge = log.child("bridge");
 const logDiscovery = log.child("discovery");
 const logTailscale = log.child("tailscale");
-const logProviders = log.child("providers");
+const logChannels = log.child("channels");
 const logBrowser = log.child("browser");
 const logHealth = log.child("health");
 const logCron = log.child("cron");
 const logReload = log.child("reload");
 const logHooks = log.child("hooks");
 const logWsControl = log.child("ws");
-const logWhatsApp = logProviders.child("whatsapp");
-const logTelegram = logProviders.child("telegram");
-const logDiscord = logProviders.child("discord");
-const logSlack = logProviders.child("slack");
-const logSignal = logProviders.child("signal");
-const logIMessage = logProviders.child("imessage");
-const logMSTeams = logProviders.child("msteams");
 const canvasRuntime = runtimeForLogger(logCanvas);
-const whatsappRuntimeEnv = runtimeForLogger(logWhatsApp);
-const telegramRuntimeEnv = runtimeForLogger(logTelegram);
-const discordRuntimeEnv = runtimeForLogger(logDiscord);
-const slackRuntimeEnv = runtimeForLogger(logSlack);
-const signalRuntimeEnv = runtimeForLogger(logSignal);
-const imessageRuntimeEnv = runtimeForLogger(logIMessage);
-const msteamsRuntimeEnv = runtimeForLogger(logMSTeams);
+const channelLogs = Object.fromEntries(
+  listChannelPlugins().map((plugin) => [
+    plugin.id,
+    logChannels.child(plugin.id),
+  ]),
+) as Record<ChannelId, ReturnType<typeof createSubsystemLogger>>;
+const channelRuntimeEnvs = Object.fromEntries(
+  Object.entries(channelLogs).map(([id, logger]) => [
+    id,
+    runtimeForLogger(logger),
+  ]),
+) as Record<ChannelId, RuntimeEnv>;
 
 type GatewayModelChoice = ModelCatalogEntry;
 
@@ -218,10 +244,11 @@ type Client = {
   presenceKey?: string;
 };
 
-const METHODS = [
+const BASE_METHODS = [
   "health",
   "logs.tail",
-  "providers.status",
+  "channels.status",
+  "channels.logout",
   "status",
   "usage.status",
   "config.get",
@@ -270,15 +297,17 @@ const METHODS = [
   "send",
   "agent",
   "agent.wait",
-  "web.login.start",
-  "web.login.wait",
-  "web.logout",
-  "telegram.logout",
   // WebChat WebSocket-native chat methods
   "chat.history",
   "chat.abort",
   "chat.send",
 ];
+
+const CHANNEL_METHODS = listChannelPlugins().flatMap(
+  (plugin) => plugin.gatewayMethods ?? [],
+);
+
+const METHODS = Array.from(new Set([...BASE_METHODS, ...CHANNEL_METHODS]));
 
 const EVENTS = [
   "agent",
@@ -322,6 +351,11 @@ export type GatewayServerOptions = {
    */
   controlUiEnabled?: boolean;
   /**
+   * If false, do not serve `POST /v1/chat/completions`.
+   * Default: config `gateway.http.endpoints.chatCompletions.enabled` (or false when absent).
+   */
+  openAiChatCompletionsEnabled?: boolean;
+  /**
    * Override gateway auth configuration (merges with config).
    */
   auth?: import("../config/config.js").GatewayAuthConfig;
@@ -349,6 +383,18 @@ let healthCache: HealthSummary | null = null;
 let healthRefresh: Promise<HealthSummary> | null = null;
 let broadcastHealthUpdate: ((snap: HealthSummary) => void) | null = null;
 
+const CLOSE_REASON_MAX_BYTES = 120;
+
+export function truncateCloseReason(
+  reason: string,
+  maxBytes = CLOSE_REASON_MAX_BYTES,
+): string {
+  if (!reason) return "invalid handshake";
+  const buf = Buffer.from(reason);
+  if (buf.length <= maxBytes) return reason;
+  return buf.subarray(0, maxBytes).toString();
+}
+
 function buildSnapshot(): Snapshot {
   const presence = listSystemPresence();
   const uptimeMs = Math.round(process.uptime() * 1000);
@@ -365,10 +411,10 @@ function buildSnapshot(): Snapshot {
   };
 }
 
-async function refreshHealthSnapshot(_opts?: { probe?: boolean }) {
+async function refreshHealthSnapshot(opts?: { probe?: boolean }) {
   if (!healthRefresh) {
     healthRefresh = (async () => {
-      const snap = await getHealthSnapshot(undefined);
+      const snap = await getHealthSnapshot({ probe: opts?.probe });
       healthCache = snap;
       healthVersion += 1;
       if (broadcastHealthUpdate) {
@@ -415,16 +461,46 @@ export async function startGatewayServer(
   }
 
   const cfgAtStart = loadConfig();
+  initSubagentRegistry();
   await autoMigrateLegacyState({ cfg: cfgAtStart, log });
-  const bindMode = opts.bind ?? cfgAtStart.gateway?.bind ?? "loopback";
-  const bindHost = opts.host ?? resolveGatewayBindHost(bindMode);
-  if (!bindHost) {
-    throw new Error(
-      "gateway bind is tailnet, but no tailnet interface was found; refusing to start gateway",
-    );
+  const defaultAgentId = resolveDefaultAgentId(cfgAtStart);
+  const defaultWorkspaceDir = resolveAgentWorkspaceDir(
+    cfgAtStart,
+    defaultAgentId,
+  );
+  const pluginRegistry = loadClawdbotPlugins({
+    config: cfgAtStart,
+    workspaceDir: defaultWorkspaceDir,
+    logger: {
+      info: (msg) => log.info(msg),
+      warn: (msg) => log.warn(msg),
+      error: (msg) => log.error(msg),
+      debug: (msg) => log.debug(msg),
+    },
+    coreGatewayHandlers,
+  });
+  const pluginMethods = Object.keys(pluginRegistry.gatewayHandlers);
+  const gatewayMethods = Array.from(new Set([...METHODS, ...pluginMethods]));
+  if (pluginRegistry.diagnostics.length > 0) {
+    for (const diag of pluginRegistry.diagnostics) {
+      if (diag.level === "error") {
+        log.warn(`[plugins] ${diag.message}`);
+      } else {
+        log.info(`[plugins] ${diag.message}`);
+      }
+    }
   }
+  let pluginServices: PluginServicesHandle | null = null;
+  const bindMode = opts.bind ?? cfgAtStart.gateway?.bind ?? "loopback";
+  const customBindHost = cfgAtStart.gateway?.customBindHost;
+  const bindHost =
+    opts.host ?? (await resolveGatewayBindHost(bindMode, customBindHost));
   const controlUiEnabled =
     opts.controlUiEnabled ?? cfgAtStart.gateway?.controlUi?.enabled ?? true;
+  const openAiChatCompletionsEnabled =
+    opts.openAiChatCompletionsEnabled ??
+    cfgAtStart.gateway?.http?.endpoints?.chatCompletions?.enabled ??
+    false;
   const controlUiBasePath = normalizeControlUiBasePath(
     cfgAtStart.gateway?.controlUi?.basePath,
   );
@@ -489,7 +565,8 @@ export async function startGatewayServer(
     text: string;
     mode: "now" | "next-heartbeat";
   }) => {
-    enqueueSystemEvent(value.text);
+    const sessionKey = resolveMainSessionKeyFromConfig();
+    enqueueSystemEvent(value.text, { sessionKey });
     if (value.mode === "now") {
       requestHeartbeatNow({ reason: "hook:wake" });
     }
@@ -501,7 +578,7 @@ export async function startGatewayServer(
     wakeMode: "now" | "next-heartbeat";
     sessionKey: string;
     deliver: boolean;
-    provider: HookMessageProvider;
+    channel: HookMessageChannel;
     to?: string;
     model?: string;
     thinking?: string;
@@ -510,6 +587,7 @@ export async function startGatewayServer(
     const sessionKey = value.sessionKey.trim()
       ? value.sessionKey.trim()
       : `hook:${randomUUID()}`;
+    const mainSessionKey = resolveMainSessionKeyFromConfig();
     const jobId = randomUUID();
     const now = Date.now();
     const job: CronJob = {
@@ -528,7 +606,7 @@ export async function startGatewayServer(
         thinking: value.thinking,
         timeoutSeconds: value.timeoutSeconds,
         deliver: value.deliver,
-        provider: value.provider,
+        channel: value.channel,
         to: value.to,
       },
       state: { nextRunAtMs: now },
@@ -552,13 +630,17 @@ export async function startGatewayServer(
           result.status === "ok"
             ? `Hook ${value.name}`
             : `Hook ${value.name} (${result.status})`;
-        enqueueSystemEvent(`${prefix}: ${summary}`.trim());
+        enqueueSystemEvent(`${prefix}: ${summary}`.trim(), {
+          sessionKey: mainSessionKey,
+        });
         if (value.wakeMode === "now") {
           requestHeartbeatNow({ reason: `hook:${jobId}` });
         }
       } catch (err) {
         logHooks.warn(`hook agent failed: ${String(err)}`);
-        enqueueSystemEvent(`Hook ${value.name} (error): ${String(err)}`);
+        enqueueSystemEvent(`Hook ${value.name} (error): ${String(err)}`, {
+          sessionKey: mainSessionKey,
+        });
         if (value.wakeMode === "now") {
           requestHeartbeatNow({ reason: `hook:${jobId}:error` });
         }
@@ -602,7 +684,9 @@ export async function startGatewayServer(
     canvasHost,
     controlUiEnabled,
     controlUiBasePath,
+    openAiChatCompletionsEnabled,
     handleHooksRequest,
+    resolvedAuth,
   });
   let bonjourStop: (() => Promise<void>) | null = null;
   let bridge: Awaited<ReturnType<typeof startNodeBridgeServer>> | null = null;
@@ -679,10 +763,7 @@ export async function startGatewayServer(
     }
     return sessionKey;
   };
-  const chatAbortControllers = new Map<
-    string,
-    { controller: AbortController; sessionId: string; sessionKey: string }
-  >();
+  const chatAbortControllers = new Map<string, ChatAbortControllerEntry>();
   setCommandLaneConcurrency("cron", cfgAtStart.cron?.maxConcurrentRuns ?? 1);
   setCommandLaneConcurrency(
     "main",
@@ -701,20 +782,54 @@ export async function startGatewayServer(
     const storePath = resolveCronStorePath(cfg.cron?.store);
     const cronEnabled =
       process.env.CLAWDBOT_SKIP_CRON !== "1" && cfg.cron?.enabled !== false;
+    const resolveCronAgent = (requested?: string | null) => {
+      const runtimeConfig = loadConfig();
+      const normalized =
+        typeof requested === "string" && requested.trim()
+          ? normalizeAgentId(requested)
+          : undefined;
+      const hasAgent =
+        normalized !== undefined &&
+        Array.isArray(runtimeConfig.agents?.list) &&
+        runtimeConfig.agents.list.some(
+          (entry) =>
+            entry &&
+            typeof entry.id === "string" &&
+            normalizeAgentId(entry.id) === normalized,
+        );
+      const agentId = hasAgent
+        ? normalized
+        : resolveDefaultAgentId(runtimeConfig);
+      return { agentId, cfg: runtimeConfig };
+    };
     const cron = new CronService({
       storePath,
       cronEnabled,
-      enqueueSystemEvent: (text) => {
-        enqueueSystemEvent(text, { sessionKey: resolveMainSessionKey(cfg) });
+      enqueueSystemEvent: (text, opts) => {
+        const { agentId, cfg: runtimeConfig } = resolveCronAgent(opts?.agentId);
+        const sessionKey = resolveAgentMainSessionKey({
+          cfg: runtimeConfig,
+          agentId,
+        });
+        enqueueSystemEvent(text, { sessionKey });
       },
       requestHeartbeatNow,
-      runIsolatedAgentJob: async ({ job, message }) => {
+      runHeartbeatOnce: async (opts) => {
         const runtimeConfig = loadConfig();
+        return await runHeartbeatOnce({
+          cfg: runtimeConfig,
+          reason: opts?.reason,
+          deps: { ...deps, runtime: defaultRuntime },
+        });
+      },
+      runIsolatedAgentJob: async ({ job, message }) => {
+        const { agentId, cfg: runtimeConfig } = resolveCronAgent(job.agentId);
         return await runCronIsolatedAgentTurn({
           cfg: runtimeConfig,
           deps,
           job,
           message,
+          agentId,
           sessionKey: `cron:${job.id}`,
           lane: "cron",
         });
@@ -751,42 +866,18 @@ export async function startGatewayServer(
 
   let { cron, storePath: cronStorePath } = buildCronService(cfgAtStart);
 
-  const providerManager = createProviderManager({
+  const channelManager = createChannelManager({
     loadConfig,
-    logWhatsApp,
-    logTelegram,
-    logDiscord,
-    logSlack,
-    logSignal,
-    logIMessage,
-    logMSTeams,
-    whatsappRuntimeEnv,
-    telegramRuntimeEnv,
-    discordRuntimeEnv,
-    slackRuntimeEnv,
-    signalRuntimeEnv,
-    imessageRuntimeEnv,
-    msteamsRuntimeEnv,
+    channelLogs,
+    channelRuntimeEnvs,
   });
   const {
     getRuntimeSnapshot,
-    startProviders,
-    startWhatsAppProvider,
-    startTelegramProvider,
-    startDiscordProvider,
-    startSlackProvider,
-    startSignalProvider,
-    startIMessageProvider,
-    startMSTeamsProvider,
-    stopWhatsAppProvider,
-    stopTelegramProvider,
-    stopDiscordProvider,
-    stopSlackProvider,
-    stopSignalProvider,
-    stopIMessageProvider,
-    stopMSTeamsProvider,
-    markWhatsAppLoggedOut,
-  } = providerManager;
+    startChannels,
+    startChannel,
+    stopChannel,
+    markChannelLoggedOut,
+  } = channelManager;
 
   const broadcast = (
     event: string,
@@ -868,17 +959,19 @@ export async function startGatewayServer(
     }
 
     const bind =
-      cfgAtStart.bridge?.bind ?? (wideAreaDiscoveryEnabled ? "tailnet" : "lan");
+      cfgAtStart.bridge?.bind ?? (wideAreaDiscoveryEnabled ? "auto" : "lan");
     if (bind === "loopback") return "127.0.0.1";
     if (bind === "lan") return "0.0.0.0";
 
     const tailnetIPv4 = pickPrimaryTailnetIPv4();
     const tailnetIPv6 = pickPrimaryTailnetIPv6();
-    if (bind === "tailnet") {
-      return tailnetIPv4 ?? tailnetIPv6 ?? null;
-    }
     if (bind === "auto") {
       return tailnetIPv4 ?? tailnetIPv6 ?? "0.0.0.0";
+    }
+    if (bind === "custom") {
+      // For bridge, customBindHost is not currently supported on GatewayConfig.
+      // This will fall back to "0.0.0.0" until we add customBindHost to BridgeConfig.
+      return "0.0.0.0";
     }
     return "0.0.0.0";
   })();
@@ -961,6 +1054,7 @@ export async function startGatewayServer(
     addChatRun,
     removeChatRun,
     chatAbortControllers,
+    chatAbortedRuns: chatRunState.abortedRuns,
     chatRunBuffers,
     chatDeltaSentAt,
     dedupe,
@@ -1186,6 +1280,31 @@ export async function startGatewayServer(
         dedupe.delete(entries[i][0]);
       }
     }
+
+    for (const [runId, entry] of chatAbortControllers) {
+      if (now <= entry.expiresAtMs) continue;
+      abortChatRunById(
+        {
+          chatAbortControllers,
+          chatRunBuffers,
+          chatDeltaSentAt,
+          chatAbortedRuns: chatRunState.abortedRuns,
+          removeChatRun,
+          agentRunSeq,
+          broadcast,
+          bridgeSendToSession,
+        },
+        { runId, sessionKey: entry.sessionKey, stopReason: "timeout" },
+      );
+    }
+
+    const ABORTED_RUN_TTL_MS = 60 * 60_000;
+    for (const [runId, abortedAt] of chatRunState.abortedRuns) {
+      if (now - abortedAt <= ABORTED_RUN_TTL_MS) continue;
+      chatRunState.abortedRuns.delete(runId);
+      chatRunBuffers.delete(runId);
+      chatDeltaSentAt.delete(runId);
+    }
   }, 60_000);
 
   const agentUnsub = onAgentEvent(
@@ -1238,8 +1357,7 @@ export async function startGatewayServer(
     });
     logWs("in", "open", { connId, remoteAddr });
     const isWebchatConnect = (params: ConnectParams | null | undefined) =>
-      params?.client?.mode === "webchat" ||
-      params?.client?.name === "webchat-ui";
+      isWebchatClient(params?.client);
     let handshakeState: "pending" | "connected" | "failed" = "pending";
     let closeCause: string | undefined;
     let closeMeta: Record<string, unknown> = {};
@@ -1262,13 +1380,13 @@ export async function startGatewayServer(
       }
     };
 
-    const close = () => {
+    const close = (code = 1000, reason?: string) => {
       if (closed) return;
       closed = true;
       clearTimeout(handshakeTimer);
       if (client) clients.delete(client);
       try {
-        socket.close(1000);
+        socket.close(code, reason);
       } catch {
         /* ignore */
       }
@@ -1280,6 +1398,15 @@ export async function startGatewayServer(
       );
       close();
     });
+    const isNoisySwiftPmHelperClose = (
+      userAgent: string | undefined,
+      remote: string | undefined,
+    ) =>
+      Boolean(
+        userAgent?.toLowerCase().includes("swiftpm-testing-helper") &&
+          isLoopbackAddress(remote),
+      );
+
     socket.once("close", (code, reason) => {
       const durationMs = Date.now() - openedAt;
       const closeContext = {
@@ -1296,8 +1423,11 @@ export async function startGatewayServer(
         ...closeMeta,
       };
       if (!client) {
-        logWsControl.warn(
-          `closed before connect conn=${connId} remote=${remoteAddr ?? "?"} code=${code ?? "n/a"} reason=${reason?.toString() || "n/a"}`,
+        const logFn = isNoisySwiftPmHelperClose(requestUserAgent, remoteAddr)
+          ? logWsControl.debug
+          : logWsControl.warn;
+        logFn(
+          `closed before connect conn=${connId} remote=${remoteAddr ?? "?"} fwd=${forwardedFor ?? "n/a"} origin=${requestOrigin ?? "n/a"} host=${requestHost ?? "n/a"} ua=${requestUserAgent ?? "n/a"} code=${code ?? "n/a"} reason=${reason?.toString() || "n/a"}`,
           closeContext,
         );
       }
@@ -1379,48 +1509,52 @@ export async function startGatewayServer(
         if (!client) {
           // Handshake must be a normal request:
           // { type:"req", method:"connect", params: ConnectParams }.
+          const isRequestFrame = validateRequestFrame(parsed);
           if (
-            !validateRequestFrame(parsed) ||
+            !isRequestFrame ||
             (parsed as RequestFrame).method !== "connect" ||
             !validateConnectParams((parsed as RequestFrame).params)
           ) {
-            if (validateRequestFrame(parsed)) {
-              const req = parsed as RequestFrame;
-              send({
-                type: "res",
-                id: req.id,
-                ok: false,
-                error: errorShape(
-                  ErrorCodes.INVALID_REQUEST,
-                  req.method === "connect"
-                    ? `invalid connect params: ${formatValidationErrors(validateConnectParams.errors)}`
-                    : "invalid handshake: first request must be connect",
-                ),
-              });
-            } else {
-              logWsControl.warn(
-                `invalid handshake conn=${connId} remote=${remoteAddr ?? "?"}`,
-              );
-            }
-            handshakeState = "failed";
-            const handshakeError = validateRequestFrame(parsed)
+            const handshakeError = isRequestFrame
               ? (parsed as RequestFrame).method === "connect"
                 ? `invalid connect params: ${formatValidationErrors(validateConnectParams.errors)}`
                 : "invalid handshake: first request must be connect"
               : "invalid request frame";
+            handshakeState = "failed";
             setCloseCause("invalid-handshake", {
               frameType,
               frameMethod,
               frameId,
               handshakeError,
             });
-            socket.close(1008, "invalid handshake");
-            close();
+            if (isRequestFrame) {
+              const req = parsed as RequestFrame;
+              send({
+                type: "res",
+                id: req.id,
+                ok: false,
+                error: errorShape(ErrorCodes.INVALID_REQUEST, handshakeError),
+              });
+            } else {
+              logWsControl.warn(
+                `invalid handshake conn=${connId} remote=${remoteAddr ?? "?"} fwd=${forwardedFor ?? "n/a"} origin=${requestOrigin ?? "n/a"} host=${requestHost ?? "n/a"} ua=${requestUserAgent ?? "n/a"}`,
+              );
+            }
+            const closeReason = truncateCloseReason(
+              handshakeError || "invalid handshake",
+            );
+            if (isRequestFrame) {
+              queueMicrotask(() => close(1008, closeReason));
+            } else {
+              close(1008, closeReason);
+            }
             return;
           }
 
           const frame = parsed as RequestFrame;
           const connectParams = frame.params as ConnectParams;
+          const clientLabel =
+            connectParams.client.displayName ?? connectParams.client.id;
 
           // protocol negotiation
           const { minProtocol, maxProtocol } = connectParams;
@@ -1430,13 +1564,14 @@ export async function startGatewayServer(
           ) {
             handshakeState = "failed";
             logWsControl.warn(
-              `protocol mismatch conn=${connId} remote=${remoteAddr ?? "?"} client=${connectParams.client.name} ${connectParams.client.mode} v${connectParams.client.version}`,
+              `protocol mismatch conn=${connId} remote=${remoteAddr ?? "?"} client=${clientLabel} ${connectParams.client.mode} v${connectParams.client.version}`,
             );
             setCloseCause("protocol-mismatch", {
               minProtocol,
               maxProtocol,
               expectedProtocol: PROTOCOL_VERSION,
-              client: connectParams.client.name,
+              client: connectParams.client.id,
+              clientDisplayName: connectParams.client.displayName,
               mode: connectParams.client.mode,
               version: connectParams.client.version,
             });
@@ -1452,8 +1587,7 @@ export async function startGatewayServer(
                 },
               ),
             });
-            socket.close(1002, "protocol mismatch");
-            close();
+            close(1002, "protocol mismatch");
             return;
           }
 
@@ -1465,7 +1599,7 @@ export async function startGatewayServer(
           if (!authResult.ok) {
             handshakeState = "failed";
             logWsControl.warn(
-              `unauthorized conn=${connId} remote=${remoteAddr ?? "?"} client=${connectParams.client.name} ${connectParams.client.mode} v${connectParams.client.version}`,
+              `unauthorized conn=${connId} remote=${remoteAddr ?? "?"} client=${clientLabel} ${connectParams.client.mode} v${connectParams.client.version}`,
             );
             const authProvided = connectParams.auth?.token
               ? "token"
@@ -1477,7 +1611,8 @@ export async function startGatewayServer(
               authProvided,
               authReason: authResult.reason,
               allowTailscale: resolvedAuth.allowTailscale,
-              client: connectParams.client.name,
+              client: connectParams.client.id,
+              clientDisplayName: connectParams.client.displayName,
               mode: connectParams.client.mode,
               version: connectParams.client.version,
             });
@@ -1487,43 +1622,48 @@ export async function startGatewayServer(
               ok: false,
               error: errorShape(ErrorCodes.INVALID_REQUEST, "unauthorized"),
             });
-            socket.close(1008, "unauthorized");
-            close();
+            close(1008, "unauthorized");
             return;
           }
           const authMethod = authResult.method ?? "none";
 
-          const shouldTrackPresence = connectParams.client.mode !== "cli";
+          const shouldTrackPresence = !isGatewayCliClient(connectParams.client);
+          const clientId = connectParams.client.id;
+          const instanceId = connectParams.client.instanceId;
           const presenceKey = shouldTrackPresence
-            ? connectParams.client.instanceId || connId
+            ? (instanceId ?? connId)
             : undefined;
 
           logWs("in", "connect", {
             connId,
-            client: connectParams.client.name,
+            client: connectParams.client.id,
+            clientDisplayName: connectParams.client.displayName,
             version: connectParams.client.version,
             mode: connectParams.client.mode,
-            instanceId: connectParams.client.instanceId,
+            clientId,
             platform: connectParams.client.platform,
             auth: authMethod,
           });
 
           if (isWebchatConnect(connectParams)) {
             logWsControl.info(
-              `webchat connected conn=${connId} remote=${remoteAddr ?? "?"} client=${connectParams.client.name} ${connectParams.client.mode} v${connectParams.client.version}`,
+              `webchat connected conn=${connId} remote=${remoteAddr ?? "?"} client=${clientLabel} ${connectParams.client.mode} v${connectParams.client.version}`,
             );
           }
 
           if (presenceKey) {
             upsertPresence(presenceKey, {
-              host: connectParams.client.name || os.hostname(),
+              host:
+                connectParams.client.displayName ??
+                connectParams.client.id ??
+                os.hostname(),
               ip: isLoopbackAddress(remoteAddr) ? undefined : remoteAddr,
               version: connectParams.client.version,
               platform: connectParams.client.platform,
               deviceFamily: connectParams.client.deviceFamily,
               modelIdentifier: connectParams.client.modelIdentifier,
               mode: connectParams.client.mode,
-              instanceId: connectParams.client.instanceId,
+              instanceId,
               reason: "connect",
             });
             presenceVersion += 1;
@@ -1546,7 +1686,7 @@ export async function startGatewayServer(
               host: os.hostname(),
               connId,
             },
-            features: { methods: METHODS, events: EVENTS },
+            features: { methods: gatewayMethods, events: EVENTS },
             snapshot,
             canvasHostUrl,
             policy: {
@@ -1562,7 +1702,7 @@ export async function startGatewayServer(
 
           logWs("out", "hello-ok", {
             connId,
-            methods: METHODS.length,
+            methods: gatewayMethods.length,
             events: EVENTS.length,
             presence: snapshot.presence.length,
             stateVersion: snapshot.stateVersion.presence,
@@ -1622,6 +1762,7 @@ export async function startGatewayServer(
             respond,
             client,
             isWebchatConnect,
+            extraHandlers: pluginRegistry.gatewayHandlers,
             context: {
               deps,
               cron,
@@ -1630,6 +1771,7 @@ export async function startGatewayServer(
               getHealthCache: () => healthCache,
               refreshHealthSnapshot,
               logHealth,
+              logGateway: log,
               incrementPresenceVersion: () => {
                 presenceVersion += 1;
                 return presenceVersion;
@@ -1641,6 +1783,7 @@ export async function startGatewayServer(
               hasConnectedMobileNode,
               agentRunSeq,
               chatAbortControllers,
+              chatAbortedRuns: chatRunState.abortedRuns,
               chatRunBuffers,
               chatDeltaSentAt,
               addChatRun,
@@ -1650,19 +1793,9 @@ export async function startGatewayServer(
               findRunningWizard,
               purgeWizardSession,
               getRuntimeSnapshot,
-              startWhatsAppProvider,
-              stopWhatsAppProvider,
-              startTelegramProvider,
-              stopTelegramProvider,
-              startDiscordProvider,
-              stopDiscordProvider,
-              startSlackProvider,
-              stopSlackProvider,
-              startSignalProvider,
-              stopSignalProvider,
-              startIMessageProvider,
-              stopIMessageProvider,
-              markWhatsAppLoggedOut,
+              startChannel,
+              stopChannel,
+              markChannelLoggedOut,
               wizardRunner,
               broadcastVoiceWakeChanged,
             },
@@ -1782,37 +1915,51 @@ export async function startGatewayServer(
           defaultModel: DEFAULT_MODEL,
         });
       const catalog = await loadModelCatalog({ config: cfgAtStart });
-      const key = modelKey(hooksModelRef.provider, hooksModelRef.model);
-      const allowed = buildAllowedModelSet({
+      const status = getModelRefStatus({
         cfg: cfgAtStart,
         catalog,
+        ref: hooksModelRef,
         defaultProvider,
         defaultModel,
       });
-      if (!allowed.allowAny && !allowed.allowedKeys.has(key)) {
+      if (!status.allowed) {
         logHooks.warn(
-          `hooks.gmail.model "${key}" not in agents.defaults.models allowlist (will use primary instead)`,
+          `hooks.gmail.model "${status.key}" not in agents.defaults.models allowlist (will use primary instead)`,
         );
       }
-      const inCatalog = catalog.some((e) => modelKey(e.provider, e.id) === key);
-      if (!inCatalog) {
+      if (!status.inCatalog) {
         logHooks.warn(
-          `hooks.gmail.model "${key}" not in the model catalog (may fail at runtime)`,
+          `hooks.gmail.model "${status.key}" not in the model catalog (may fail at runtime)`,
         );
       }
     }
   }
 
-  // Launch configured providers (WhatsApp Web, Discord, Slack, Telegram) so gateway replies via the
-  // surface the message came from. Tests can opt out via CLAWDBOT_SKIP_PROVIDERS.
-  if (process.env.CLAWDBOT_SKIP_PROVIDERS !== "1") {
+  // Launch configured channels so gateway replies via the surface the message came from.
+  // Tests can opt out via CLAWDBOT_SKIP_CHANNELS (or legacy CLAWDBOT_SKIP_PROVIDERS).
+  const skipChannels =
+    process.env.CLAWDBOT_SKIP_CHANNELS === "1" ||
+    process.env.CLAWDBOT_SKIP_PROVIDERS === "1";
+  if (!skipChannels) {
     try {
-      await startProviders();
+      await startChannels();
     } catch (err) {
-      logProviders.error(`provider startup failed: ${String(err)}`);
+      logChannels.error(`channel startup failed: ${String(err)}`);
     }
   } else {
-    logProviders.info("skipping provider start (CLAWDBOT_SKIP_PROVIDERS=1)");
+    logChannels.info(
+      "skipping channel start (CLAWDBOT_SKIP_CHANNELS=1 or CLAWDBOT_SKIP_PROVIDERS=1)",
+    );
+  }
+
+  try {
+    pluginServices = await startPluginServices({
+      registry: pluginRegistry,
+      config: cfgAtStart,
+      workspaceDir: defaultWorkspaceDir,
+    });
+  } catch (err) {
+    log.warn(`plugin services failed to start: ${String(err)}`);
   }
 
   const scheduleRestartSentinelWake = async () => {
@@ -1824,38 +1971,32 @@ export async function startGatewayServer(
     const summary = summarizeRestartSentinel(payload);
 
     if (!sessionKey) {
-      enqueueSystemEvent(message);
+      const mainSessionKey = resolveMainSessionKeyFromConfig();
+      enqueueSystemEvent(message, { sessionKey: mainSessionKey });
       return;
     }
 
     const { cfg, entry } = loadSessionEntry(sessionKey);
-    const lastProvider =
-      entry?.lastProvider && entry.lastProvider !== "webchat"
-        ? entry.lastProvider
-        : undefined;
+    const lastChannel = entry?.lastChannel;
     const lastTo = entry?.lastTo?.trim();
     const parsedTarget = resolveAnnounceTargetFromKey(sessionKey);
-    const provider = lastProvider ?? parsedTarget?.provider;
+    const channelRaw = lastChannel ?? parsedTarget?.channel;
+    const channel = channelRaw ? normalizeChannelId(channelRaw) : null;
     const to = lastTo || parsedTarget?.to;
-    if (!provider || !to) {
-      enqueueSystemEvent(message);
+    if (!channel || !to) {
+      enqueueSystemEvent(message, { sessionKey });
       return;
     }
 
     const resolved = resolveOutboundTarget({
-      provider: provider as
-        | "whatsapp"
-        | "telegram"
-        | "discord"
-        | "slack"
-        | "signal"
-        | "imessage"
-        | "webchat",
+      channel,
       to,
-      allowFrom: cfg.whatsapp?.allowFrom ?? [],
+      cfg,
+      accountId: parsedTarget?.accountId ?? entry?.lastAccountId,
+      mode: "implicit",
     });
     if (!resolved.ok) {
-      enqueueSystemEvent(message);
+      enqueueSystemEvent(message, { sessionKey });
       return;
     }
 
@@ -1865,16 +2006,16 @@ export async function startGatewayServer(
           message,
           sessionKey,
           to: resolved.to,
-          provider,
+          channel,
           deliver: true,
           bestEffortDeliver: true,
-          messageProvider: provider,
+          messageChannel: channel,
         },
         defaultRuntime,
         deps,
       );
     } catch (err) {
-      enqueueSystemEvent(`${summary}\n${String(err)}`);
+      enqueueSystemEvent(`${summary}\n${String(err)}`, { sessionKey });
     }
   };
 
@@ -1948,65 +2089,22 @@ export async function startGatewayServer(
       }
     }
 
-    if (plan.restartProviders.size > 0) {
-      if (process.env.CLAWDBOT_SKIP_PROVIDERS === "1") {
-        logProviders.info(
-          "skipping provider reload (CLAWDBOT_SKIP_PROVIDERS=1)",
+    if (plan.restartChannels.size > 0) {
+      if (
+        process.env.CLAWDBOT_SKIP_CHANNELS === "1" ||
+        process.env.CLAWDBOT_SKIP_PROVIDERS === "1"
+      ) {
+        logChannels.info(
+          "skipping channel reload (CLAWDBOT_SKIP_CHANNELS=1 or CLAWDBOT_SKIP_PROVIDERS=1)",
         );
       } else {
-        const restartProvider = async (
-          name: ProviderKind,
-          stop: () => Promise<void>,
-          start: () => Promise<void>,
-        ) => {
-          logProviders.info(`restarting ${name} provider`);
-          await stop();
-          await start();
+        const restartChannel = async (name: ChannelKind) => {
+          logChannels.info(`restarting ${name} channel`);
+          await stopChannel(name);
+          await startChannel(name);
         };
-        if (plan.restartProviders.has("whatsapp")) {
-          await restartProvider(
-            "whatsapp",
-            stopWhatsAppProvider,
-            startWhatsAppProvider,
-          );
-        }
-        if (plan.restartProviders.has("telegram")) {
-          await restartProvider(
-            "telegram",
-            stopTelegramProvider,
-            startTelegramProvider,
-          );
-        }
-        if (plan.restartProviders.has("discord")) {
-          await restartProvider(
-            "discord",
-            stopDiscordProvider,
-            startDiscordProvider,
-          );
-        }
-        if (plan.restartProviders.has("slack")) {
-          await restartProvider("slack", stopSlackProvider, startSlackProvider);
-        }
-        if (plan.restartProviders.has("signal")) {
-          await restartProvider(
-            "signal",
-            stopSignalProvider,
-            startSignalProvider,
-          );
-        }
-        if (plan.restartProviders.has("imessage")) {
-          await restartProvider(
-            "imessage",
-            stopIMessageProvider,
-            startIMessageProvider,
-          );
-        }
-        if (plan.restartProviders.has("msteams")) {
-          await restartProvider(
-            "msteams",
-            stopMSTeamsProvider,
-            startMSTeamsProvider,
-          );
+        for (const channel of plan.restartChannels) {
+          await restartChannel(channel);
         }
       }
     }
@@ -2101,13 +2199,12 @@ export async function startGatewayServer(
           /* ignore */
         }
       }
-      await stopWhatsAppProvider();
-      await stopTelegramProvider();
-      await stopDiscordProvider();
-      await stopSlackProvider();
-      await stopSignalProvider();
-      await stopIMessageProvider();
-      await stopMSTeamsProvider();
+      for (const plugin of listChannelPlugins()) {
+        await stopChannel(plugin.id);
+      }
+      if (pluginServices) {
+        await pluginServices.stop().catch(() => {});
+      }
       await stopGmailWatcher();
       cron.stop();
       heartbeatRunner.stop();

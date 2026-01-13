@@ -3,11 +3,21 @@ import { randomUUID } from "node:crypto";
 import { resolveThinkingDefault } from "../../agents/model-selection.js";
 import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
 import { agentCommand } from "../../commands/agent.js";
-import { type SessionEntry, saveSessionStore } from "../../config/sessions.js";
+import { mergeSessionEntry, saveSessionStore } from "../../config/sessions.js";
 import { registerAgentRunContext } from "../../infra/agent-events.js";
 import { defaultRuntime } from "../../runtime.js";
 import { resolveSendPolicy } from "../../sessions/send-policy.js";
-import { buildMessageWithAttachments } from "../chat-attachments.js";
+import { INTERNAL_MESSAGE_CHANNEL } from "../../utils/message-channel.js";
+import {
+  abortChatRunById,
+  abortChatRunsForSessionKey,
+  isChatStopCommandText,
+  resolveChatRunExpiresAtMs,
+} from "../chat-abort.js";
+import {
+  type ChatImageContent,
+  parseMessageWithAttachments,
+} from "../chat-attachments.js";
 import {
   ErrorCodes,
   errorShape,
@@ -96,11 +106,32 @@ export const chatHandlers: GatewayRequestHandlers = {
     }
     const { sessionKey, runId } = params as {
       sessionKey: string;
-      runId: string;
+      runId?: string;
     };
+
+    const ops = {
+      chatAbortControllers: context.chatAbortControllers,
+      chatRunBuffers: context.chatRunBuffers,
+      chatDeltaSentAt: context.chatDeltaSentAt,
+      chatAbortedRuns: context.chatAbortedRuns,
+      removeChatRun: context.removeChatRun,
+      agentRunSeq: context.agentRunSeq,
+      broadcast: context.broadcast,
+      bridgeSendToSession: context.bridgeSendToSession,
+    };
+
+    if (!runId) {
+      const res = abortChatRunsForSessionKey(ops, {
+        sessionKey,
+        stopReason: "rpc",
+      });
+      respond(true, { ok: true, aborted: res.aborted, runIds: res.runIds });
+      return;
+    }
+
     const active = context.chatAbortControllers.get(runId);
     if (!active) {
-      respond(true, { ok: true, aborted: false });
+      respond(true, { ok: true, aborted: false, runIds: [] });
       return;
     }
     if (active.sessionKey !== sessionKey) {
@@ -115,21 +146,16 @@ export const chatHandlers: GatewayRequestHandlers = {
       return;
     }
 
-    active.controller.abort();
-    context.chatAbortControllers.delete(runId);
-    context.chatRunBuffers.delete(runId);
-    context.chatDeltaSentAt.delete(runId);
-    context.removeChatRun(runId, runId, sessionKey);
-
-    const payload = {
+    const res = abortChatRunById(ops, {
       runId,
       sessionKey,
-      seq: (context.agentRunSeq.get(runId) ?? 0) + 1,
-      state: "aborted" as const,
-    };
-    context.broadcast("chat", payload);
-    context.bridgeSendToSession(sessionKey, "chat", payload);
-    respond(true, { ok: true, aborted: true });
+      stopReason: "rpc",
+    });
+    respond(true, {
+      ok: true,
+      aborted: res.aborted,
+      runIds: res.aborted ? [runId] : [],
+    });
   },
   "chat.send": async ({ params, respond, context }) => {
     if (!validateChatSendParams(params)) {
@@ -157,30 +183,36 @@ export const chatHandlers: GatewayRequestHandlers = {
       timeoutMs?: number;
       idempotencyKey: string;
     };
+    const stopCommand = isChatStopCommandText(p.message);
     const normalizedAttachments =
-      p.attachments?.map((a) => ({
-        type: typeof a?.type === "string" ? a.type : undefined,
-        mimeType: typeof a?.mimeType === "string" ? a.mimeType : undefined,
-        fileName: typeof a?.fileName === "string" ? a.fileName : undefined,
-        content:
-          typeof a?.content === "string"
-            ? a.content
-            : ArrayBuffer.isView(a?.content)
-              ? Buffer.from(
-                  a.content.buffer,
-                  a.content.byteOffset,
-                  a.content.byteLength,
-                ).toString("base64")
-              : undefined,
-      })) ?? [];
-    let messageWithAttachments = p.message;
+      p.attachments
+        ?.map((a) => ({
+          type: typeof a?.type === "string" ? a.type : undefined,
+          mimeType: typeof a?.mimeType === "string" ? a.mimeType : undefined,
+          fileName: typeof a?.fileName === "string" ? a.fileName : undefined,
+          content:
+            typeof a?.content === "string"
+              ? a.content
+              : ArrayBuffer.isView(a?.content)
+                ? Buffer.from(
+                    a.content.buffer,
+                    a.content.byteOffset,
+                    a.content.byteLength,
+                  ).toString("base64")
+                : undefined,
+        }))
+        .filter((a) => a.content) ?? [];
+    let parsedMessage = p.message;
+    let parsedImages: ChatImageContent[] = [];
     if (normalizedAttachments.length > 0) {
       try {
-        messageWithAttachments = buildMessageWithAttachments(
+        const parsed = await parseMessageWithAttachments(
           p.message,
           normalizedAttachments,
-          { maxBytes: 5_000_000 },
+          { maxBytes: 5_000_000, log: context.logGateway },
         );
+        parsedMessage = parsed.message;
+        parsedImages = parsed.images;
       } catch (err) {
         respond(
           false,
@@ -190,24 +222,19 @@ export const chatHandlers: GatewayRequestHandlers = {
         return;
       }
     }
-    const { cfg, storePath, store, entry } = loadSessionEntry(p.sessionKey);
+    const { cfg, storePath, store, entry, canonicalKey } = loadSessionEntry(
+      p.sessionKey,
+    );
     const timeoutMs = resolveAgentTimeoutMs({
       cfg,
       overrideMs: p.timeoutMs,
     });
     const now = Date.now();
     const sessionId = entry?.sessionId ?? randomUUID();
-    const sessionEntry: SessionEntry = {
+    const sessionEntry = mergeSessionEntry(entry, {
       sessionId,
       updatedAt: now,
-      thinkingLevel: entry?.thinkingLevel,
-      verboseLevel: entry?.verboseLevel,
-      reasoningLevel: entry?.reasoningLevel,
-      systemSent: entry?.systemSent,
-      sendPolicy: entry?.sendPolicy,
-      lastProvider: entry?.lastProvider,
-      lastTo: entry?.lastTo,
-    };
+    });
     const clientRunId = p.idempotencyKey;
     registerAgentRunContext(clientRunId, { sessionKey: p.sessionKey });
 
@@ -215,7 +242,7 @@ export const chatHandlers: GatewayRequestHandlers = {
       cfg,
       entry,
       sessionKey: p.sessionKey,
-      provider: entry?.provider,
+      channel: entry?.channel,
       chatType: entry?.chatType,
     });
     if (sendPolicy === "deny") {
@@ -230,11 +257,40 @@ export const chatHandlers: GatewayRequestHandlers = {
       return;
     }
 
+    if (stopCommand) {
+      const res = abortChatRunsForSessionKey(
+        {
+          chatAbortControllers: context.chatAbortControllers,
+          chatRunBuffers: context.chatRunBuffers,
+          chatDeltaSentAt: context.chatDeltaSentAt,
+          chatAbortedRuns: context.chatAbortedRuns,
+          removeChatRun: context.removeChatRun,
+          agentRunSeq: context.agentRunSeq,
+          broadcast: context.broadcast,
+          bridgeSendToSession: context.bridgeSendToSession,
+        },
+        { sessionKey: p.sessionKey, stopReason: "stop" },
+      );
+      respond(true, { ok: true, aborted: res.aborted, runIds: res.runIds });
+      return;
+    }
+
     const cached = context.dedupe.get(`chat:${clientRunId}`);
     if (cached) {
       respond(cached.ok, cached.payload, cached.error, {
         cached: true,
       });
+      return;
+    }
+
+    const activeExisting = context.chatAbortControllers.get(clientRunId);
+    if (activeExisting) {
+      respond(
+        true,
+        { runId: clientRunId, status: "in_flight" as const },
+        undefined,
+        { cached: true, runId: clientRunId },
+      );
       return;
     }
 
@@ -244,6 +300,8 @@ export const chatHandlers: GatewayRequestHandlers = {
         controller: abortController,
         sessionId,
         sessionKey: p.sessionKey,
+        startedAtMs: now,
+        expiresAtMs: resolveChatRunExpiresAtMs({ now, timeoutMs }),
       });
       context.addChatRun(clientRunId, {
         sessionKey: p.sessionKey,
@@ -251,37 +309,57 @@ export const chatHandlers: GatewayRequestHandlers = {
       });
 
       if (store) {
-        store[p.sessionKey] = sessionEntry;
+        store[canonicalKey] = sessionEntry;
         if (storePath) {
           await saveSessionStore(storePath, store);
         }
       }
 
-      await agentCommand(
+      const ackPayload = {
+        runId: clientRunId,
+        status: "started" as const,
+      };
+      respond(true, ackPayload, undefined, { runId: clientRunId });
+
+      void agentCommand(
         {
-          message: messageWithAttachments,
+          message: parsedMessage,
+          images: parsedImages.length > 0 ? parsedImages : undefined,
           sessionId,
           sessionKey: p.sessionKey,
           runId: clientRunId,
           thinking: p.thinking,
           deliver: p.deliver,
           timeout: Math.ceil(timeoutMs / 1000).toString(),
-          messageProvider: "webchat",
+          messageChannel: INTERNAL_MESSAGE_CHANNEL,
           abortSignal: abortController.signal,
         },
         defaultRuntime,
         context.deps,
-      );
-      const payload = {
-        runId: clientRunId,
-        status: "ok" as const,
-      };
-      context.dedupe.set(`chat:${clientRunId}`, {
-        ts: Date.now(),
-        ok: true,
-        payload,
-      });
-      respond(true, payload, undefined, { runId: clientRunId });
+      )
+        .then(() => {
+          context.dedupe.set(`chat:${clientRunId}`, {
+            ts: Date.now(),
+            ok: true,
+            payload: { runId: clientRunId, status: "ok" as const },
+          });
+        })
+        .catch((err) => {
+          const error = errorShape(ErrorCodes.UNAVAILABLE, String(err));
+          context.dedupe.set(`chat:${clientRunId}`, {
+            ts: Date.now(),
+            ok: false,
+            payload: {
+              runId: clientRunId,
+              status: "error" as const,
+              summary: String(err),
+            },
+            error,
+          });
+        })
+        .finally(() => {
+          context.chatAbortControllers.delete(clientRunId);
+        });
     } catch (err) {
       const error = errorShape(ErrorCodes.UNAVAILABLE, String(err));
       const payload = {
@@ -299,8 +377,6 @@ export const chatHandlers: GatewayRequestHandlers = {
         runId: clientRunId,
         error: formatForLog(err),
       });
-    } finally {
-      context.chatAbortControllers.delete(clientRunId);
     }
   },
 };

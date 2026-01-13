@@ -6,26 +6,33 @@ import {
   createWriteTool,
   readTool,
 } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
 import type { ClawdbotConfig } from "../config/config.js";
 import { detectMime } from "../media/mime.js";
 import { isSubagentSessionKey } from "../routing/session-key.js";
-import { startWebLoginWithQr, waitForWebLogin } from "../web/login-qr.js";
+import { resolveGatewayMessageChannel } from "../utils/message-channel.js";
 import {
   resolveAgentConfig,
   resolveAgentIdFromSessionKey,
 } from "./agent-scope.js";
+import { createApplyPatchTool } from "./apply-patch.js";
 import {
-  type BashToolDefaults,
-  createBashTool,
+  createExecTool,
   createProcessTool,
+  type ExecToolDefaults,
   type ProcessToolDefaults,
 } from "./bash-tools.js";
+import { listChannelAgentTools } from "./channel-tools.js";
 import { createClawdbotTools } from "./clawdbot-tools.js";
+import type { ModelAuthMode } from "./model-auth.js";
 import type { SandboxContext, SandboxToolPolicy } from "./sandbox.js";
 import { assertSandboxPath } from "./sandbox-paths.js";
 import { cleanSchemaForGemini } from "./schema/clean-for-gemini.js";
 import { sanitizeToolResultImages } from "./tool-images.js";
+import {
+  expandToolGroups,
+  normalizeToolName,
+  resolveToolProfilePolicy,
+} from "./tool-policy.js";
 
 // NOTE(steipete): Upstream read now does file-magic MIME detection; we keep the wrapper
 // to normalize payloads and sanitize oversized images before they hit providers.
@@ -125,6 +132,18 @@ function extractEnumValues(schema: unknown): unknown[] | undefined {
   const record = schema as Record<string, unknown>;
   if (Array.isArray(record.enum)) return record.enum;
   if ("const" in record) return [record.const];
+  const variants = Array.isArray(record.anyOf)
+    ? record.anyOf
+    : Array.isArray(record.oneOf)
+      ? record.oneOf
+      : null;
+  if (variants) {
+    const values = variants.flatMap((variant) => {
+      const extracted = extractEnumValues(variant);
+      return extracted ?? [];
+    });
+    return values.length > 0 ? values : undefined;
+  }
   return undefined;
 }
 
@@ -277,30 +296,32 @@ function cleanToolSchemaForGemini(schema: Record<string, unknown>): unknown {
   return cleanSchemaForGemini(schema);
 }
 
-function normalizeToolNames(list?: string[]) {
-  if (!list) return [];
-  return list.map((entry) => entry.trim().toLowerCase()).filter(Boolean);
+function isOpenAIProvider(provider?: string) {
+  const normalized = provider?.trim().toLowerCase();
+  return normalized === "openai" || normalized === "openai-codex";
 }
 
-/**
- * Anthropic blocks specific lowercase tool names (bash, read, write, edit) with OAuth tokens.
- * Renaming to capitalized versions bypasses the block while maintaining compatibility
- * with regular API keys.
- */
-const OAUTH_BLOCKED_TOOL_NAMES: Record<string, string> = {
-  bash: "Bash",
-  read: "Read",
-  write: "Write",
-  edit: "Edit",
-};
-
-function renameBlockedToolsForOAuth(tools: AnyAgentTool[]): AnyAgentTool[] {
-  return tools.map((tool) => {
-    const newName = OAUTH_BLOCKED_TOOL_NAMES[tool.name];
-    if (newName) {
-      return { ...tool, name: newName };
-    }
-    return tool;
+function isApplyPatchAllowedForModel(params: {
+  modelProvider?: string;
+  modelId?: string;
+  allowModels?: string[];
+}) {
+  const allowModels = Array.isArray(params.allowModels)
+    ? params.allowModels
+    : [];
+  if (allowModels.length === 0) return true;
+  const modelId = params.modelId?.trim();
+  if (!modelId) return false;
+  const normalizedModelId = modelId.toLowerCase();
+  const provider = params.modelProvider?.trim().toLowerCase();
+  const normalizedFull =
+    provider && !normalizedModelId.includes("/")
+      ? `${provider}/${normalizedModelId}`
+      : normalizedModelId;
+  return allowModels.some((entry) => {
+    const normalized = entry.trim().toLowerCase();
+    if (!normalized) return false;
+    return normalized === normalizedModelId || normalized === normalizedFull;
   });
 }
 
@@ -321,20 +342,30 @@ function resolveSubagentToolPolicy(cfg?: ClawdbotConfig): SandboxToolPolicy {
   return { allow, deny };
 }
 
+function isToolAllowedByPolicyName(
+  name: string,
+  policy?: SandboxToolPolicy,
+): boolean {
+  if (!policy) return true;
+  const deny = new Set(expandToolGroups(policy.deny));
+  const allowRaw = expandToolGroups(policy.allow);
+  const allow = allowRaw.length > 0 ? new Set(allowRaw) : null;
+  const normalized = normalizeToolName(name);
+  if (deny.has(normalized)) return false;
+  if (allow) {
+    if (allow.has(normalized)) return true;
+    if (normalized === "apply_patch" && allow.has("exec")) return true;
+    return false;
+  }
+  return true;
+}
+
 function filterToolsByPolicy(
   tools: AnyAgentTool[],
   policy?: SandboxToolPolicy,
 ) {
   if (!policy) return tools;
-  const deny = new Set(normalizeToolNames(policy.deny));
-  const allowRaw = normalizeToolNames(policy.allow);
-  const allow = allowRaw.length > 0 ? new Set(allowRaw) : null;
-  return tools.filter((tool) => {
-    const name = tool.name.toLowerCase();
-    if (deny.has(name)) return false;
-    if (allow) return allow.has(name);
-    return true;
-  });
+  return tools.filter((tool) => isToolAllowedByPolicyName(tool.name, policy));
 }
 
 function resolveEffectiveToolPolicy(params: {
@@ -348,23 +379,22 @@ function resolveEffectiveToolPolicy(params: {
     params.config && agentId
       ? resolveAgentConfig(params.config, agentId)
       : undefined;
-  const hasAgentTools = agentConfig?.tools !== undefined;
+  const agentTools = agentConfig?.tools;
+  const hasAgentToolPolicy =
+    Array.isArray(agentTools?.allow) ||
+    Array.isArray(agentTools?.deny) ||
+    typeof agentTools?.profile === "string";
   const globalTools = params.config?.tools;
+  const profile = agentTools?.profile ?? globalTools?.profile;
   return {
     agentId,
-    policy: hasAgentTools ? agentConfig?.tools : globalTools,
+    policy: hasAgentToolPolicy ? agentTools : globalTools,
+    profile,
   };
 }
 
 function isToolAllowedByPolicy(name: string, policy?: SandboxToolPolicy) {
-  if (!policy) return true;
-  const deny = new Set(normalizeToolNames(policy.deny));
-  const allowRaw = normalizeToolNames(policy.allow);
-  const allow = allowRaw.length > 0 ? new Set(allowRaw) : null;
-  const normalized = name.trim().toLowerCase();
-  if (deny.has(normalized)) return false;
-  if (allow) return allow.has(normalized);
-  return true;
+  return isToolAllowedByPolicyName(name, policy);
 }
 
 function isToolAllowedByPolicies(
@@ -378,17 +408,115 @@ function wrapSandboxPathGuard(tool: AnyAgentTool, root: string): AnyAgentTool {
   return {
     ...tool,
     execute: async (toolCallId, args, signal, onUpdate) => {
+      const normalized = normalizeToolParams(args);
       const record =
-        args && typeof args === "object"
+        normalized ??
+        (args && typeof args === "object"
           ? (args as Record<string, unknown>)
-          : undefined;
+          : undefined);
       const filePath = record?.path;
       if (typeof filePath === "string" && filePath.trim()) {
         await assertSandboxPath({ filePath, cwd: root, root });
       }
-      return tool.execute(toolCallId, args, signal, onUpdate);
+      return tool.execute(toolCallId, normalized ?? args, signal, onUpdate);
     },
   };
+}
+
+type RequiredParamGroup = {
+  keys: readonly string[];
+  allowEmpty?: boolean;
+  label?: string;
+};
+
+const CLAUDE_PARAM_GROUPS = {
+  read: [{ keys: ["path", "file_path"], label: "path (path or file_path)" }],
+  write: [{ keys: ["path", "file_path"], label: "path (path or file_path)" }],
+  edit: [
+    { keys: ["path", "file_path"], label: "path (path or file_path)" },
+    {
+      keys: ["oldText", "old_string"],
+      label: "oldText (oldText or old_string)",
+    },
+    {
+      keys: ["newText", "new_string"],
+      label: "newText (newText or new_string)",
+    },
+  ],
+} as const;
+
+function patchToolSchemaForClaudeCompatibility(
+  tool: AnyAgentTool,
+): AnyAgentTool {
+  const schema =
+    tool.parameters && typeof tool.parameters === "object"
+      ? (tool.parameters as Record<string, unknown>)
+      : undefined;
+
+  if (!schema || !schema.properties || typeof schema.properties !== "object") {
+    return tool;
+  }
+
+  const properties = { ...(schema.properties as Record<string, unknown>) };
+  const required = Array.isArray(schema.required)
+    ? schema.required.filter((key): key is string => typeof key === "string")
+    : [];
+  let changed = false;
+
+  const aliasPairs: Array<{ original: string; alias: string }> = [
+    { original: "path", alias: "file_path" },
+    { original: "oldText", alias: "old_string" },
+    { original: "newText", alias: "new_string" },
+  ];
+
+  for (const { original, alias } of aliasPairs) {
+    if (!(original in properties)) continue;
+    if (!(alias in properties)) {
+      properties[alias] = properties[original];
+      changed = true;
+    }
+    const idx = required.indexOf(original);
+    if (idx !== -1) {
+      required.splice(idx, 1);
+      changed = true;
+    }
+  }
+
+  if (!changed) return tool;
+
+  return {
+    ...tool,
+    parameters: {
+      ...schema,
+      properties,
+      ...(required.length > 0 ? { required } : {}),
+    },
+  };
+}
+
+function assertRequiredParams(
+  record: Record<string, unknown> | undefined,
+  groups: readonly RequiredParamGroup[],
+  toolName: string,
+): void {
+  if (!record || typeof record !== "object") {
+    throw new Error(`Missing parameters for ${toolName}`);
+  }
+
+  for (const group of groups) {
+    const satisfied = group.keys.some((key) => {
+      if (!(key in record)) return false;
+      const value = record[key];
+      if (typeof value !== "string") return false;
+      if (group.allowEmpty) return true;
+      return value.trim().length > 0;
+    });
+
+    if (!satisfied) {
+      const label = group.label ?? group.keys.join(" or ");
+      throw new Error(`Missing required parameter: ${label}`);
+    }
+  }
 }
 
 function createSandboxedReadTool(root: string) {
@@ -398,150 +526,245 @@ function createSandboxedReadTool(root: string) {
 
 function createSandboxedWriteTool(root: string) {
   const base = createWriteTool(root);
-  return wrapSandboxPathGuard(base as unknown as AnyAgentTool, root);
+  return wrapSandboxPathGuard(
+    wrapToolParamNormalization(base, CLAUDE_PARAM_GROUPS.write),
+    root,
+  );
 }
 
 function createSandboxedEditTool(root: string) {
   const base = createEditTool(root);
-  return wrapSandboxPathGuard(base as unknown as AnyAgentTool, root);
+  return wrapSandboxPathGuard(
+    wrapToolParamNormalization(base, CLAUDE_PARAM_GROUPS.edit),
+    root,
+  );
 }
 
-function createWhatsAppLoginTool(): AnyAgentTool {
+// Normalize tool parameters from Claude Code conventions to pi-coding-agent conventions.
+// Claude Code uses file_path/old_string/new_string while pi-coding-agent uses path/oldText/newText.
+// This prevents models trained on Claude Code from getting stuck in tool-call loops.
+function normalizeToolParams(
+  params: unknown,
+): Record<string, unknown> | undefined {
+  if (!params || typeof params !== "object") return undefined;
+  const record = params as Record<string, unknown>;
+  const normalized = { ...record };
+  // file_path → path (read, write, edit)
+  if ("file_path" in normalized && !("path" in normalized)) {
+    normalized.path = normalized.file_path;
+    delete normalized.file_path;
+  }
+  // old_string → oldText (edit)
+  if ("old_string" in normalized && !("oldText" in normalized)) {
+    normalized.oldText = normalized.old_string;
+    delete normalized.old_string;
+  }
+  // new_string → newText (edit)
+  if ("new_string" in normalized && !("newText" in normalized)) {
+    normalized.newText = normalized.new_string;
+    delete normalized.new_string;
+  }
+  return normalized;
+}
+
+// Generic wrapper to normalize parameters for any tool
+function wrapToolParamNormalization(
+  tool: AnyAgentTool,
+  requiredParamGroups?: readonly RequiredParamGroup[],
+): AnyAgentTool {
+  const patched = patchToolSchemaForClaudeCompatibility(tool);
   return {
-    label: "WhatsApp Login",
-    name: "whatsapp_login",
-    description:
-      "Generate a WhatsApp QR code for linking, or wait for the scan to complete.",
-    // NOTE: Using Type.Unsafe for action enum instead of Type.Union([Type.Literal(...)])
-    // because Claude API on Vertex AI rejects nested anyOf schemas as invalid JSON Schema.
-    parameters: Type.Object({
-      action: Type.Unsafe<"start" | "wait">({
-        type: "string",
-        enum: ["start", "wait"],
-      }),
-      timeoutMs: Type.Optional(Type.Number()),
-      force: Type.Optional(Type.Boolean()),
-    }),
-    execute: async (_toolCallId, args) => {
-      const action = (args as { action?: string })?.action ?? "start";
-      if (action === "wait") {
-        const result = await waitForWebLogin({
-          timeoutMs:
-            typeof (args as { timeoutMs?: unknown }).timeoutMs === "number"
-              ? (args as { timeoutMs?: number }).timeoutMs
-              : undefined,
-        });
-        return {
-          content: [{ type: "text", text: result.message }],
-          details: { connected: result.connected },
-        };
+    ...patched,
+    execute: async (toolCallId, params, signal, onUpdate) => {
+      const normalized = normalizeToolParams(params);
+      const record =
+        normalized ??
+        (params && typeof params === "object"
+          ? (params as Record<string, unknown>)
+          : undefined);
+      if (requiredParamGroups?.length) {
+        assertRequiredParams(record, requiredParamGroups, tool.name);
       }
-
-      const result = await startWebLoginWithQr({
-        timeoutMs:
-          typeof (args as { timeoutMs?: unknown }).timeoutMs === "number"
-            ? (args as { timeoutMs?: number }).timeoutMs
-            : undefined,
-        force:
-          typeof (args as { force?: unknown }).force === "boolean"
-            ? (args as { force?: boolean }).force
-            : false,
-      });
-
-      if (!result.qrDataUrl) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: result.message,
-            },
-          ],
-          details: { qr: false },
-        };
-      }
-
-      const text = [
-        result.message,
-        "",
-        "Open WhatsApp → Linked Devices and scan:",
-        "",
-        `![whatsapp-qr](${result.qrDataUrl})`,
-      ].join("\n");
-      return {
-        content: [{ type: "text", text }],
-        details: { qr: true },
-      };
+      return tool.execute(toolCallId, normalized ?? params, signal, onUpdate);
     },
   };
 }
-
 function createClawdbotReadTool(base: AnyAgentTool): AnyAgentTool {
+  const patched = patchToolSchemaForClaudeCompatibility(base);
   return {
-    ...base,
+    ...patched,
     execute: async (toolCallId, params, signal) => {
+      const normalized = normalizeToolParams(params);
+      const record =
+        normalized ??
+        (params && typeof params === "object"
+          ? (params as Record<string, unknown>)
+          : undefined);
+      assertRequiredParams(record, CLAUDE_PARAM_GROUPS.read, base.name);
       const result = (await base.execute(
         toolCallId,
-        params,
+        normalized ?? params,
         signal,
       )) as AgentToolResult<unknown>;
-      const record =
-        params && typeof params === "object"
-          ? (params as Record<string, unknown>)
-          : undefined;
       const filePath =
         typeof record?.path === "string" ? String(record.path) : "<unknown>";
-      const normalized = await normalizeReadImageResult(result, filePath);
-      return sanitizeToolResultImages(normalized, `read:${filePath}`);
+      const normalizedResult = await normalizeReadImageResult(result, filePath);
+      return sanitizeToolResultImages(normalizedResult, `read:${filePath}`);
     },
   };
 }
 
 export const __testing = {
   cleanToolSchemaForGemini,
+  normalizeToolParams,
+  patchToolSchemaForClaudeCompatibility,
+  wrapToolParamNormalization,
+  assertRequiredParams,
 } as const;
 
+function throwAbortError(): never {
+  const err = new Error("Aborted");
+  err.name = "AbortError";
+  throw err;
+}
+
+function combineAbortSignals(
+  a?: AbortSignal,
+  b?: AbortSignal,
+): AbortSignal | undefined {
+  if (!a && !b) return undefined;
+  if (a && !b) return a;
+  if (b && !a) return b;
+  if (a?.aborted) return a;
+  if (b?.aborted) return b;
+  if (typeof AbortSignal.any === "function") {
+    return AbortSignal.any([a as AbortSignal, b as AbortSignal]);
+  }
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  a?.addEventListener("abort", onAbort, { once: true });
+  b?.addEventListener("abort", onAbort, { once: true });
+  return controller.signal;
+}
+
+function wrapToolWithAbortSignal(
+  tool: AnyAgentTool,
+  abortSignal?: AbortSignal,
+): AnyAgentTool {
+  if (!abortSignal) return tool;
+  const execute = tool.execute;
+  if (!execute) return tool;
+  return {
+    ...tool,
+    execute: async (toolCallId, params, signal, onUpdate) => {
+      const combined = combineAbortSignals(signal, abortSignal);
+      if (combined?.aborted) throwAbortError();
+      return await execute(toolCallId, params, combined, onUpdate);
+    },
+  };
+}
+
 export function createClawdbotCodingTools(options?: {
-  bash?: BashToolDefaults & ProcessToolDefaults;
+  exec?: ExecToolDefaults & ProcessToolDefaults;
   messageProvider?: string;
   agentAccountId?: string;
   sandbox?: SandboxContext | null;
   sessionKey?: string;
   agentDir?: string;
+  workspaceDir?: string;
   config?: ClawdbotConfig;
+  abortSignal?: AbortSignal;
+  /**
+   * Provider of the currently selected model (used for provider-specific tool quirks).
+   * Example: "anthropic", "openai", "google", "openai-codex".
+   */
+  modelProvider?: string;
+  /** Model id for the current provider (used for model-specific tool gating). */
+  modelId?: string;
+  /**
+   * Auth mode for the current provider. We only need this for Anthropic OAuth
+   * tool-name blocking quirks.
+   */
+  modelAuthMode?: ModelAuthMode;
+  /** Current channel ID for auto-threading (Slack). */
+  currentChannelId?: string;
+  /** Current thread timestamp for auto-threading (Slack). */
+  currentThreadTs?: string;
+  /** Reply-to mode for Slack auto-threading. */
+  replyToMode?: "off" | "first" | "all";
+  /** Mutable ref to track if a reply was sent (for "first" mode). */
+  hasRepliedRef?: { value: boolean };
 }): AnyAgentTool[] {
-  const bashToolName = "bash";
+  const execToolName = "exec";
   const sandbox = options?.sandbox?.enabled ? options.sandbox : undefined;
-  const { agentId, policy: effectiveToolsPolicy } = resolveEffectiveToolPolicy({
+  const {
+    agentId,
+    policy: effectiveToolsPolicy,
+    profile,
+  } = resolveEffectiveToolPolicy({
     config: options?.config,
     sessionKey: options?.sessionKey,
   });
+  const profilePolicy = resolveToolProfilePolicy(profile);
   const scopeKey =
-    options?.bash?.scopeKey ?? (agentId ? `agent:${agentId}` : undefined);
+    options?.exec?.scopeKey ?? (agentId ? `agent:${agentId}` : undefined);
   const subagentPolicy =
     isSubagentSessionKey(options?.sessionKey) && options?.sessionKey
       ? resolveSubagentToolPolicy(options.config)
       : undefined;
   const allowBackground = isToolAllowedByPolicies("process", [
+    profilePolicy,
     effectiveToolsPolicy,
     sandbox?.tools,
     subagentPolicy,
   ]);
   const sandboxRoot = sandbox?.workspaceDir;
   const allowWorkspaceWrites = sandbox?.workspaceAccess !== "ro";
+  const workspaceRoot = options?.workspaceDir ?? process.cwd();
+  const applyPatchConfig = options?.config?.tools?.exec?.applyPatch;
+  const applyPatchEnabled =
+    !!applyPatchConfig?.enabled &&
+    isOpenAIProvider(options?.modelProvider) &&
+    isApplyPatchAllowedForModel({
+      modelProvider: options?.modelProvider,
+      modelId: options?.modelId,
+      allowModels: applyPatchConfig?.allowModels,
+    });
+
   const base = (codingTools as unknown as AnyAgentTool[]).flatMap((tool) => {
     if (tool.name === readTool.name) {
-      return sandboxRoot
-        ? [createSandboxedReadTool(sandboxRoot)]
-        : [createClawdbotReadTool(tool)];
+      if (sandboxRoot) {
+        return [createSandboxedReadTool(sandboxRoot)];
+      }
+      const freshReadTool = createReadTool(workspaceRoot);
+      return [createClawdbotReadTool(freshReadTool)];
     }
-    if (tool.name === bashToolName) return [];
-    if (sandboxRoot && (tool.name === "write" || tool.name === "edit")) {
-      return [];
+    if (tool.name === "bash" || tool.name === execToolName) return [];
+    if (tool.name === "write") {
+      if (sandboxRoot) return [];
+      // Wrap with param normalization for Claude Code compatibility
+      return [
+        wrapToolParamNormalization(
+          createWriteTool(workspaceRoot),
+          CLAUDE_PARAM_GROUPS.write,
+        ),
+      ];
+    }
+    if (tool.name === "edit") {
+      if (sandboxRoot) return [];
+      // Wrap with param normalization for Claude Code compatibility
+      return [
+        wrapToolParamNormalization(
+          createEditTool(workspaceRoot),
+          CLAUDE_PARAM_GROUPS.edit,
+        ),
+      ];
     }
     return [tool as AnyAgentTool];
   });
-  const bashTool = createBashTool({
-    ...options?.bash,
+  const execTool = createExecTool({
+    ...options?.exec,
+    cwd: options?.workspaceDir,
     allowBackground,
     scopeKey,
     sandbox: sandbox
@@ -553,10 +776,23 @@ export function createClawdbotCodingTools(options?: {
         }
       : undefined,
   });
+  const bashTool = {
+    ...(execTool as unknown as AnyAgentTool),
+    name: "bash",
+    label: "bash",
+  } satisfies AnyAgentTool;
   const processTool = createProcessTool({
-    cleanupMs: options?.bash?.cleanupMs,
+    cleanupMs: options?.exec?.cleanupMs,
     scopeKey,
   });
+  const applyPatchTool =
+    !applyPatchEnabled || (sandboxRoot && !allowWorkspaceWrites)
+      ? null
+      : createApplyPatchTool({
+          cwd: sandboxRoot ?? workspaceRoot,
+          sandboxRoot:
+            sandboxRoot && allowWorkspaceWrites ? sandboxRoot : undefined,
+        });
   const tools: AnyAgentTool[] = [
     ...base,
     ...(sandboxRoot
@@ -567,33 +803,55 @@ export function createClawdbotCodingTools(options?: {
           ]
         : []
       : []),
-    bashTool as unknown as AnyAgentTool,
+    ...(applyPatchTool ? [applyPatchTool as unknown as AnyAgentTool] : []),
+    execTool as unknown as AnyAgentTool,
+    bashTool,
     processTool as unknown as AnyAgentTool,
-    createWhatsAppLoginTool(),
+    // Channel docking: include channel-defined agent tools (login, etc.).
+    ...listChannelAgentTools({ cfg: options?.config }),
     ...createClawdbotTools({
       browserControlUrl: sandbox?.browser?.controlUrl,
+      allowHostBrowserControl: sandbox ? sandbox.browserAllowHostControl : true,
+      allowedControlUrls: sandbox?.browserAllowedControlUrls,
+      allowedControlHosts: sandbox?.browserAllowedControlHosts,
+      allowedControlPorts: sandbox?.browserAllowedControlPorts,
       agentSessionKey: options?.sessionKey,
-      agentProvider: options?.messageProvider,
+      agentChannel: resolveGatewayMessageChannel(options?.messageProvider),
       agentAccountId: options?.agentAccountId,
       agentDir: options?.agentDir,
+      sandboxRoot,
+      workspaceDir: options?.workspaceDir,
       sandboxed: !!sandbox,
       config: options?.config,
+      currentChannelId: options?.currentChannelId,
+      currentThreadTs: options?.currentThreadTs,
+      replyToMode: options?.replyToMode,
+      hasRepliedRef: options?.hasRepliedRef,
     }),
   ];
-  const toolsFiltered = effectiveToolsPolicy
-    ? filterToolsByPolicy(tools, effectiveToolsPolicy)
+  const toolsFiltered = profilePolicy
+    ? filterToolsByPolicy(tools, profilePolicy)
     : tools;
-  const sandboxed = sandbox
-    ? filterToolsByPolicy(toolsFiltered, sandbox.tools)
+  const policyFiltered = effectiveToolsPolicy
+    ? filterToolsByPolicy(toolsFiltered, effectiveToolsPolicy)
     : toolsFiltered;
+  const sandboxed = sandbox
+    ? filterToolsByPolicy(policyFiltered, sandbox.tools)
+    : policyFiltered;
   const subagentFiltered = subagentPolicy
     ? filterToolsByPolicy(sandboxed, subagentPolicy)
     : sandboxed;
   // Always normalize tool JSON Schemas before handing them to pi-agent/pi-ai.
   // Without this, some providers (notably OpenAI) will reject root-level union schemas.
   const normalized = subagentFiltered.map(normalizeToolParameters);
+  const withAbort = options?.abortSignal
+    ? normalized.map((tool) =>
+        wrapToolWithAbortSignal(tool, options.abortSignal),
+      )
+    : normalized;
 
-  // Anthropic blocks specific lowercase tool names (bash, read, write, edit) with OAuth tokens.
-  // Always use capitalized versions for compatibility with both OAuth and regular API keys.
-  return renameBlockedToolsForOAuth(normalized);
+  // NOTE: Keep canonical (lowercase) tool names here.
+  // pi-ai's Anthropic OAuth transport remaps tool names to Claude Code-style names
+  // on the wire and maps them back for tool dispatch.
+  return withAbort;
 }

@@ -43,9 +43,8 @@ describe("control command parsing", () => {
     expect(hasControlCommand("/commands")).toBe(true);
     expect(hasControlCommand("/commands:")).toBe(true);
     expect(hasControlCommand("commands")).toBe(false);
-    expect(hasControlCommand("/compact")).toBe(true);
-    expect(hasControlCommand("/compact:")).toBe(true);
-    expect(hasControlCommand("compact")).toBe(false);
+    expect(hasControlCommand("/status")).toBe(true);
+    expect(hasControlCommand("/status:")).toBe(true);
     expect(hasControlCommand("status")).toBe(false);
     expect(hasControlCommand("usage")).toBe(false);
 
@@ -55,6 +54,15 @@ describe("control command parsing", () => {
         expect(hasControlCommand(`${alias}:`)).toBe(true);
       }
     }
+    expect(hasControlCommand("/compact")).toBe(true);
+    expect(hasControlCommand("/compact:")).toBe(true);
+    expect(hasControlCommand("compact")).toBe(false);
+  });
+
+  it("respects disabled config/debug commands", () => {
+    const cfg = { commands: { config: false, debug: false } };
+    expect(hasControlCommand("/config show", cfg)).toBe(false);
+    expect(hasControlCommand("/debug show", cfg)).toBe(false);
   });
 
   it("requires commands to be the full message", () => {
@@ -62,5 +70,18 @@ describe("control command parsing", () => {
     expect(hasControlCommand("/status please")).toBe(false);
     expect(hasControlCommand("prefix /send on")).toBe(false);
     expect(hasControlCommand("/send on")).toBe(true);
+  });
+
+  it("ignores telegram commands addressed to other bots", () => {
+    expect(
+      hasControlCommand("/help@otherbot", undefined, {
+        botUsername: "clawdbot",
+      }),
+    ).toBe(false);
+    expect(
+      hasControlCommand("/help@clawdbot", undefined, {
+        botUsername: "clawdbot",
+      }),
+    ).toBe(true);
   });
 });

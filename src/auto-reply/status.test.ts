@@ -4,7 +4,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { normalizeTestText } from "../../test/helpers/normalize-text.js";
 import { withTempHome } from "../../test/helpers/temp-home.js";
 import type { ClawdbotConfig } from "../config/config.js";
-import { buildCommandsMessage, buildStatusMessage } from "./status.js";
+import {
+  buildCommandsMessage,
+  buildHelpMessage,
+  buildStatusMessage,
+} from "./status.js";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -58,7 +62,7 @@ describe("buildStatusMessage", () => {
     });
     const normalized = normalizeTestText(text);
 
-    expect(normalized).toContain("ClawdBot");
+    expect(normalized).toContain("Clawdbot");
     expect(normalized).toContain("Model: anthropic/pi:opus");
     expect(normalized).toContain("api-key");
     expect(normalized).toContain("Tokens: 1.2k in / 800 out");
@@ -69,8 +73,8 @@ describe("buildStatusMessage", () => {
     expect(normalized).toContain("updated 10m ago");
     expect(normalized).toContain("Runtime: direct");
     expect(normalized).toContain("Think: medium");
-    expect(normalized).toContain("Verbose: off");
-    expect(normalized).toContain("Elevated: on");
+    expect(normalized).not.toContain("verbose");
+    expect(normalized).toContain("elevated");
     expect(normalized).toContain("Queue: collect");
   });
 
@@ -86,8 +90,26 @@ describe("buildStatusMessage", () => {
       queue: { mode: "collect", depth: 0 },
     });
 
-    expect(text).toContain("Verbose: on");
-    expect(text).toContain("Elevated: on");
+    expect(text).toContain("verbose");
+    expect(text).toContain("elevated");
+  });
+
+  it("does not show elevated label when session explicitly disables it", () => {
+    const text = buildStatusMessage({
+      agent: { model: "anthropic/claude-opus-4-5", elevatedDefault: "on" },
+      sessionEntry: { sessionId: "v1", updatedAt: 0, elevatedLevel: "off" },
+      sessionKey: "agent:main:main",
+      sessionScope: "per-sender",
+      resolvedThink: "low",
+      resolvedVerbose: "off",
+      queue: { mode: "collect", depth: 0 },
+    });
+
+    const optionsLine = text
+      .split("\n")
+      .find((line) => line.trim().startsWith("⚙️"));
+    expect(optionsLine).toBeTruthy();
+    expect(optionsLine).not.toContain("elevated");
   });
 
   it("prefers model overrides over last-run model", () => {
@@ -299,7 +321,9 @@ describe("buildStatusMessage", () => {
 
 describe("buildCommandsMessage", () => {
   it("lists commands with aliases and text-only hints", () => {
-    const text = buildCommandsMessage();
+    const text = buildCommandsMessage({
+      commands: { config: false, debug: false },
+    } as ClawdbotConfig);
     expect(text).toContain("/commands - List all slash commands.");
     expect(text).toContain(
       "/think (aliases: /thinking, /t) - Set thinking level.",
@@ -307,5 +331,17 @@ describe("buildCommandsMessage", () => {
     expect(text).toContain(
       "/compact (text-only) - Compact the session context.",
     );
+    expect(text).not.toContain("/config");
+    expect(text).not.toContain("/debug");
+  });
+});
+
+describe("buildHelpMessage", () => {
+  it("hides config/debug when disabled", () => {
+    const text = buildHelpMessage({
+      commands: { config: false, debug: false },
+    } as ClawdbotConfig);
+    expect(text).not.toContain("/config");
+    expect(text).not.toContain("/debug");
   });
 });

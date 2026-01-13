@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
 
 import { callGateway } from "../../gateway/call.js";
+import { INTERNAL_MESSAGE_CHANNEL } from "../../utils/message-channel.js";
+import { AGENT_LANE_NESTED } from "../lanes.js";
 import { extractAssistantText, stripToolMessages } from "./sessions-helpers.js";
 
 export async function readLatestAssistantReply(params: {
@@ -23,6 +25,7 @@ export async function runAgentStep(params: {
   message: string;
   extraSystemPrompt: string;
   timeoutMs: number;
+  channel?: string;
   lane?: string;
 }): Promise<string | undefined> {
   const stepIdem = crypto.randomUUID();
@@ -33,7 +36,8 @@ export async function runAgentStep(params: {
       sessionKey: params.sessionKey,
       idempotencyKey: stepIdem,
       deliver: false,
-      lane: params.lane ?? "nested",
+      channel: params.channel ?? INTERNAL_MESSAGE_CHANNEL,
+      lane: params.lane ?? AGENT_LANE_NESTED,
       extraSystemPrompt: params.extraSystemPrompt,
     },
     timeoutMs: 10_000,

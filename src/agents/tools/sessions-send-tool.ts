@@ -4,12 +4,19 @@ import { Type } from "@sinclair/typebox";
 
 import { loadConfig } from "../../config/config.js";
 import { callGateway } from "../../gateway/call.js";
+import { formatErrorMessage } from "../../infra/errors.js";
+import { createSubsystemLogger } from "../../logging.js";
 import {
   isSubagentSessionKey,
   normalizeAgentId,
   parseAgentSessionKey,
 } from "../../routing/session-key.js";
 import { SESSION_LABEL_MAX_LENGTH } from "../../sessions/session-label.js";
+import {
+  type GatewayMessageChannel,
+  INTERNAL_MESSAGE_CHANNEL,
+} from "../../utils/message-channel.js";
+import { AGENT_LANE_NESTED } from "../lanes.js";
 import { readLatestAssistantReply, runAgentStep } from "./agent-step.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult, readStringParam } from "./common.js";
@@ -30,29 +37,21 @@ import {
   resolvePingPongTurns,
 } from "./sessions-send-helpers.js";
 
-const SessionsSendToolSchema = Type.Union([
-  Type.Object(
-    {
-      sessionKey: Type.String(),
-      message: Type.String(),
-      timeoutSeconds: Type.Optional(Type.Integer({ minimum: 0 })),
-    },
-    { additionalProperties: false },
+const log = createSubsystemLogger("agents/sessions-send");
+
+const SessionsSendToolSchema = Type.Object({
+  sessionKey: Type.Optional(Type.String()),
+  label: Type.Optional(
+    Type.String({ minLength: 1, maxLength: SESSION_LABEL_MAX_LENGTH }),
   ),
-  Type.Object(
-    {
-      label: Type.String({ minLength: 1, maxLength: SESSION_LABEL_MAX_LENGTH }),
-      agentId: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
-      message: Type.String(),
-      timeoutSeconds: Type.Optional(Type.Integer({ minimum: 0 })),
-    },
-    { additionalProperties: false },
-  ),
-]);
+  agentId: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+  message: Type.String(),
+  timeoutSeconds: Type.Optional(Type.Number({ minimum: 0 })),
+});
 
 export function createSessionsSendTool(opts?: {
   agentSessionKey?: string;
-  agentProvider?: string;
+  agentChannel?: GatewayMessageChannel;
   sandboxed?: boolean;
 }): AnyAgentTool {
   return {
@@ -298,7 +297,7 @@ export function createSessionsSendTool(opts?: {
 
       const agentMessageContext = buildAgentToAgentMessageContext({
         requesterSessionKey: opts?.agentSessionKey,
-        requesterProvider: opts?.agentProvider,
+        requesterChannel: opts?.agentChannel,
         targetSessionKey: displayKey,
       });
       const sendParams = {
@@ -306,17 +305,20 @@ export function createSessionsSendTool(opts?: {
         sessionKey: resolvedKey,
         idempotencyKey,
         deliver: false,
-        lane: "nested",
+        channel: INTERNAL_MESSAGE_CHANNEL,
+        lane: AGENT_LANE_NESTED,
         extraSystemPrompt: agentMessageContext,
       };
       const requesterSessionKey = opts?.agentSessionKey;
-      const requesterProvider = opts?.agentProvider;
+      const requesterChannel = opts?.agentChannel;
       const maxPingPongTurns = resolvePingPongTurns(cfg);
+      const delivery = { status: "pending", mode: "announce" as const };
 
       const runAgentToAgentFlow = async (
         roundOneReply?: string,
         runInfo?: { runId: string },
       ) => {
+        const runContextId = runInfo?.runId ?? runId;
         try {
           let primaryReply = roundOneReply;
           let latestReply = roundOneReply;
@@ -342,7 +344,7 @@ export function createSessionsSendTool(opts?: {
             sessionKey: resolvedKey,
             displayKey,
           });
-          const targetProvider = announceTarget?.provider ?? "unknown";
+          const targetChannel = announceTarget?.channel ?? "unknown";
           if (
             maxPingPongTurns > 0 &&
             requesterSessionKey &&
@@ -358,9 +360,9 @@ export function createSessionsSendTool(opts?: {
                   : "target";
               const replyPrompt = buildAgentToAgentReplyContext({
                 requesterSessionKey,
-                requesterProvider,
+                requesterChannel,
                 targetSessionKey: displayKey,
-                targetProvider,
+                targetChannel,
                 currentRole,
                 turn,
                 maxTurns: maxPingPongTurns,
@@ -370,7 +372,7 @@ export function createSessionsSendTool(opts?: {
                 message: incomingMessage,
                 extraSystemPrompt: replyPrompt,
                 timeoutMs: announceTimeoutMs,
-                lane: "nested",
+                lane: AGENT_LANE_NESTED,
               });
               if (!replyText || isReplySkip(replyText)) {
                 break;
@@ -384,9 +386,9 @@ export function createSessionsSendTool(opts?: {
           }
           const announcePrompt = buildAgentToAgentAnnounceContext({
             requesterSessionKey,
-            requesterProvider,
+            requesterChannel,
             targetSessionKey: displayKey,
-            targetProvider,
+            targetChannel,
             originalMessage: message,
             roundOneReply: primaryReply,
             latestReply,
@@ -396,7 +398,7 @@ export function createSessionsSendTool(opts?: {
             message: "Agent-to-agent announce step.",
             extraSystemPrompt: announcePrompt,
             timeoutMs: announceTimeoutMs,
-            lane: "nested",
+            lane: AGENT_LANE_NESTED,
           });
           if (
             announceTarget &&
@@ -404,20 +406,32 @@ export function createSessionsSendTool(opts?: {
             announceReply.trim() &&
             !isAnnounceSkip(announceReply)
           ) {
-            await callGateway({
-              method: "send",
-              params: {
+            try {
+              await callGateway({
+                method: "send",
+                params: {
+                  to: announceTarget.to,
+                  message: announceReply.trim(),
+                  channel: announceTarget.channel,
+                  accountId: announceTarget.accountId,
+                  idempotencyKey: crypto.randomUUID(),
+                },
+                timeoutMs: 10_000,
+              });
+            } catch (err) {
+              log.warn("sessions_send announce delivery failed", {
+                runId: runContextId,
+                channel: announceTarget.channel,
                 to: announceTarget.to,
-                message: announceReply.trim(),
-                provider: announceTarget.provider,
-                accountId: announceTarget.accountId,
-                idempotencyKey: crypto.randomUUID(),
-              },
-              timeoutMs: 10_000,
-            });
+                error: formatErrorMessage(err),
+              });
+            }
           }
-        } catch {
-          // Best-effort follow-ups; ignore failures to avoid breaking the caller response.
+        } catch (err) {
+          log.warn("sessions_send announce flow failed", {
+            runId: runContextId,
+            error: formatErrorMessage(err),
+          });
         }
       };
 
@@ -436,6 +450,7 @@ export function createSessionsSendTool(opts?: {
             runId,
             status: "accepted",
             sessionKey: displayKey,
+            delivery,
           });
         } catch (err) {
           const messageText =
@@ -539,6 +554,7 @@ export function createSessionsSendTool(opts?: {
         status: "ok",
         reply,
         sessionKey: displayKey,
+        delivery,
       });
     },
   };

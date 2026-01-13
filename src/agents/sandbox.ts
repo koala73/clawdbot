@@ -14,19 +14,26 @@ import {
   resolveProfile,
 } from "../browser/config.js";
 import { DEFAULT_CLAWD_BROWSER_COLOR } from "../browser/constants.js";
+import { CHANNEL_IDS } from "../channels/registry.js";
 import {
   type ClawdbotConfig,
   loadConfig,
   STATE_DIR_CLAWDBOT,
 } from "../config/config.js";
+import {
+  canonicalizeMainSessionAlias,
+  resolveAgentMainSessionKey,
+} from "../config/sessions.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import { defaultRuntime } from "../runtime.js";
 import { resolveUserPath } from "../utils.js";
 import {
   resolveAgentConfig,
   resolveAgentIdFromSessionKey,
+  resolveSessionAgentId,
 } from "./agent-scope.js";
 import { syncSkillsToWorkspace } from "./skills.js";
+import { expandToolGroups } from "./tool-policy.js";
 import {
   DEFAULT_AGENT_WORKSPACE_DIR,
   DEFAULT_AGENTS_FILENAME,
@@ -44,6 +51,24 @@ export type SandboxToolPolicy = {
   deny?: string[];
 };
 
+export type SandboxToolPolicySource = {
+  source: "agent" | "global" | "default";
+  /**
+   * Config key path hint for humans.
+   * (Arrays use `agents.list[].…` form.)
+   */
+  key: string;
+};
+
+export type SandboxToolPolicyResolved = {
+  allow: string[];
+  deny: string[];
+  sources: {
+    allow: SandboxToolPolicySource;
+    deny: SandboxToolPolicySource;
+  };
+};
+
 export type SandboxWorkspaceAccess = "none" | "ro" | "rw";
 
 export type SandboxBrowserConfig = {
@@ -55,6 +80,12 @@ export type SandboxBrowserConfig = {
   noVncPort: number;
   headless: boolean;
   enableNoVnc: boolean;
+  allowHostControl: boolean;
+  allowedControlUrls?: string[];
+  allowedControlHosts?: string[];
+  allowedControlPorts?: number[];
+  autoStart: boolean;
+  autoStartTimeoutMs: number;
 };
 
 export type SandboxDockerConfig = {
@@ -77,6 +108,7 @@ export type SandboxDockerConfig = {
   apparmorProfile?: string;
   dns?: string[];
   extraHosts?: string[];
+  binds?: string[];
 };
 
 export type SandboxPruneConfig = {
@@ -113,6 +145,10 @@ export type SandboxContext = {
   containerWorkdir: string;
   docker: SandboxDockerConfig;
   tools: SandboxToolPolicy;
+  browserAllowHostControl: boolean;
+  browserAllowedControlUrls?: string[];
+  browserAllowedControlHosts?: string[];
+  browserAllowedControlPorts?: number[];
   browser?: SandboxBrowserContext;
 };
 
@@ -132,23 +168,27 @@ const DEFAULT_SANDBOX_WORKDIR = "/workspace";
 const DEFAULT_SANDBOX_IDLE_HOURS = 24;
 const DEFAULT_SANDBOX_MAX_AGE_DAYS = 7;
 const DEFAULT_TOOL_ALLOW = [
-  "bash",
+  "exec",
   "process",
   "read",
   "write",
   "edit",
+  "apply_patch",
+  "image",
   "sessions_list",
   "sessions_history",
   "sessions_send",
   "sessions_spawn",
+  "session_status",
 ];
+// Provider docking: keep sandbox policy aligned with provider tool names.
 const DEFAULT_TOOL_DENY = [
   "browser",
   "canvas",
   "nodes",
   "cron",
-  "discord",
   "gateway",
+  ...CHANNEL_IDS,
 ];
 export const DEFAULT_SANDBOX_BROWSER_IMAGE =
   "clawdbot-sandbox-browser:bookworm-slim";
@@ -158,6 +198,7 @@ const DEFAULT_SANDBOX_BROWSER_PREFIX = "clawdbot-sbx-browser-";
 const DEFAULT_SANDBOX_BROWSER_CDP_PORT = 9222;
 const DEFAULT_SANDBOX_BROWSER_VNC_PORT = 5900;
 const DEFAULT_SANDBOX_BROWSER_NOVNC_PORT = 6080;
+const DEFAULT_SANDBOX_BROWSER_AUTOSTART_TIMEOUT_MS = 12_000;
 const SANDBOX_AGENT_WORKSPACE_MOUNT = "/agent";
 
 const SANDBOX_STATE_DIR = path.join(STATE_DIR_CLAWDBOT, "sandbox");
@@ -199,18 +240,10 @@ const BROWSER_BRIDGES = new Map<
   { bridge: BrowserBridge; containerName: string }
 >();
 
-function normalizeToolList(values?: string[]) {
-  if (!values) return [];
-  return values
-    .map((value) => value.trim())
-    .filter(Boolean)
-    .map((value) => value.toLowerCase());
-}
-
 function isToolAllowed(policy: SandboxToolPolicy, name: string) {
-  const deny = new Set(normalizeToolList(policy.deny));
+  const deny = new Set(expandToolGroups(policy.deny));
   if (deny.has(name.toLowerCase())) return false;
-  const allow = normalizeToolList(policy.allow);
+  const allow = expandToolGroups(policy.allow);
   if (allow.length === 0) return true;
   return allow.includes(name.toLowerCase());
 }
@@ -243,6 +276,8 @@ export function resolveSandboxDockerConfig(params: {
     ? { ...globalDocker?.ulimits, ...agentDocker.ulimits }
     : globalDocker?.ulimits;
 
+  const binds = [...(globalDocker?.binds ?? []), ...(agentDocker?.binds ?? [])];
+
   return {
     image: agentDocker?.image ?? globalDocker?.image ?? DEFAULT_SANDBOX_IMAGE,
     containerPrefix:
@@ -270,6 +305,7 @@ export function resolveSandboxDockerConfig(params: {
       agentDocker?.apparmorProfile ?? globalDocker?.apparmorProfile,
     dns: agentDocker?.dns ?? globalDocker?.dns,
     extraHosts: agentDocker?.extraHosts ?? globalDocker?.extraHosts,
+    binds: binds.length ? binds : undefined,
   };
 }
 
@@ -281,6 +317,12 @@ export function resolveSandboxBrowserConfig(params: {
   const agentBrowser =
     params.scope === "shared" ? undefined : params.agentBrowser;
   const globalBrowser = params.globalBrowser;
+  const allowedControlUrls =
+    agentBrowser?.allowedControlUrls ?? globalBrowser?.allowedControlUrls;
+  const allowedControlHosts =
+    agentBrowser?.allowedControlHosts ?? globalBrowser?.allowedControlHosts;
+  const allowedControlPorts =
+    agentBrowser?.allowedControlPorts ?? globalBrowser?.allowedControlPorts;
   return {
     enabled: agentBrowser?.enabled ?? globalBrowser?.enabled ?? false,
     image:
@@ -306,7 +348,52 @@ export function resolveSandboxBrowserConfig(params: {
     headless: agentBrowser?.headless ?? globalBrowser?.headless ?? false,
     enableNoVnc:
       agentBrowser?.enableNoVnc ?? globalBrowser?.enableNoVnc ?? true,
+    allowHostControl:
+      agentBrowser?.allowHostControl ??
+      globalBrowser?.allowHostControl ??
+      false,
+    allowedControlUrls:
+      Array.isArray(allowedControlUrls) && allowedControlUrls.length > 0
+        ? allowedControlUrls
+        : undefined,
+    allowedControlHosts:
+      Array.isArray(allowedControlHosts) && allowedControlHosts.length > 0
+        ? allowedControlHosts
+        : undefined,
+    allowedControlPorts:
+      Array.isArray(allowedControlPorts) && allowedControlPorts.length > 0
+        ? allowedControlPorts
+        : undefined,
+    autoStart: agentBrowser?.autoStart ?? globalBrowser?.autoStart ?? true,
+    autoStartTimeoutMs:
+      agentBrowser?.autoStartTimeoutMs ??
+      globalBrowser?.autoStartTimeoutMs ??
+      DEFAULT_SANDBOX_BROWSER_AUTOSTART_TIMEOUT_MS,
   };
+}
+
+async function waitForSandboxCdp(params: {
+  cdpPort: number;
+  timeoutMs: number;
+}): Promise<boolean> {
+  const deadline = Date.now() + Math.max(0, params.timeoutMs);
+  const url = `http://127.0.0.1:${params.cdpPort}/json/version`;
+  while (Date.now() < deadline) {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 1000);
+      try {
+        const res = await fetch(url, { signal: ctrl.signal });
+        if (res.ok) return true;
+      } finally {
+        clearTimeout(t);
+      }
+    } catch {
+      // ignore
+    }
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  return false;
 }
 
 export function resolveSandboxPruneConfig(params: {
@@ -344,6 +431,80 @@ function resolveSandboxAgentId(scopeKey: string): string | undefined {
   return resolveAgentIdFromSessionKey(trimmed);
 }
 
+export function resolveSandboxToolPolicyForAgent(
+  cfg?: ClawdbotConfig,
+  agentId?: string,
+): SandboxToolPolicyResolved {
+  const agentConfig =
+    cfg && agentId ? resolveAgentConfig(cfg, agentId) : undefined;
+  const agentAllow = agentConfig?.tools?.sandbox?.tools?.allow;
+  const agentDeny = agentConfig?.tools?.sandbox?.tools?.deny;
+  const globalAllow = cfg?.tools?.sandbox?.tools?.allow;
+  const globalDeny = cfg?.tools?.sandbox?.tools?.deny;
+
+  const allowSource = Array.isArray(agentAllow)
+    ? ({
+        source: "agent",
+        key: "agents.list[].tools.sandbox.tools.allow",
+      } satisfies SandboxToolPolicySource)
+    : Array.isArray(globalAllow)
+      ? ({
+          source: "global",
+          key: "tools.sandbox.tools.allow",
+        } satisfies SandboxToolPolicySource)
+      : ({
+          source: "default",
+          key: "tools.sandbox.tools.allow",
+        } satisfies SandboxToolPolicySource);
+
+  const denySource = Array.isArray(agentDeny)
+    ? ({
+        source: "agent",
+        key: "agents.list[].tools.sandbox.tools.deny",
+      } satisfies SandboxToolPolicySource)
+    : Array.isArray(globalDeny)
+      ? ({
+          source: "global",
+          key: "tools.sandbox.tools.deny",
+        } satisfies SandboxToolPolicySource)
+      : ({
+          source: "default",
+          key: "tools.sandbox.tools.deny",
+        } satisfies SandboxToolPolicySource);
+
+  const deny = Array.isArray(agentDeny)
+    ? agentDeny
+    : Array.isArray(globalDeny)
+      ? globalDeny
+      : DEFAULT_TOOL_DENY;
+  const allow = Array.isArray(agentAllow)
+    ? agentAllow
+    : Array.isArray(globalAllow)
+      ? globalAllow
+      : DEFAULT_TOOL_ALLOW;
+
+  const expandedDeny = expandToolGroups(deny);
+  let expandedAllow = expandToolGroups(allow);
+
+  // `image` is essential for multimodal workflows; always include it in sandboxed
+  // sessions unless explicitly denied.
+  if (
+    !expandedDeny.map((v) => v.toLowerCase()).includes("image") &&
+    !expandedAllow.map((v) => v.toLowerCase()).includes("image")
+  ) {
+    expandedAllow = [...expandedAllow, "image"];
+  }
+
+  return {
+    allow: expandedAllow,
+    deny: expandedDeny,
+    sources: {
+      allow: allowSource,
+      deny: denySource,
+    },
+  };
+}
+
 export function resolveSandboxConfigForAgent(
   cfg?: ClawdbotConfig,
   agentId?: string,
@@ -362,6 +523,8 @@ export function resolveSandboxConfigForAgent(
     scope: agentSandbox?.scope ?? agent?.scope,
     perSession: agentSandbox?.perSession ?? agent?.perSession,
   });
+
+  const toolPolicy = resolveSandboxToolPolicyForAgent(cfg, agentId);
 
   return {
     mode: agentSandbox?.mode ?? agent?.mode ?? "off",
@@ -383,14 +546,8 @@ export function resolveSandboxConfigForAgent(
       agentBrowser: agentSandbox?.browser,
     }),
     tools: {
-      allow:
-        agentConfig?.tools?.sandbox?.tools?.allow ??
-        cfg?.tools?.sandbox?.tools?.allow ??
-        DEFAULT_TOOL_ALLOW,
-      deny:
-        agentConfig?.tools?.sandbox?.tools?.deny ??
-        cfg?.tools?.sandbox?.tools?.deny ??
-        DEFAULT_TOOL_DENY,
+      allow: toolPolicy.allow,
+      deny: toolPolicy.deny,
     },
     prune: resolveSandboxPruneConfig({
       scope,
@@ -403,11 +560,121 @@ export function resolveSandboxConfigForAgent(
 function shouldSandboxSession(
   cfg: SandboxConfig,
   sessionKey: string,
-  mainKey: string,
+  mainSessionKey: string,
 ) {
   if (cfg.mode === "off") return false;
   if (cfg.mode === "all") return true;
-  return sessionKey.trim() !== mainKey.trim();
+  return sessionKey.trim() !== mainSessionKey.trim();
+}
+
+function resolveMainSessionKeyForSandbox(params: {
+  cfg?: ClawdbotConfig;
+  agentId: string;
+}): string {
+  if (params.cfg?.session?.scope === "global") return "global";
+  return resolveAgentMainSessionKey({
+    cfg: params.cfg,
+    agentId: params.agentId,
+  });
+}
+
+function resolveComparableSessionKeyForSandbox(params: {
+  cfg?: ClawdbotConfig;
+  agentId: string;
+  sessionKey: string;
+}): string {
+  return canonicalizeMainSessionAlias({
+    cfg: params.cfg,
+    agentId: params.agentId,
+    sessionKey: params.sessionKey,
+  });
+}
+
+export function resolveSandboxRuntimeStatus(params: {
+  cfg?: ClawdbotConfig;
+  sessionKey?: string;
+}): {
+  agentId: string;
+  sessionKey: string;
+  mainSessionKey: string;
+  mode: SandboxConfig["mode"];
+  sandboxed: boolean;
+  toolPolicy: SandboxToolPolicyResolved;
+} {
+  const sessionKey = params.sessionKey?.trim() ?? "";
+  const agentId = resolveSessionAgentId({
+    sessionKey,
+    config: params.cfg,
+  });
+  const cfg = params.cfg;
+  const sandboxCfg = resolveSandboxConfigForAgent(cfg, agentId);
+  const mainSessionKey = resolveMainSessionKeyForSandbox({ cfg, agentId });
+  const sandboxed = sessionKey
+    ? shouldSandboxSession(
+        sandboxCfg,
+        resolveComparableSessionKeyForSandbox({ cfg, agentId, sessionKey }),
+        mainSessionKey,
+      )
+    : false;
+  return {
+    agentId,
+    sessionKey,
+    mainSessionKey,
+    mode: sandboxCfg.mode,
+    sandboxed,
+    toolPolicy: resolveSandboxToolPolicyForAgent(cfg, agentId),
+  };
+}
+
+export function formatSandboxToolPolicyBlockedMessage(params: {
+  cfg?: ClawdbotConfig;
+  sessionKey?: string;
+  toolName: string;
+}): string | undefined {
+  const tool = params.toolName.trim().toLowerCase();
+  if (!tool) return undefined;
+
+  const runtime = resolveSandboxRuntimeStatus({
+    cfg: params.cfg,
+    sessionKey: params.sessionKey,
+  });
+  if (!runtime.sandboxed) return undefined;
+
+  const deny = new Set(expandToolGroups(runtime.toolPolicy.deny));
+  const allow = expandToolGroups(runtime.toolPolicy.allow);
+  const allowSet = allow.length > 0 ? new Set(allow) : null;
+  const blockedByDeny = deny.has(tool);
+  const blockedByAllow = allowSet ? !allowSet.has(tool) : false;
+  if (!blockedByDeny && !blockedByAllow) return undefined;
+
+  const reasons: string[] = [];
+  const fixes: string[] = [];
+  if (blockedByDeny) {
+    reasons.push("deny list");
+    fixes.push(`Remove "${tool}" from ${runtime.toolPolicy.sources.deny.key}.`);
+  }
+  if (blockedByAllow) {
+    reasons.push("allow list");
+    fixes.push(
+      `Add "${tool}" to ${runtime.toolPolicy.sources.allow.key} (or set it to [] to allow all).`,
+    );
+  }
+
+  const lines: string[] = [];
+  lines.push(
+    `Tool "${tool}" blocked by sandbox tool policy (mode=${runtime.mode}).`,
+  );
+  lines.push(`Session: ${runtime.sessionKey || "(unknown)"}`);
+  lines.push(`Reason: ${reasons.join(" + ")}`);
+  lines.push("Fix:");
+  lines.push(`- agents.defaults.sandbox.mode=off (disable sandbox)`);
+  for (const fix of fixes) lines.push(`- ${fix}`);
+  if (runtime.mode === "non-main") {
+    lines.push(`- Use main session key (direct): ${runtime.mainSessionKey}`);
+  }
+  lines.push(`- See: clawdbot sandbox explain --session ${runtime.sessionKey}`);
+
+  return lines.join("\n");
 }
 
 function slugifySessionKey(value: string) {
@@ -703,6 +970,11 @@ export function buildSandboxCreateArgs(params: {
     const formatted = formatUlimitValue(name, value);
     if (formatted) args.push("--ulimit", formatted);
   }
+  if (params.cfg.binds?.length) {
+    for (const bind of params.cfg.binds) {
+      args.push("-v", bind);
+    }
+  }
   return args;
 }
 
@@ -920,12 +1192,31 @@ async function ensureSandboxBrowser(params: {
   if (shouldReuse && existing) {
     bridge = existing.bridge;
   } else {
+    const onEnsureAttachTarget = params.cfg.browser.autoStart
+      ? async () => {
+          const state = await dockerContainerState(containerName);
+          if (state.exists && !state.running) {
+            await execDocker(["start", containerName]);
+          }
+          const ok = await waitForSandboxCdp({
+            cdpPort: mappedCdp,
+            timeoutMs: params.cfg.browser.autoStartTimeoutMs,
+          });
+          if (!ok) {
+            throw new Error(
+              `Sandbox browser CDP did not become reachable on 127.0.0.1:${mappedCdp} within ${params.cfg.browser.autoStartTimeoutMs}ms.`,
+            );
+          }
+        }
+      : undefined;
+
     bridge = await startBrowserBridgeServer({
       resolved: buildSandboxBrowserResolvedConfig({
         controlPort: 0,
         cdpPort: mappedCdp,
         headless: params.cfg.browser.headless,
       }),
+      onEnsureAttachTarget,
     });
   }
   if (!shouldReuse) {
@@ -1045,8 +1336,17 @@ export async function resolveSandboxContext(params: {
   if (!rawSessionKey) return null;
   const agentId = resolveAgentIdFromSessionKey(rawSessionKey);
   const cfg = resolveSandboxConfigForAgent(params.config, agentId);
-  const mainKey = params.config?.session?.mainKey?.trim() || "main";
-  if (!shouldSandboxSession(cfg, rawSessionKey, mainKey)) return null;
+  const mainSessionKey = resolveMainSessionKeyForSandbox({
+    cfg: params.config,
+    agentId,
+  });
+  const comparableSessionKey = resolveComparableSessionKeyForSandbox({
+    cfg: params.config,
+    agentId,
+    sessionKey: rawSessionKey,
+  });
+  if (!shouldSandboxSession(cfg, comparableSessionKey, mainSessionKey))
+    return null;
 
   await maybePruneSandboxes(cfg);
 
@@ -1067,7 +1367,7 @@ export async function resolveSandboxContext(params: {
       agentWorkspaceDir,
       params.config?.agents?.defaults?.skipBootstrap,
     );
-    if (cfg.workspaceAccess === "none") {
+    if (cfg.workspaceAccess !== "rw") {
       try {
         await syncSkillsToWorkspace({
           sourceWorkspaceDir: agentWorkspaceDir,
@@ -1108,6 +1408,10 @@ export async function resolveSandboxContext(params: {
     containerWorkdir: cfg.docker.workdir,
     docker: cfg.docker,
     tools: cfg.tools,
+    browserAllowHostControl: cfg.browser.allowHostControl,
+    browserAllowedControlUrls: cfg.browser.allowedControlUrls,
+    browserAllowedControlHosts: cfg.browser.allowedControlHosts,
+    browserAllowedControlPorts: cfg.browser.allowedControlPorts,
     browser: browser ?? undefined,
   };
 }
@@ -1121,8 +1425,17 @@ export async function ensureSandboxWorkspaceForSession(params: {
   if (!rawSessionKey) return null;
   const agentId = resolveAgentIdFromSessionKey(rawSessionKey);
   const cfg = resolveSandboxConfigForAgent(params.config, agentId);
-  const mainKey = params.config?.session?.mainKey?.trim() || "main";
-  if (!shouldSandboxSession(cfg, rawSessionKey, mainKey)) return null;
+  const mainSessionKey = resolveMainSessionKeyForSandbox({
+    cfg: params.config,
+    agentId,
+  });
+  const comparableSessionKey = resolveComparableSessionKeyForSandbox({
+    cfg: params.config,
+    agentId,
+    sessionKey: rawSessionKey,
+  });
+  if (!shouldSandboxSession(cfg, comparableSessionKey, mainSessionKey))
+    return null;
 
   const agentWorkspaceDir = resolveUserPath(
     params.workspaceDir?.trim() || DEFAULT_AGENT_WORKSPACE_DIR,
@@ -1141,7 +1454,7 @@ export async function ensureSandboxWorkspaceForSession(params: {
       agentWorkspaceDir,
       params.config?.agents?.defaults?.skipBootstrap,
     );
-    if (cfg.workspaceAccess === "none") {
+    if (cfg.workspaceAccess !== "rw") {
       try {
         await syncSkillsToWorkspace({
           sourceWorkspaceDir: agentWorkspaceDir,

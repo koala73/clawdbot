@@ -5,11 +5,11 @@ import { normalizePollInput, type PollInput } from "../polls.js";
 import { toWhatsappJid } from "../utils.js";
 import {
   type ActiveWebSendOptions,
-  getActiveWebListener,
+  requireActiveWebListener,
 } from "./active-listener.js";
 import { loadWebMedia } from "./media.js";
 
-const outboundLog = createSubsystemLogger("gateway/providers/whatsapp").child(
+const outboundLog = createSubsystemLogger("gateway/channels/whatsapp").child(
   "outbound",
 );
 
@@ -26,12 +26,8 @@ export async function sendMessageWhatsApp(
   let text = body;
   const correlationId = randomUUID();
   const startedAt = Date.now();
-  const active = getActiveWebListener(options.accountId);
-  if (!active) {
-    throw new Error(
-      "No active gateway listener. Start the gateway before sending WhatsApp messages.",
-    );
-  }
+  const { listener: active, accountId: resolvedAccountId } =
+    requireActiveWebListener(options.accountId);
   const logger = getChildLogger({
     module: "web-outbound",
     correlationId,
@@ -67,11 +63,16 @@ export async function sendMessageWhatsApp(
       { jid, hasMedia: Boolean(options.mediaUrl) },
       "sending message",
     );
-    if (!active) throw new Error("Active web listener missing");
     await active.sendComposingTo(to);
-    const sendOptions: ActiveWebSendOptions | undefined = options.gifPlayback
-      ? { gifPlayback: true }
-      : undefined;
+    const hasExplicitAccountId = Boolean(options.accountId?.trim());
+    const accountId = hasExplicitAccountId ? resolvedAccountId : undefined;
+    const sendOptions: ActiveWebSendOptions | undefined =
+      options.gifPlayback || accountId
+        ? {
+            ...(options.gifPlayback ? { gifPlayback: true } : {}),
+            accountId,
+          }
+        : undefined;
     const result = sendOptions
       ? await active.sendMessage(to, text, mediaBuffer, mediaType, sendOptions)
       : await active.sendMessage(to, text, mediaBuffer, mediaType);
@@ -104,12 +105,7 @@ export async function sendReactionWhatsApp(
   },
 ): Promise<void> {
   const correlationId = randomUUID();
-  const active = getActiveWebListener(options.accountId);
-  if (!active) {
-    throw new Error(
-      "No active gateway listener. Start the gateway before sending WhatsApp reactions.",
-    );
-  }
+  const { listener: active } = requireActiveWebListener(options.accountId);
   const logger = getChildLogger({
     module: "web-outbound",
     correlationId,
@@ -145,12 +141,7 @@ export async function sendPollWhatsApp(
 ): Promise<{ messageId: string; toJid: string }> {
   const correlationId = randomUUID();
   const startedAt = Date.now();
-  const active = getActiveWebListener(options.accountId);
-  if (!active) {
-    throw new Error(
-      "No active gateway listener. Start the gateway before sending WhatsApp polls.",
-    );
-  }
+  const { listener: active } = requireActiveWebListener(options.accountId);
   const logger = getChildLogger({
     module: "web-outbound",
     correlationId,

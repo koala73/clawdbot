@@ -1,39 +1,30 @@
-import { note as clackNote } from "@clack/prompts";
-
+import { resolveChannelDefaultAccountId } from "../channels/plugins/helpers.js";
+import { listChannelPlugins } from "../channels/plugins/index.js";
+import type { ChannelId } from "../channels/plugins/types.js";
 import type { ClawdbotConfig } from "../config/config.js";
-import { readProviderAllowFromStore } from "../pairing/pairing-store.js";
-import { readTelegramAllowFromStore } from "../telegram/pairing-store.js";
-import { resolveTelegramToken } from "../telegram/token.js";
-import { stylePromptTitle } from "../terminal/prompt-style.js";
-import { normalizeE164 } from "../utils.js";
-
-const note = (message: string, title?: string) =>
-  clackNote(message, stylePromptTitle(title));
+import { readChannelAllowFromStore } from "../pairing/pairing-store.js";
+import { note } from "../terminal/note.js";
 
 export async function noteSecurityWarnings(cfg: ClawdbotConfig) {
   const warnings: string[] = [];
 
   const warnDmPolicy = async (params: {
     label: string;
-    provider:
-      | "telegram"
-      | "signal"
-      | "imessage"
-      | "discord"
-      | "slack"
-      | "whatsapp";
+    provider: ChannelId;
     dmPolicy: string;
     allowFrom?: Array<string | number> | null;
+    policyPath?: string;
     allowFromPath: string;
     approveHint: string;
     normalizeEntry?: (raw: string) => string;
   }) => {
     const dmPolicy = params.dmPolicy;
+    const policyPath = params.policyPath ?? `${params.allowFromPath}policy`;
     const configAllowFrom = (params.allowFrom ?? []).map((v) =>
       String(v).trim(),
     );
     const hasWildcard = configAllowFrom.includes("*");
-    const storeAllowFrom = await readProviderAllowFromStore(
+    const storeAllowFrom = await readChannelAllowFromStore(
       params.provider,
     ).catch(() => []);
     const normalizedCfg = configAllowFrom
@@ -50,7 +41,6 @@ export async function noteSecurityWarnings(cfg: ClawdbotConfig) {
     ).length;
 
     if (dmPolicy === "open") {
-      const policyPath = `${params.allowFromPath}policy`;
       const allowFromPath = `${params.allowFromPath}allowFrom`;
       warnings.push(
         `- ${params.label} DMs: OPEN (${policyPath}="open"). Anyone can DM it.`,
@@ -64,7 +54,6 @@ export async function noteSecurityWarnings(cfg: ClawdbotConfig) {
     }
 
     if (dmPolicy === "disabled") {
-      const policyPath = `${params.allowFromPath}policy`;
       warnings.push(
         `- ${params.label} DMs: disabled (${policyPath}="disabled").`,
       );
@@ -72,7 +61,6 @@ export async function noteSecurityWarnings(cfg: ClawdbotConfig) {
     }
 
     if (allowCount === 0) {
-      const policyPath = `${params.allowFromPath}policy`;
       warnings.push(
         `- ${params.label} DMs: locked (${policyPath}="${dmPolicy}") with no allowlist; unknown senders will be blocked / get a pairing code.`,
       );
@@ -80,119 +68,48 @@ export async function noteSecurityWarnings(cfg: ClawdbotConfig) {
     }
   };
 
-  const telegramConfigured = Boolean(cfg.telegram);
-  const { token: telegramToken } = resolveTelegramToken(cfg);
-  if (telegramConfigured && telegramToken.trim()) {
-    const dmPolicy = cfg.telegram?.dmPolicy ?? "pairing";
-    const configAllowFrom = (cfg.telegram?.allowFrom ?? []).map((v) =>
-      String(v).trim(),
-    );
-    const hasWildcard = configAllowFrom.includes("*");
-    const storeAllowFrom = await readTelegramAllowFromStore().catch(() => []);
-    const allowCount = Array.from(
-      new Set([
-        ...configAllowFrom
-          .filter((v) => v !== "*")
-          .map((v) => v.replace(/^(telegram|tg):/i, ""))
-          .filter(Boolean),
-        ...storeAllowFrom.filter((v) => v !== "*"),
-      ]),
-    ).length;
-
-    if (dmPolicy === "open") {
-      warnings.push(
-        `- Telegram DMs: OPEN (telegram.dmPolicy="open"). Anyone who can find the bot can DM it.`,
-      );
-      if (!hasWildcard) {
-        warnings.push(
-          `- Telegram DMs: config invalid — dmPolicy "open" requires telegram.allowFrom to include "*".`,
-        );
-      }
-    } else if (dmPolicy === "disabled") {
-      warnings.push(`- Telegram DMs: disabled (telegram.dmPolicy="disabled").`);
-    } else if (allowCount === 0) {
-      warnings.push(
-        `- Telegram DMs: locked (telegram.dmPolicy="${dmPolicy}") with no allowlist; unknown senders will be blocked / get a pairing code.`,
-      );
-      warnings.push(
-        `  Approve via: clawdbot pairing list --provider telegram / clawdbot pairing approve --provider telegram <code>`,
-      );
+  for (const plugin of listChannelPlugins()) {
+    if (!plugin.security) continue;
+    const accountIds = plugin.config.listAccountIds(cfg);
+    const defaultAccountId = resolveChannelDefaultAccountId({
+      plugin,
+      cfg,
+      accountIds,
+    });
+    const account = plugin.config.resolveAccount(cfg, defaultAccountId);
+    const enabled = plugin.config.isEnabled
+      ? plugin.config.isEnabled(account, cfg)
+      : true;
+    if (!enabled) continue;
+    const configured = plugin.config.isConfigured
+      ? await plugin.config.isConfigured(account, cfg)
+      : true;
+    if (!configured) continue;
+    const dmPolicy = plugin.security.resolveDmPolicy?.({
+      cfg,
+      accountId: defaultAccountId,
+      account,
+    });
+    if (dmPolicy) {
+      await warnDmPolicy({
+        label: plugin.meta.label ?? plugin.id,
+        provider: plugin.id,
+        dmPolicy: dmPolicy.policy,
+        allowFrom: dmPolicy.allowFrom,
+        policyPath: dmPolicy.policyPath,
+        allowFromPath: dmPolicy.allowFromPath,
+        approveHint: dmPolicy.approveHint,
+        normalizeEntry: dmPolicy.normalizeEntry,
+      });
     }
-
-    const groupPolicy = cfg.telegram?.groupPolicy ?? "open";
-    const groupAllowlistConfigured =
-      cfg.telegram?.groups && Object.keys(cfg.telegram.groups).length > 0;
-    if (groupPolicy === "open" && !groupAllowlistConfigured) {
-      warnings.push(
-        `- Telegram groups: open (groupPolicy="open") with no telegram.groups allowlist; mention-gating applies but any group can add + ping.`,
-      );
+    if (plugin.security.collectWarnings) {
+      const extra = await plugin.security.collectWarnings({
+        cfg,
+        accountId: defaultAccountId,
+        account,
+      });
+      if (extra?.length) warnings.push(...extra);
     }
-  }
-
-  if (cfg.discord?.enabled !== false) {
-    await warnDmPolicy({
-      label: "Discord",
-      provider: "discord",
-      dmPolicy: cfg.discord?.dm?.policy ?? "pairing",
-      allowFrom: cfg.discord?.dm?.allowFrom ?? [],
-      allowFromPath: "discord.dm.",
-      approveHint:
-        "Approve via: clawdbot pairing list --provider discord / clawdbot pairing approve --provider discord <code>",
-      normalizeEntry: (raw) =>
-        raw.replace(/^(discord|user):/i, "").replace(/^<@!?(\d+)>$/, "$1"),
-    });
-  }
-
-  if (cfg.slack?.enabled !== false) {
-    await warnDmPolicy({
-      label: "Slack",
-      provider: "slack",
-      dmPolicy: cfg.slack?.dm?.policy ?? "pairing",
-      allowFrom: cfg.slack?.dm?.allowFrom ?? [],
-      allowFromPath: "slack.dm.",
-      approveHint:
-        "Approve via: clawdbot pairing list --provider slack / clawdbot pairing approve --provider slack <code>",
-      normalizeEntry: (raw) => raw.replace(/^(slack|user):/i, ""),
-    });
-  }
-
-  if (cfg.signal?.enabled !== false) {
-    await warnDmPolicy({
-      label: "Signal",
-      provider: "signal",
-      dmPolicy: cfg.signal?.dmPolicy ?? "pairing",
-      allowFrom: cfg.signal?.allowFrom ?? [],
-      allowFromPath: "signal.",
-      approveHint:
-        "Approve via: clawdbot pairing list --provider signal / clawdbot pairing approve --provider signal <code>",
-      normalizeEntry: (raw) =>
-        normalizeE164(raw.replace(/^signal:/i, "").trim()),
-    });
-  }
-
-  if (cfg.imessage?.enabled !== false) {
-    await warnDmPolicy({
-      label: "iMessage",
-      provider: "imessage",
-      dmPolicy: cfg.imessage?.dmPolicy ?? "pairing",
-      allowFrom: cfg.imessage?.allowFrom ?? [],
-      allowFromPath: "imessage.",
-      approveHint:
-        "Approve via: clawdbot pairing list --provider imessage / clawdbot pairing approve --provider imessage <code>",
-    });
-  }
-
-  if (cfg.whatsapp) {
-    await warnDmPolicy({
-      label: "WhatsApp",
-      provider: "whatsapp",
-      dmPolicy: cfg.whatsapp?.dmPolicy ?? "pairing",
-      allowFrom: cfg.whatsapp?.allowFrom ?? [],
-      allowFromPath: "whatsapp.",
-      approveHint:
-        "Approve via: clawdbot pairing list --provider whatsapp / clawdbot pairing approve --provider whatsapp <code>",
-      normalizeEntry: (raw) => normalizeE164(raw),
-    });
   }
 
   if (warnings.length > 0) {

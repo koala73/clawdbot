@@ -5,23 +5,23 @@ read_when:
 ---
 # Agent Runtime 🤖
 
-CLAWDBOT runs a single embedded agent runtime derived from **p-mono**.
+Clawdbot runs a single embedded agent runtime derived from **p-mono**.
 
 ## Workspace (required)
 
-CLAWDBOT uses a single agent workspace directory (`agents.defaults.workspace`) as the agent’s **only** working directory (`cwd`) for tools and context.
+Clawdbot uses a single agent workspace directory (`agents.defaults.workspace`) as the agent’s **only** working directory (`cwd`) for tools and context.
 
 Recommended: use `clawdbot setup` to create `~/.clawdbot/clawdbot.json` if missing and initialize the workspace files.
 
-Full workspace layout + backup guide: [`docs/agent-workspace.md`](/concepts/agent-workspace)
+Full workspace layout + backup guide: [Agent workspace](/concepts/agent-workspace)
 
 If `agents.defaults.sandbox` is enabled, non-main sessions can override this with
 per-session workspaces under `agents.defaults.sandbox.workspaceRoot` (see
-[`docs/configuration.md`](/gateway/configuration)).
+[Gateway configuration](/gateway/configuration)).
 
 ## Bootstrap files (injected)
 
-Inside `agents.defaults.workspace`, CLAWDBOT expects these user-editable files:
+Inside `agents.defaults.workspace`, Clawdbot expects these user-editable files:
 - `AGENTS.md` — operating instructions + “memory”
 - `SOUL.md` — persona, boundaries, tone
 - `TOOLS.md` — user-maintained tool notes (e.g. `imsg`, `sag`, conventions)
@@ -29,11 +29,11 @@ Inside `agents.defaults.workspace`, CLAWDBOT expects these user-editable files:
 - `IDENTITY.md` — agent name/vibe/emoji
 - `USER.md` — user profile + preferred address
 
-On the first turn of a new session, CLAWDBOT injects the contents of these files directly into the agent context.
+On the first turn of a new session, Clawdbot injects the contents of these files directly into the agent context.
 
 Blank files are skipped. Large files are trimmed and truncated with a marker so prompts stay lean (read the file for full content).
 
-If a file is missing, CLAWDBOT injects a single “missing file” marker line (and `clawdbot setup` will create a safe default template).
+If a file is missing, Clawdbot injects a single “missing file” marker line (and `clawdbot setup` will create a safe default template).
 
 `BOOTSTRAP.md` is only created for a **brand new workspace** (no other bootstrap files present). If you delete it after completing the ritual, it should not be recreated on later restarts.
 
@@ -45,7 +45,10 @@ To disable bootstrap file creation entirely (for pre-seeded workspaces), set:
 
 ## Built-in tools
 
-Core tools (read/bash/edit/write and related system tools) are always available. `TOOLS.md` does **not** control which tools exist; it’s guidance for how *you* want them used.
+Core tools (read/exec/edit/write and related system tools) are always available,
+subject to tool policy. `apply_patch` is optional and gated by
+`tools.exec.applyPatch`. `TOOLS.md` does **not** control which tools exist; it’s
+guidance for how *you* want them used.
 
 ## Skills
 
@@ -54,7 +57,7 @@ Clawdbot loads skills from three locations (workspace wins on name conflict):
 - Managed/local: `~/.clawdbot/skills`
 - Workspace: `<workspace>/skills`
 
-Skills can be gated by config/env (see `skills` in [`docs/configuration.md`](/gateway/configuration)).
+Skills can be gated by config/env (see `skills` in [Gateway configuration](/gateway/configuration)).
 
 ## p-mono integration
 
@@ -68,7 +71,7 @@ Clawdbot reuses pieces of the p-mono codebase (models/tools), but **session mana
 Session transcripts are stored as JSONL at:
 - `~/.clawdbot/agents/<agentId>/sessions/<SessionId>.jsonl`
 
-The session ID is stable and chosen by CLAWDBOT.
+The session ID is stable and chosen by Clawdbot.
 Legacy Pi/Tau session folders are **not** read.
 
 ## Steering while streaming
@@ -81,15 +84,16 @@ message is injected before the next assistant response.
 
 When queue mode is `followup` or `collect`, inbound messages are held until the
 current turn ends, then a new agent turn starts with the queued payloads. See
-[`docs/queue.md`](/concepts/queue) for mode + debounce/cap behavior.
+[Queue](/concepts/queue) for mode + debounce/cap behavior.
 
-Block streaming sends completed assistant blocks as soon as they finish; disable
-via `agents.defaults.blockStreamingDefault: "off"` if you only want the final response.
+Block streaming sends completed assistant blocks as soon as they finish; it is
+**off by default** (`agents.defaults.blockStreamingDefault: "off"`).
 Tune the boundary via `agents.defaults.blockStreamingBreak` (`text_end` vs `message_end`; defaults to text_end).
 Control soft block chunking with `agents.defaults.blockStreamingChunk` (defaults to
 800–1200 chars; prefers paragraph breaks, then newlines; sentences last).
 Coalesce streamed chunks with `agents.defaults.blockStreamingCoalesce` to reduce
-single-line spam (idle-based merging before send).
+single-line spam (idle-based merging before send). Non-Telegram channels require
+explicit `*.blockStreaming: true` to enable block replies.
 Verbose tool summaries are emitted at tool start (no debounce); Control UI
 streams tool output via agent events when available.
 More details: [Streaming + chunking](/concepts/streaming).
@@ -98,7 +102,7 @@ More details: [Streaming + chunking](/concepts/streaming).
 
 At minimum, set:
 - `agents.defaults.workspace`
-- `whatsapp.allowFrom` (strongly recommended)
+- `channels.whatsapp.allowFrom` (strongly recommended)
 
 ---
 

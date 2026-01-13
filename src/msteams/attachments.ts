@@ -750,13 +750,12 @@ export async function downloadMSTeamsImageAttachments(params: {
       if (buffer.byteLength > params.maxBytes) continue;
       const mime = await detectMime({
         buffer,
-        headerMime:
-          candidate.contentTypeHint ?? res.headers.get("content-type"),
+        headerMime: res.headers.get("content-type"),
         filePath: candidate.fileHint ?? candidate.url,
       });
       const saved = await saveMediaBuffer(
         buffer,
-        mime,
+        mime ?? candidate.contentTypeHint,
         "inbound",
         params.maxBytes,
       );

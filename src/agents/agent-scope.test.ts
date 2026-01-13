@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { ClawdbotConfig } from "../config/config.js";
-import { resolveAgentConfig } from "./agent-scope.js";
+import {
+  resolveAgentConfig,
+  resolveAgentModelFallbacksOverride,
+  resolveAgentModelPrimary,
+} from "./agent-scope.js";
 
 describe("resolveAgentConfig", () => {
   it("should return undefined when no agents config exists", () => {
@@ -47,6 +51,68 @@ describe("resolveAgentConfig", () => {
     });
   });
 
+  it("supports per-agent model primary+fallbacks", () => {
+    const cfg: ClawdbotConfig = {
+      agents: {
+        defaults: {
+          model: {
+            primary: "anthropic/claude-sonnet-4",
+            fallbacks: ["openai/gpt-4.1"],
+          },
+        },
+        list: [
+          {
+            id: "linus",
+            model: {
+              primary: "anthropic/claude-opus-4",
+              fallbacks: ["openai/gpt-5.2"],
+            },
+          },
+        ],
+      },
+    };
+
+    expect(resolveAgentModelPrimary(cfg, "linus")).toBe(
+      "anthropic/claude-opus-4",
+    );
+    expect(resolveAgentModelFallbacksOverride(cfg, "linus")).toEqual([
+      "openai/gpt-5.2",
+    ]);
+
+    // If fallbacks isn't present, we don't override the global fallbacks.
+    const cfgNoOverride: ClawdbotConfig = {
+      agents: {
+        list: [
+          {
+            id: "linus",
+            model: {
+              primary: "anthropic/claude-opus-4",
+            },
+          },
+        ],
+      },
+    };
+    expect(resolveAgentModelFallbacksOverride(cfgNoOverride, "linus")).toBe(
+      undefined,
+    );
+
+    // Explicit empty list disables global fallbacks for that agent.
+    const cfgDisable: ClawdbotConfig = {
+      agents: {
+        list: [
+          {
+            id: "linus",
+            model: {
+              primary: "anthropic/claude-opus-4",
+              fallbacks: [],
+            },
+          },
+        ],
+      },
+    };
+    expect(resolveAgentModelFallbacksOverride(cfgDisable, "linus")).toEqual([]);
+  });
+
   it("should return agent-specific sandbox config", () => {
     const cfg: ClawdbotConfig = {
       agents: {
@@ -84,7 +150,11 @@ describe("resolveAgentConfig", () => {
             workspace: "~/clawd-restricted",
             tools: {
               allow: ["read"],
-              deny: ["bash", "write", "edit"],
+              deny: ["exec", "write", "edit"],
+              elevated: {
+                enabled: false,
+                allowFrom: { whatsapp: ["+15555550123"] },
+              },
             },
           },
         ],
@@ -93,7 +163,11 @@ describe("resolveAgentConfig", () => {
     const result = resolveAgentConfig(cfg, "restricted");
     expect(result?.tools).toEqual({
       allow: ["read"],
-      deny: ["bash", "write", "edit"],
+      deny: ["exec", "write", "edit"],
+      elevated: {
+        enabled: false,
+        allowFrom: { whatsapp: ["+15555550123"] },
+      },
     });
   });
 
@@ -110,7 +184,7 @@ describe("resolveAgentConfig", () => {
             },
             tools: {
               allow: ["read"],
-              deny: ["bash"],
+              deny: ["exec"],
             },
           },
         ],

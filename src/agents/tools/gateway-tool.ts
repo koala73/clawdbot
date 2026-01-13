@@ -2,47 +2,46 @@ import { Type } from "@sinclair/typebox";
 
 import type { ClawdbotConfig } from "../../config/config.js";
 import { scheduleGatewaySigusr1Restart } from "../../infra/restart.js";
+import {
+  DOCTOR_NONINTERACTIVE_HINT,
+  type RestartSentinelPayload,
+  writeRestartSentinel,
+} from "../../infra/restart-sentinel.js";
+import { stringEnum } from "../schema/typebox.js";
 import { type AnyAgentTool, jsonResult, readStringParam } from "./common.js";
 import { callGatewayTool } from "./gateway.js";
 
-const GatewayToolSchema = Type.Union([
-  Type.Object({
-    action: Type.Literal("restart"),
-    delayMs: Type.Optional(Type.Number()),
-    reason: Type.Optional(Type.String()),
-  }),
-  Type.Object({
-    action: Type.Literal("config.get"),
-    gatewayUrl: Type.Optional(Type.String()),
-    gatewayToken: Type.Optional(Type.String()),
-    timeoutMs: Type.Optional(Type.Number()),
-  }),
-  Type.Object({
-    action: Type.Literal("config.schema"),
-    gatewayUrl: Type.Optional(Type.String()),
-    gatewayToken: Type.Optional(Type.String()),
-    timeoutMs: Type.Optional(Type.Number()),
-  }),
-  Type.Object({
-    action: Type.Literal("config.apply"),
-    raw: Type.String(),
-    sessionKey: Type.Optional(Type.String()),
-    note: Type.Optional(Type.String()),
-    restartDelayMs: Type.Optional(Type.Number()),
-    gatewayUrl: Type.Optional(Type.String()),
-    gatewayToken: Type.Optional(Type.String()),
-    timeoutMs: Type.Optional(Type.Number()),
-  }),
-  Type.Object({
-    action: Type.Literal("update.run"),
-    sessionKey: Type.Optional(Type.String()),
-    note: Type.Optional(Type.String()),
-    restartDelayMs: Type.Optional(Type.Number()),
-    timeoutMs: Type.Optional(Type.Number()),
-    gatewayUrl: Type.Optional(Type.String()),
-    gatewayToken: Type.Optional(Type.String()),
-  }),
-]);
+const GATEWAY_ACTIONS = [
+  "restart",
+  "config.get",
+  "config.schema",
+  "config.apply",
+  "update.run",
+] as const;
+
+// NOTE: Using a flattened object schema instead of Type.Union([Type.Object(...), ...])
+// because Claude API on Vertex AI rejects nested anyOf schemas as invalid JSON Schema.
+// The discriminator (action) determines which properties are relevant; runtime validates.
+const GatewayToolSchema = Type.Object({
+  action: stringEnum(GATEWAY_ACTIONS),
+  // restart
+  delayMs: Type.Optional(Type.Number()),
+  reason: Type.Optional(Type.String()),
+  // config.get, config.schema, config.apply, update.run
+  gatewayUrl: Type.Optional(Type.String()),
+  gatewayToken: Type.Optional(Type.String()),
+  timeoutMs: Type.Optional(Type.Number()),
+  // config.apply
+  raw: Type.Optional(Type.String()),
+  // config.apply, update.run
+  sessionKey: Type.Optional(Type.String()),
+  note: Type.Optional(Type.String()),
+  restartDelayMs: Type.Optional(Type.Number()),
+});
+// NOTE: We intentionally avoid top-level `allOf`/`anyOf`/`oneOf` conditionals here:
+// - OpenAI rejects tool schemas that include these keywords at the *top-level*.
+// - Claude/Vertex has other JSON Schema quirks.
+// Conditional requirements (like `raw` for config.apply) are enforced at runtime.
 
 export function createGatewayTool(opts?: {
   agentSessionKey?: string;
@@ -63,6 +62,10 @@ export function createGatewayTool(opts?: {
             "Gateway restart is disabled. Set commands.restart=true to enable.",
           );
         }
+        const sessionKey =
+          typeof params.sessionKey === "string" && params.sessionKey.trim()
+            ? params.sessionKey.trim()
+            : opts?.agentSessionKey?.trim() || undefined;
         const delayMs =
           typeof params.delayMs === "number" && Number.isFinite(params.delayMs)
             ? Math.floor(params.delayMs)
@@ -71,6 +74,27 @@ export function createGatewayTool(opts?: {
           typeof params.reason === "string" && params.reason.trim()
             ? params.reason.trim().slice(0, 200)
             : undefined;
+        const note =
+          typeof params.note === "string" && params.note.trim()
+            ? params.note.trim()
+            : undefined;
+        const payload: RestartSentinelPayload = {
+          kind: "restart",
+          status: "ok",
+          ts: Date.now(),
+          sessionKey,
+          message: note ?? reason ?? null,
+          doctorHint: DOCTOR_NONINTERACTIVE_HINT,
+          stats: {
+            mode: "gateway.restart",
+            reason,
+          },
+        };
+        try {
+          await writeRestartSentinel(payload);
+        } catch {
+          // ignore: sentinel is best-effort
+        }
         console.info(
           `gateway tool: restart requested (delayMs=${delayMs ?? "default"}, reason=${reason ?? "none"})`,
         );

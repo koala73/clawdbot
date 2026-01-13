@@ -20,7 +20,9 @@ import {
   browserScreenshotAction,
 } from "../../browser/client-actions.js";
 import { resolveBrowserConfig } from "../../browser/config.js";
+import { DEFAULT_AI_SNAPSHOT_MAX_CHARS } from "../../browser/constants.js";
 import { loadConfig } from "../../config/config.js";
+import { optionalStringEnum, stringEnum } from "../schema/typebox.js";
 import {
   type AnyAgentTool,
   imageResultFromFile,
@@ -42,16 +44,35 @@ const BROWSER_ACT_KINDS = [
   "close",
 ] as const;
 
-type BrowserActKind = (typeof BROWSER_ACT_KINDS)[number];
+const BROWSER_TOOL_ACTIONS = [
+  "status",
+  "start",
+  "stop",
+  "tabs",
+  "open",
+  "focus",
+  "close",
+  "snapshot",
+  "screenshot",
+  "navigate",
+  "console",
+  "pdf",
+  "upload",
+  "dialog",
+  "act",
+] as const;
+
+const BROWSER_TARGETS = ["sandbox", "host", "custom"] as const;
+
+const BROWSER_SNAPSHOT_FORMATS = ["aria", "ai"] as const;
+
+const BROWSER_IMAGE_TYPES = ["png", "jpeg"] as const;
 
 // NOTE: Using a flattened object schema instead of Type.Union([Type.Object(...), ...])
 // because Claude API on Vertex AI rejects nested anyOf schemas as invalid JSON Schema.
 // The discriminator (kind) determines which properties are relevant; runtime validates.
 const BrowserActSchema = Type.Object({
-  kind: Type.Unsafe<BrowserActKind>({
-    type: "string",
-    enum: [...BROWSER_ACT_KINDS],
-  }),
+  kind: stringEnum(BROWSER_ACT_KINDS),
   // Common fields
   targetId: Type.Optional(Type.String()),
   ref: Type.Optional(Type.String()),
@@ -88,33 +109,24 @@ const BrowserActSchema = Type.Object({
 // A root-level `Type.Union([...])` compiles to `{ anyOf: [...] }` (no `type`),
 // which OpenAI rejects ("Invalid schema ... type: None"). Keep this schema an object.
 const BrowserToolSchema = Type.Object({
-  action: Type.Union([
-    Type.Literal("status"),
-    Type.Literal("start"),
-    Type.Literal("stop"),
-    Type.Literal("tabs"),
-    Type.Literal("open"),
-    Type.Literal("focus"),
-    Type.Literal("close"),
-    Type.Literal("snapshot"),
-    Type.Literal("screenshot"),
-    Type.Literal("navigate"),
-    Type.Literal("console"),
-    Type.Literal("pdf"),
-    Type.Literal("upload"),
-    Type.Literal("dialog"),
-    Type.Literal("act"),
-  ]),
+  action: stringEnum(BROWSER_TOOL_ACTIONS),
+  target: optionalStringEnum(BROWSER_TARGETS),
   profile: Type.Optional(Type.String()),
   controlUrl: Type.Optional(Type.String()),
   targetUrl: Type.Optional(Type.String()),
   targetId: Type.Optional(Type.String()),
   limit: Type.Optional(Type.Number()),
-  format: Type.Optional(Type.Union([Type.Literal("aria"), Type.Literal("ai")])),
+  maxChars: Type.Optional(Type.Number()),
+  format: optionalStringEnum(BROWSER_SNAPSHOT_FORMATS),
+  interactive: Type.Optional(Type.Boolean()),
+  compact: Type.Optional(Type.Boolean()),
+  depth: Type.Optional(Type.Number()),
+  selector: Type.Optional(Type.String()),
+  frame: Type.Optional(Type.String()),
   fullPage: Type.Optional(Type.Boolean()),
   ref: Type.Optional(Type.String()),
   element: Type.Optional(Type.String()),
-  type: Type.Optional(Type.Union([Type.Literal("png"), Type.Literal("jpeg")])),
+  type: optionalStringEnum(BROWSER_IMAGE_TYPES),
   level: Type.Optional(Type.String()),
   paths: Type.Optional(Type.Array(Type.String())),
   inputRef: Type.Optional(Type.String()),
@@ -124,35 +136,152 @@ const BrowserToolSchema = Type.Object({
   request: Type.Optional(BrowserActSchema),
 });
 
-function resolveBrowserBaseUrl(controlUrl?: string) {
+function resolveBrowserBaseUrl(params: {
+  target?: "sandbox" | "host" | "custom";
+  controlUrl?: string;
+  defaultControlUrl?: string;
+  allowHostControl?: boolean;
+  allowedControlUrls?: string[];
+  allowedControlHosts?: string[];
+  allowedControlPorts?: number[];
+}) {
   const cfg = loadConfig();
   const resolved = resolveBrowserConfig(cfg.browser);
-  if (!resolved.enabled && !controlUrl?.trim()) {
+  const normalizedControlUrl = params.controlUrl?.trim() ?? "";
+  const normalizedDefault = params.defaultControlUrl?.trim() ?? "";
+  const target =
+    params.target ??
+    (normalizedControlUrl ? "custom" : normalizedDefault ? "sandbox" : "host");
+
+  const assertAllowedControlUrl = (url: string) => {
+    const allowedUrls = params.allowedControlUrls?.map((entry) =>
+      entry.trim().replace(/\/$/, ""),
+    );
+    const allowedHosts = params.allowedControlHosts?.map((entry) =>
+      entry.trim().toLowerCase(),
+    );
+    const allowedPorts = params.allowedControlPorts;
+    if (
+      !allowedUrls?.length &&
+      !allowedHosts?.length &&
+      !allowedPorts?.length
+    ) {
+      return;
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new Error(`Invalid browser controlUrl: ${url}`);
+    }
+    const normalizedUrl = parsed.toString().replace(/\/$/, "");
+    if (allowedUrls?.length && !allowedUrls.includes(normalizedUrl)) {
+      throw new Error("Browser controlUrl is not in the allowed URL list.");
+    }
+    if (allowedHosts?.length && !allowedHosts.includes(parsed.hostname)) {
+      throw new Error(
+        "Browser controlUrl hostname is not in the allowed host list.",
+      );
+    }
+    if (allowedPorts?.length) {
+      const port =
+        parsed.port?.trim() !== ""
+          ? Number(parsed.port)
+          : parsed.protocol === "https:"
+            ? 443
+            : 80;
+      if (!Number.isFinite(port) || !allowedPorts.includes(port)) {
+        throw new Error(
+          "Browser controlUrl port is not in the allowed port list.",
+        );
+      }
+    }
+  };
+
+  if (target !== "custom" && params.target && normalizedControlUrl) {
+    throw new Error('controlUrl is only supported with target="custom".');
+  }
+
+  if (target === "custom") {
+    if (!normalizedControlUrl) {
+      throw new Error("Custom browser target requires controlUrl.");
+    }
+    const normalized = normalizedControlUrl.replace(/\/$/, "");
+    assertAllowedControlUrl(normalized);
+    return normalized;
+  }
+
+  if (target === "sandbox") {
+    if (!normalizedDefault) {
+      throw new Error(
+        'Sandbox browser is unavailable. Enable agents.defaults.sandbox.browser.enabled or use target="host" if allowed.',
+      );
+    }
+    return normalizedDefault.replace(/\/$/, "");
+  }
+
+  if (params.allowHostControl === false) {
+    throw new Error("Host browser control is disabled by sandbox policy.");
+  }
+  if (!resolved.enabled) {
     throw new Error(
       "Browser control is disabled. Set browser.enabled=true in ~/.clawdbot/clawdbot.json.",
     );
   }
-  const url = controlUrl?.trim() ? controlUrl.trim() : resolved.controlUrl;
-  return url.replace(/\/$/, "");
+  const normalized = resolved.controlUrl.replace(/\/$/, "");
+  assertAllowedControlUrl(normalized);
+  return normalized;
 }
 
 export function createBrowserTool(opts?: {
   defaultControlUrl?: string;
+  allowHostControl?: boolean;
+  allowedControlUrls?: string[];
+  allowedControlHosts?: string[];
+  allowedControlPorts?: number[];
 }): AnyAgentTool {
+  const targetDefault = opts?.defaultControlUrl ? "sandbox" : "host";
+  const hostHint =
+    opts?.allowHostControl === false
+      ? "Host target blocked by policy."
+      : "Host target allowed.";
+  const allowlistHint =
+    opts?.allowedControlUrls?.length ||
+    opts?.allowedControlHosts?.length ||
+    opts?.allowedControlPorts?.length
+      ? "Custom targets are restricted by sandbox allowlists."
+      : "Custom targets are unrestricted.";
   return {
     label: "Browser",
     name: "browser",
-    description:
-      "Control clawd's dedicated browser (status/start/stop/tabs/open/snapshot/screenshot/actions). Use snapshot+act for UI automation. Avoid act:wait by default; use only in exceptional cases when no reliable UI state exists.",
+    description: [
+      "Control clawd's dedicated browser (status/start/stop/tabs/open/snapshot/screenshot/actions).",
+      "Use snapshot+act for UI automation. Avoid act:wait by default; use only in exceptional cases when no reliable UI state exists.",
+      `target selects browser location (sandbox|host|custom). Default: ${targetDefault}.`,
+      "controlUrl implies target=custom (remote control server).",
+      hostHint,
+      allowlistHint,
+    ].join(" "),
     parameters: BrowserToolSchema,
     execute: async (_toolCallId, args) => {
       const params = args as Record<string, unknown>;
       const action = readStringParam(params, "action", { required: true });
       const controlUrl = readStringParam(params, "controlUrl");
+      const target = readStringParam(params, "target") as
+        | "sandbox"
+        | "host"
+        | "custom"
+        | undefined;
       const profile = readStringParam(params, "profile");
-      const baseUrl = resolveBrowserBaseUrl(
-        controlUrl ?? opts?.defaultControlUrl,
-      );
+      const baseUrl = resolveBrowserBaseUrl({
+        target,
+        controlUrl,
+        defaultControlUrl: opts?.defaultControlUrl,
+        allowHostControl: opts?.allowHostControl,
+        allowedControlUrls: opts?.allowedControlUrls,
+        allowedControlHosts: opts?.allowedControlHosts,
+        allowedControlPorts: opts?.allowedControlPorts,
+      });
 
       switch (action) {
         case "status":
@@ -191,6 +320,7 @@ export function createBrowserTool(opts?: {
             params.format === "ai" || params.format === "aria"
               ? (params.format as "ai" | "aria")
               : "ai";
+          const hasMaxChars = Object.hasOwn(params, "maxChars");
           const targetId =
             typeof params.targetId === "string"
               ? params.targetId.trim()
@@ -199,10 +329,46 @@ export function createBrowserTool(opts?: {
             typeof params.limit === "number" && Number.isFinite(params.limit)
               ? params.limit
               : undefined;
+          const maxChars =
+            typeof params.maxChars === "number" &&
+            Number.isFinite(params.maxChars) &&
+            params.maxChars > 0
+              ? Math.floor(params.maxChars)
+              : undefined;
+          const resolvedMaxChars =
+            format === "ai"
+              ? hasMaxChars
+                ? maxChars
+                : DEFAULT_AI_SNAPSHOT_MAX_CHARS
+              : undefined;
+          const interactive =
+            typeof params.interactive === "boolean"
+              ? params.interactive
+              : undefined;
+          const compact =
+            typeof params.compact === "boolean" ? params.compact : undefined;
+          const depth =
+            typeof params.depth === "number" && Number.isFinite(params.depth)
+              ? params.depth
+              : undefined;
+          const selector =
+            typeof params.selector === "string"
+              ? params.selector.trim()
+              : undefined;
+          const frame =
+            typeof params.frame === "string" ? params.frame.trim() : undefined;
           const snapshot = await browserSnapshot(baseUrl, {
             format,
             targetId,
             limit,
+            ...(typeof resolvedMaxChars === "number"
+              ? { maxChars: resolvedMaxChars }
+              : {}),
+            interactive,
+            compact,
+            depth,
+            selector,
+            frame,
             profile,
           });
           if (snapshot.format === "ai") {

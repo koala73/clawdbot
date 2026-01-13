@@ -65,12 +65,6 @@ enum GatewayEnvironment {
     private static let logger = Logger(subsystem: "com.clawdbot", category: "gateway.env")
     private static let supportedBindModes: Set<String> = ["loopback", "tailnet", "lan", "auto"]
 
-    static func bundledGatewayExecutable() -> String? {
-        guard let res = Bundle.main.resourceURL else { return nil }
-        let path = res.appendingPathComponent("Relay/clawdbot").path
-        return FileManager.default.isExecutableFile(atPath: path) ? path : nil
-    }
-
     static func gatewayPort() -> Int {
         if let raw = ProcessInfo.processInfo.environment["CLAWDBOT_GATEWAY_PORT"] {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -105,28 +99,6 @@ enum GatewayEnvironment {
         }
         let expected = self.expectedGatewayVersion()
 
-        if let bundled = self.bundledGatewayExecutable() {
-            let installed = self.readGatewayVersion(binary: bundled)
-            if let expected, let installed, !installed.compatible(with: expected) {
-                let message =
-                    "Bundled gateway \(installed.description) is incompatible with app " +
-                    "\(expected.description); rebuild the app bundle."
-                return GatewayEnvironmentStatus(
-                    kind: .incompatible(found: installed.description, required: expected.description),
-                    nodeVersion: nil,
-                    gatewayVersion: installed.description,
-                    requiredGateway: expected.description,
-                    message: message)
-            }
-            let gatewayVersionText = installed?.description ?? "unknown"
-            return GatewayEnvironmentStatus(
-                kind: .ok,
-                nodeVersion: nil,
-                gatewayVersion: gatewayVersionText,
-                requiredGateway: expected?.description,
-                message: "Bundled gateway \(gatewayVersionText) (bun)")
-        }
-
         let projectRoot = CommandResolver.projectRoot()
         let projectEntrypoint = CommandResolver.gatewayEntrypoint(in: projectRoot)
 
@@ -147,7 +119,7 @@ enum GatewayEnvironment {
                     nodeVersion: runtime.version.description,
                     gatewayVersion: nil,
                     requiredGateway: expected?.description,
-                    message: "clawdbot CLI not found in PATH; install the global package.")
+                    message: "clawdbot CLI not found in PATH; install the CLI.")
             }
 
             let installed = gatewayBin.flatMap { self.readGatewayVersion(binary: $0) }
@@ -197,7 +169,6 @@ enum GatewayEnvironment {
         let projectEntrypoint = CommandResolver.gatewayEntrypoint(in: projectRoot)
         let status = self.check()
         let gatewayBin = CommandResolver.clawdbotExecutable()
-        let bundled = self.bundledGatewayExecutable()
         let runtime = RuntimeLocator.resolve(searchPaths: CommandResolver.preferredPaths())
 
         guard case .ok = status.kind else {
@@ -205,20 +176,17 @@ enum GatewayEnvironment {
         }
 
         let port = self.gatewayPort()
-        if let bundled {
-            let bind = self.preferredGatewayBind() ?? "loopback"
-            let cmd = [bundled, "gateway-daemon", "--port", "\(port)", "--bind", bind]
-            return GatewayCommandResolution(status: status, command: cmd)
-        }
         if let gatewayBin {
-            let cmd = [gatewayBin, "gateway", "--port", "\(port)"]
+            let bind = self.preferredGatewayBind() ?? "loopback"
+            let cmd = [gatewayBin, "gateway-daemon", "--port", "\(port)", "--bind", bind]
             return GatewayCommandResolution(status: status, command: cmd)
         }
 
         if let entry = projectEntrypoint,
            case let .success(resolvedRuntime) = runtime
         {
-            let cmd = [resolvedRuntime.path, entry, "gateway", "--port", "\(port)"]
+            let bind = self.preferredGatewayBind() ?? "loopback"
+            let cmd = [resolvedRuntime.path, entry, "gateway-daemon", "--port", "\(port)", "--bind", bind]
             return GatewayCommandResolution(status: status, command: cmd)
         }
 

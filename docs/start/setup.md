@@ -12,12 +12,12 @@ Last updated: 2026-01-01
 ## TL;DR
 - **Tailoring lives outside the repo:** `~/clawd` (workspace) + `~/.clawdbot/clawdbot.json` (config).
 - **Stable workflow:** install the macOS app; let it run the bundled Gateway.
-- **Bleeding edge workflow:** run the Gateway yourself via `pnpm gateway:watch`, then point the macOS app at it using **Debug Settings → Gateway → Attach only**.
+- **Bleeding edge workflow:** run the Gateway yourself via `pnpm gateway:watch`, then let the macOS app attach in Local mode.
 
 ## Prereqs (from source)
 - Node `>=22`
 - `pnpm`
-- Docker (optional; only for containerized setup/e2e — see [`docs/docker.md`](/install/docker))
+- Docker (optional; only for containerized setup/e2e — see [Docker](/install/docker))
 
 ## Tailoring strategy (so updates don’t hurt)
 
@@ -46,7 +46,7 @@ pnpm clawdbot setup
 4) Link surfaces (example: WhatsApp):
 
 ```bash
-clawdbot providers login
+clawdbot channels login
 ```
 
 5) Sanity check:
@@ -56,7 +56,7 @@ clawdbot health
 ```
 
 If onboarding is not available in your build:
-- Run `clawdbot setup`, then `clawdbot providers login`, then start the Gateway manually (`clawdbot gateway`).
+- Run `clawdbot setup`, then `clawdbot channels login`, then start the Gateway manually (`clawdbot gateway`).
 
 ## Bleeding edge workflow (Gateway in a terminal)
 
@@ -84,9 +84,7 @@ pnpm gateway:watch
 In **Clawdbot.app**:
 
 - Connection Mode: **Local**
-- Settings → **Debug Settings** → **Gateway** → enable **Attach only**
-
-This makes the app **only connect to an already-running gateway** and **never spawn** its own.
+The app will attach to the running gateway on the configured port.
 
 ### 3) Verify
 
@@ -98,7 +96,6 @@ pnpm clawdbot health
 ```
 
 ### Common footguns
-- **Attach only enabled, but nothing is running:** app shows “Attach-only enabled; no gateway to attach”.
 - **Wrong port:** Gateway WS defaults to `ws://127.0.0.1:18789`; keep app + CLI on the same port.
 - **Where state lives:**
   - Credentials: `~/.clawdbot/credentials/`
@@ -121,12 +118,12 @@ sudo loginctl enable-linger $USER
 ```
 
 For always-on or multi-user servers, consider a **system** service instead of a
-user service (no lingering needed). See [`docs/gateway.md`](/gateway) for the systemd notes.
+user service (no lingering needed). See [Gateway runbook](/gateway) for the systemd notes.
 
 ## Related docs
 
-- [`docs/gateway.md`](/gateway) (Gateway runbook; flags, supervision, ports)
-- [`docs/configuration.md`](/gateway/configuration) (config schema + examples)
-- [`docs/discord.md`](/providers/discord) and [`docs/telegram.md`](/providers/telegram) (reply tags + replyToMode settings)
-- [`docs/clawd.md`](/start/clawd) (Clawdbot assistant setup)
-- [`docs/macos.md`](/platforms/macos) (macOS app behavior; gateway lifecycle + “Attach only”)
+- [Gateway runbook](/gateway) (flags, supervision, ports)
+- [Gateway configuration](/gateway/configuration) (config schema + examples)
+- [Discord](/channels/discord) and [Telegram](/channels/telegram) (reply tags + replyToMode settings)
+- [Clawdbot assistant setup](/start/clawd)
+- [macOS app](/platforms/macos) (gateway lifecycle)

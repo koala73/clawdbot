@@ -143,7 +143,7 @@ describe("gateway server sessions", () => {
     const patched = await rpcReq<{ ok: true; key: string }>(
       ws,
       "sessions.patch",
-      { key: "agent:main:main", thinkingLevel: "medium", verboseLevel: null },
+      { key: "agent:main:main", thinkingLevel: "medium", verboseLevel: "off" },
     );
     expect(patched.ok).toBe(true);
     expect(patched.payload?.ok).toBe(true);
@@ -186,12 +186,31 @@ describe("gateway server sessions", () => {
       (s) => s.key === "agent:main:main",
     );
     expect(main2?.thinkingLevel).toBe("medium");
-    expect(main2?.verboseLevel).toBeUndefined();
+    expect(main2?.verboseLevel).toBe("off");
     expect(main2?.sendPolicy).toBe("deny");
     const subagent = list2.payload?.sessions.find(
       (s) => s.key === "agent:main:subagent:one",
     );
     expect(subagent?.label).toBe("Briefing");
+
+    const clearedVerbose = await rpcReq<{ ok: true; key: string }>(
+      ws,
+      "sessions.patch",
+      { key: "agent:main:main", verboseLevel: null },
+    );
+    expect(clearedVerbose.ok).toBe(true);
+
+    const list3 = await rpcReq<{
+      sessions: Array<{
+        key: string;
+        verboseLevel?: string;
+      }>;
+    }>(ws, "sessions.list", {});
+    expect(list3.ok).toBe(true);
+    const main3 = list3.payload?.sessions.find(
+      (s) => s.key === "agent:main:main",
+    );
+    expect(main3?.verboseLevel).toBeUndefined();
 
     const listByLabel = await rpcReq<{
       sessions: Array<{ key: string }>;
@@ -444,5 +463,53 @@ describe("gateway server sessions", () => {
     expect(workSessions.payload?.sessions.map((s) => s.key)).toEqual([
       "agent:work:main",
     ]);
+  });
+
+  test("resolves and patches main alias to default agent main key", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-sessions-"));
+    const storePath = path.join(dir, "sessions.json");
+    testState.sessionStorePath = storePath;
+    testState.agentsConfig = { list: [{ id: "ops", default: true }] };
+    testState.sessionConfig = { mainKey: "work" };
+
+    await fs.writeFile(
+      storePath,
+      JSON.stringify(
+        {
+          "agent:ops:work": {
+            sessionId: "sess-ops-main",
+            updatedAt: Date.now(),
+          },
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+
+    const { ws } = await startServerWithClient();
+    await connectOk(ws);
+    const resolved = await rpcReq<{ ok: true; key: string }>(
+      ws,
+      "sessions.resolve",
+      { key: "main" },
+    );
+    expect(resolved.ok).toBe(true);
+    expect(resolved.payload?.key).toBe("agent:ops:work");
+
+    const patched = await rpcReq<{ ok: true; key: string }>(
+      ws,
+      "sessions.patch",
+      { key: "main", thinkingLevel: "medium" },
+    );
+    expect(patched.ok).toBe(true);
+    expect(patched.payload?.key).toBe("agent:ops:work");
+
+    const stored = JSON.parse(await fs.readFile(storePath, "utf-8")) as Record<
+      string,
+      { thinkingLevel?: string }
+    >;
+    expect(stored["agent:ops:work"]?.thinkingLevel).toBe("medium");
+    expect(stored.main).toBeUndefined();
   });
 });

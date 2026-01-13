@@ -450,7 +450,7 @@ describe("Agent-specific sandbox config", () => {
         sandbox: {
           tools: {
             allow: ["read"],
-            deny: ["bash"],
+            deny: ["exec"],
           },
         },
       },
@@ -464,8 +464,70 @@ describe("Agent-specific sandbox config", () => {
 
     expect(context).toBeDefined();
     expect(context?.tools).toEqual({
-      allow: ["read", "write"],
+      allow: ["read", "write", "image"],
       deny: ["edit"],
     });
+  });
+
+  it("includes session_status in default sandbox allowlist", async () => {
+    const { resolveSandboxConfigForAgent } = await import("./sandbox.js");
+
+    const cfg: ClawdbotConfig = {
+      agents: {
+        defaults: {
+          sandbox: {
+            mode: "all",
+            scope: "agent",
+          },
+        },
+      },
+    };
+
+    const sandbox = resolveSandboxConfigForAgent(cfg, "main");
+    expect(sandbox.tools.allow).toContain("session_status");
+  });
+
+  it("includes image in default sandbox allowlist", async () => {
+    const { resolveSandboxConfigForAgent } = await import("./sandbox.js");
+
+    const cfg: ClawdbotConfig = {
+      agents: {
+        defaults: {
+          sandbox: {
+            mode: "all",
+            scope: "agent",
+          },
+        },
+      },
+    };
+
+    const sandbox = resolveSandboxConfigForAgent(cfg, "main");
+    expect(sandbox.tools.allow).toContain("image");
+  });
+
+  it("injects image into explicit sandbox allowlists", async () => {
+    const { resolveSandboxConfigForAgent } = await import("./sandbox.js");
+
+    const cfg: ClawdbotConfig = {
+      tools: {
+        sandbox: {
+          tools: {
+            allow: ["bash", "read"],
+            deny: [],
+          },
+        },
+      },
+      agents: {
+        defaults: {
+          sandbox: {
+            mode: "all",
+            scope: "agent",
+          },
+        },
+      },
+    };
+
+    const sandbox = resolveSandboxConfigForAgent(cfg, "main");
+    expect(sandbox.tools.allow).toContain("image");
   });
 });

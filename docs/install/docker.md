@@ -43,6 +43,11 @@ This script:
 - starts the gateway via Docker Compose
 - generates a gateway token and writes it to `.env`
 
+Optional env vars:
+- `CLAWDBOT_DOCKER_APT_PACKAGES` — install extra apt packages during build
+- `CLAWDBOT_EXTRA_MOUNTS` — add extra host bind mounts
+- `CLAWDBOT_HOME_VOLUME` — persist `/home/node` in a named volume
+
 After it finishes:
 - Open `http://127.0.0.1:18789/` in your browser.
 - Paste the token into the Control UI (Settings → token).
@@ -61,26 +66,127 @@ docker compose run --rm clawdbot-cli onboard
 docker compose up -d clawdbot-gateway
 ```
 
-### Provider setup (optional)
+### Extra mounts (optional)
 
-Use the CLI container to configure providers, then restart the gateway if needed.
+If you want to mount additional host directories into the containers, set
+`CLAWDBOT_EXTRA_MOUNTS` before running `docker-setup.sh`. This accepts a
+comma-separated list of Docker bind mounts and applies them to both
+`clawdbot-gateway` and `clawdbot-cli` by generating `docker-compose.extra.yml`.
+
+Example:
+
+```bash
+export CLAWDBOT_EXTRA_MOUNTS="$HOME/.codex:/home/node/.codex:ro,$HOME/github:/home/node/github:rw"
+./docker-setup.sh
+```
+
+Notes:
+- Paths must be shared with Docker Desktop on macOS/Windows.
+- If you edit `CLAWDBOT_EXTRA_MOUNTS`, rerun `docker-setup.sh` to regenerate the
+  extra compose file.
+- `docker-compose.extra.yml` is generated. Don’t hand-edit it.
+
+### Persist the entire container home (optional)
+
+If you want `/home/node` to persist across container recreation, set a named
+volume via `CLAWDBOT_HOME_VOLUME`. This creates a Docker volume and mounts it at
+`/home/node`, while keeping the standard config/workspace bind mounts. Use a
+named volume here (not a bind path); for bind mounts, use
+`CLAWDBOT_EXTRA_MOUNTS`.
+
+Example:
+
+```bash
+export CLAWDBOT_HOME_VOLUME="clawdbot_home"
+./docker-setup.sh
+```
+
+You can combine this with extra mounts:
+
+```bash
+export CLAWDBOT_HOME_VOLUME="clawdbot_home"
+export CLAWDBOT_EXTRA_MOUNTS="$HOME/.codex:/home/node/.codex:ro,$HOME/github:/home/node/github:rw"
+./docker-setup.sh
+```
+
+Notes:
+- If you change `CLAWDBOT_HOME_VOLUME`, rerun `docker-setup.sh` to regenerate the
+  extra compose file.
+- The named volume persists until removed with `docker volume rm <name>`.
+
+### Install extra apt packages (optional)
+
+If you need system packages inside the image (for example, build tools or media
+libraries), set `CLAWDBOT_DOCKER_APT_PACKAGES` before running `docker-setup.sh`.
+This installs the packages during the image build, so they persist even if the
+container is deleted.
+
+Example:
+
+```bash
+export CLAWDBOT_DOCKER_APT_PACKAGES="ffmpeg build-essential"
+./docker-setup.sh
+```
+
+Notes:
+- This accepts a space-separated list of apt package names.
+- If you change `CLAWDBOT_DOCKER_APT_PACKAGES`, rerun `docker-setup.sh` to rebuild
+  the image.
+
+### Faster rebuilds (recommended)
+
+To speed up rebuilds, order your Dockerfile so dependency layers are cached.
+This avoids re-running `pnpm install` unless lockfiles change:
+
+```dockerfile
+FROM node:22-bookworm
+
+# Install Bun (required for build scripts)
+RUN curl -fsSL https://bun.sh/install | bash
+ENV PATH="/root/.bun/bin:${PATH}"
+
+RUN corepack enable
+
+WORKDIR /app
+
+# Cache dependencies unless package metadata changes
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
+COPY ui/package.json ./ui/package.json
+COPY patches ./patches
+COPY scripts ./scripts
+
+RUN pnpm install --frozen-lockfile
+
+COPY . .
+RUN pnpm build
+RUN pnpm ui:install
+RUN pnpm ui:build
+
+ENV NODE_ENV=production
+
+CMD ["node","dist/index.js"]
+```
+
+### Channel setup (optional)
+
+Use the CLI container to configure channels, then restart the gateway if needed.
 
 WhatsApp (QR):
 ```bash
-docker compose run --rm clawdbot-cli providers login
+docker compose run --rm clawdbot-cli channels login
 ```
 
 Telegram (bot token):
 ```bash
-docker compose run --rm clawdbot-cli providers add --provider telegram --token "<token>"
+docker compose run --rm clawdbot-cli channels add --channel telegram --token "<token>"
 ```
 
 Discord (bot token):
 ```bash
-docker compose run --rm clawdbot-cli providers add --provider discord --token "<token>"
+docker compose run --rm clawdbot-cli channels add --channel discord --token "<token>"
 ```
 
-Docs: [WhatsApp](/providers/whatsapp), [Telegram](/providers/telegram), [Discord](/providers/discord)
+Docs: [WhatsApp](/channels/whatsapp), [Telegram](/channels/telegram), [Discord](/channels/discord)
 
 ### Health check
 
@@ -140,11 +246,11 @@ precedence, and troubleshooting.
 - Image: `clawdbot-sandbox:bookworm-slim`
 - One container per agent
 - Agent workspace access: `workspaceAccess: "none"` (default) uses `~/.clawdbot/sandboxes`
-  - `"ro"` keeps the sandbox workspace at `/workspace` and mounts the agent workspace read-only at `/agent` (disables `write`/`edit`)
+  - `"ro"` keeps the sandbox workspace at `/workspace` and mounts the agent workspace read-only at `/agent` (disables `write`/`edit`/`apply_patch`)
   - `"rw"` mounts the agent workspace read/write at `/workspace`
 - Auto-prune: idle > 24h OR age > 7d
 - Network: `none` by default (explicitly opt-in if you need egress)
-- Default allow: `bash`, `process`, `read`, `write`, `edit`, `sessions_list`, `sessions_history`, `sessions_send`, `sessions_spawn`
+- Default allow: `exec`, `process`, `read`, `write`, `edit`, `sessions_list`, `sessions_history`, `sessions_send`, `sessions_spawn`, `session_status`
 - Default deny: `browser`, `canvas`, `nodes`, `cron`, `discord`, `gateway`
 
 ### Enable sandboxing
@@ -191,7 +297,7 @@ precedence, and troubleshooting.
   tools: {
     sandbox: {
       tools: {
-        allow: ["bash", "process", "read", "write", "edit", "sessions_list", "sessions_history", "sessions_send", "sessions_spawn"],
+        allow: ["exec", "process", "read", "write", "edit", "sessions_list", "sessions_history", "sessions_send", "sessions_spawn", "session_status"],
         deny: ["browser", "canvas", "nodes", "cron", "discord", "gateway"]
       }
     }
@@ -318,7 +424,7 @@ Example:
 
 ### Security notes
 
-- Hard wall only applies to **tools** (bash/read/write/edit).  
+- Hard wall only applies to **tools** (exec/read/write/edit/apply_patch).  
 - Host-only tools like browser/camera/canvas are blocked by default.  
 - Allowing `browser` in sandbox **breaks isolation** (browser runs on host).
 

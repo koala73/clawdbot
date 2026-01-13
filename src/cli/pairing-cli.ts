@@ -1,78 +1,26 @@
 import type { Command } from "commander";
-
-import { loadConfig } from "../config/config.js";
-import { sendMessageDiscord } from "../discord/send.js";
-import { sendMessageIMessage } from "../imessage/send.js";
-import { sendMessageMSTeams } from "../msteams/send.js";
-import { PROVIDER_ID_LABELS } from "../pairing/pairing-labels.js";
 import {
-  approveProviderPairingCode,
-  listProviderPairingRequests,
-  type PairingProvider,
+  listPairingChannels,
+  notifyPairingApproved,
+  resolvePairingChannel,
+} from "../channels/plugins/pairing.js";
+import { loadConfig } from "../config/config.js";
+import { resolvePairingIdLabel } from "../pairing/pairing-labels.js";
+import {
+  approveChannelPairingCode,
+  listChannelPairingRequests,
+  type PairingChannel,
 } from "../pairing/pairing-store.js";
-import { sendMessageSignal } from "../signal/send.js";
-import { sendMessageSlack } from "../slack/send.js";
-import { sendMessageTelegram } from "../telegram/send.js";
-import { resolveTelegramToken } from "../telegram/token.js";
 
-const PROVIDERS: PairingProvider[] = [
-  "telegram",
-  "signal",
-  "imessage",
-  "discord",
-  "slack",
-  "whatsapp",
-  "msteams",
-];
+const CHANNELS: PairingChannel[] = listPairingChannels();
 
-function parseProvider(raw: unknown): PairingProvider {
-  const value = (
-    typeof raw === "string"
-      ? raw
-      : typeof raw === "number" || typeof raw === "boolean"
-        ? String(raw)
-        : ""
-  )
-    .trim()
-    .toLowerCase();
-  if ((PROVIDERS as string[]).includes(value)) return value as PairingProvider;
-  throw new Error(
-    `Invalid provider: ${value || "(empty)"} (expected one of: ${PROVIDERS.join(", ")})`,
-  );
+function parseChannel(raw: unknown): PairingChannel {
+  return resolvePairingChannel(raw);
 }
 
-async function notifyApproved(provider: PairingProvider, id: string) {
-  const message =
-    "✅ Clawdbot access approved. Send a message to start chatting.";
-  if (provider === "telegram") {
-    const cfg = loadConfig();
-    const { token } = resolveTelegramToken(cfg);
-    if (!token) throw new Error("telegram token not configured");
-    await sendMessageTelegram(id, message, { token });
-    return;
-  }
-  if (provider === "discord") {
-    await sendMessageDiscord(`user:${id}`, message);
-    return;
-  }
-  if (provider === "slack") {
-    await sendMessageSlack(`user:${id}`, message);
-    return;
-  }
-  if (provider === "signal") {
-    await sendMessageSignal(id, message);
-    return;
-  }
-  if (provider === "imessage") {
-    await sendMessageIMessage(id, message);
-    return;
-  }
-  if (provider === "msteams") {
-    const cfg = loadConfig();
-    await sendMessageMSTeams({ cfg, to: id, text: message });
-    return;
-  }
-  // WhatsApp: approval still works (store); notifying requires an active web session.
+async function notifyApproved(channel: PairingChannel, id: string) {
+  const cfg = loadConfig();
+  await notifyPairingApproved({ channelId: channel, id, cfg });
 }
 
 export function registerPairingCli(program: Command) {
@@ -83,25 +31,29 @@ export function registerPairingCli(program: Command) {
   pairing
     .command("list")
     .description("List pending pairing requests")
-    .requiredOption(
-      "--provider <provider>",
-      `Provider (${PROVIDERS.join(", ")})`,
-    )
+    .option("--channel <channel>", `Channel (${CHANNELS.join(", ")})`)
+    .argument("[channel]", `Channel (${CHANNELS.join(", ")})`)
     .option("--json", "Print JSON", false)
-    .action(async (opts) => {
-      const provider = parseProvider(opts.provider);
-      const requests = await listProviderPairingRequests(provider);
+    .action(async (channelArg, opts) => {
+      const channelRaw = opts.channel ?? channelArg;
+      if (!channelRaw) {
+        throw new Error(
+          `Channel required. Use --channel <channel> or pass it as the first argument (expected one of: ${CHANNELS.join(", ")})`,
+        );
+      }
+      const channel = parseChannel(channelRaw);
+      const requests = await listChannelPairingRequests(channel);
       if (opts.json) {
-        console.log(JSON.stringify({ provider, requests }, null, 2));
+        console.log(JSON.stringify({ channel, requests }, null, 2));
         return;
       }
       if (requests.length === 0) {
-        console.log(`No pending ${provider} pairing requests.`);
+        console.log(`No pending ${channel} pairing requests.`);
         return;
       }
       for (const r of requests) {
         const meta = r.meta ? JSON.stringify(r.meta) : "";
-        const idLabel = PROVIDER_ID_LABELS[provider];
+        const idLabel = resolvePairingIdLabel(channel);
         console.log(
           `${r.code}  ${idLabel}=${r.id}${meta ? `  meta=${meta}` : ""}  ${r.createdAt}`,
         );
@@ -111,26 +63,38 @@ export function registerPairingCli(program: Command) {
   pairing
     .command("approve")
     .description("Approve a pairing code and allow that sender")
-    .requiredOption(
-      "--provider <provider>",
-      `Provider (${PROVIDERS.join(", ")})`,
-    )
-    .argument("<code>", "Pairing code (shown to the requester)")
-    .option("--notify", "Notify the requester on the same provider", false)
-    .action(async (code, opts) => {
-      const provider = parseProvider(opts.provider);
-      const approved = await approveProviderPairingCode({
-        provider,
-        code: String(code),
+    .option("--channel <channel>", `Channel (${CHANNELS.join(", ")})`)
+    .argument("<codeOrChannel>", "Pairing code (or channel when using 2 args)")
+    .argument("[code]", "Pairing code (when channel is passed as the 1st arg)")
+    .option("--notify", "Notify the requester on the same channel", false)
+    .action(async (codeOrChannel, code, opts) => {
+      const channelRaw = opts.channel ?? codeOrChannel;
+      const resolvedCode = opts.channel ? codeOrChannel : code;
+      if (!opts.channel && !code) {
+        throw new Error(
+          `Usage: clawdbot pairing approve <channel> <code> (or: clawdbot pairing approve --channel <channel> <code>)`,
+        );
+      }
+      if (opts.channel && code != null) {
+        throw new Error(
+          `Too many arguments. Use: clawdbot pairing approve --channel <channel> <code>`,
+        );
+      }
+      const channel = parseChannel(channelRaw);
+      const approved = await approveChannelPairingCode({
+        channel,
+        code: String(resolvedCode),
       });
       if (!approved) {
-        throw new Error(`No pending pairing request found for code: ${code}`);
+        throw new Error(
+          `No pending pairing request found for code: ${String(resolvedCode)}`,
+        );
       }
 
-      console.log(`Approved ${provider} sender ${approved.id}.`);
+      console.log(`Approved ${channel} sender ${approved.id}.`);
 
       if (!opts.notify) return;
-      await notifyApproved(provider, approved.id).catch((err) => {
+      await notifyApproved(channel, approved.id).catch((err) => {
         console.log(`Failed to notify requester: ${String(err)}`);
       });
     });

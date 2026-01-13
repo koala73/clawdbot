@@ -37,15 +37,16 @@ describe("subagents", () => {
     };
   });
 
-  it("sessions_spawn announces back to the requester group provider", async () => {
+  it("sessions_spawn announces back to the requester group channel", async () => {
     resetSubagentRegistryForTests();
     callGatewayMock.mockReset();
     const calls: Array<{ method?: string; params?: unknown }> = [];
     let agentCallCount = 0;
-    let sendParams: { to?: string; provider?: string; message?: string } = {};
+    let sendParams: { to?: string; channel?: string; message?: string } = {};
     let deletedKey: string | undefined;
     let childRunId: string | undefined;
     let childSessionKey: string | undefined;
+    const waitCalls: Array<{ runId?: string; timeoutMs?: number }> = [];
     const sessionLastAssistantText = new Map<string, string>();
 
     callGatewayMock.mockImplementation(async (opts: unknown) => {
@@ -57,6 +58,7 @@ describe("subagents", () => {
         const params = request.params as {
           message?: string;
           sessionKey?: string;
+          channel?: string;
           timeout?: number;
         };
         const message = params?.message ?? "";
@@ -67,6 +69,7 @@ describe("subagents", () => {
           childRunId = runId;
           childSessionKey = sessionKey;
           sessionLastAssistantText.set(sessionKey, "result");
+          expect(params?.channel).toBe("discord");
           expect(params?.timeout).toBe(1);
         }
         return {
@@ -79,20 +82,9 @@ describe("subagents", () => {
         const params = request.params as
           | { runId?: string; timeoutMs?: number }
           | undefined;
-        if (
-          params?.runId &&
-          params.runId === childRunId &&
-          typeof params.timeoutMs === "number" &&
-          params.timeoutMs > 0
-        ) {
-          throw new Error(
-            "sessions_spawn must not wait for sub-agent completion",
-          );
-        }
-        if (params?.timeoutMs === 0) {
-          return { runId: params?.runId ?? "run-1", status: "timeout" };
-        }
-        return { runId: params?.runId ?? "run-1", status: "ok" };
+        waitCalls.push(params ?? {});
+        const status = params?.runId === childRunId ? "timeout" : "ok";
+        return { runId: params?.runId ?? "run-1", status };
       }
       if (request.method === "chat.history") {
         const params = request.params as { sessionKey?: string } | undefined;
@@ -104,11 +96,11 @@ describe("subagents", () => {
       }
       if (request.method === "send") {
         const params = request.params as
-          | { to?: string; provider?: string; message?: string }
+          | { to?: string; channel?: string; message?: string }
           | undefined;
         sendParams = {
           to: params?.to,
-          provider: params?.provider,
+          channel: params?.channel,
           message: params?.message,
         };
         return { messageId: "m-announce" };
@@ -123,7 +115,7 @@ describe("subagents", () => {
 
     const tool = createClawdbotTools({
       agentSessionKey: "discord:group:req",
-      agentProvider: "discord",
+      agentChannel: "discord",
     }).find((candidate) => candidate.name === "sessions_spawn");
     if (!tool) throw new Error("missing sessions_spawn tool");
 
@@ -152,17 +144,151 @@ describe("subagents", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     await new Promise((resolve) => setTimeout(resolve, 0));
 
+    const childWait = waitCalls.find((call) => call.runId === childRunId);
+    expect(childWait?.timeoutMs).toBe(1000);
     const agentCalls = calls.filter((call) => call.method === "agent");
     expect(agentCalls).toHaveLength(2);
     const first = agentCalls[0]?.params as
-      | { lane?: string; deliver?: boolean; sessionKey?: string }
+      | {
+          lane?: string;
+          deliver?: boolean;
+          sessionKey?: string;
+          channel?: string;
+        }
       | undefined;
     expect(first?.lane).toBe("subagent");
     expect(first?.deliver).toBe(false);
+    expect(first?.channel).toBe("discord");
     expect(first?.sessionKey?.startsWith("agent:main:subagent:")).toBe(true);
     expect(childSessionKey?.startsWith("agent:main:subagent:")).toBe(true);
+    const second = agentCalls[1]?.params as
+      | { channel?: string; deliver?: boolean; lane?: string }
+      | undefined;
+    expect(second?.lane).toBe("nested");
+    expect(second?.deliver).toBe(false);
+    expect(second?.channel).toBe("webchat");
 
-    expect(sendParams.provider).toBe("discord");
+    expect(sendParams.channel).toBe("discord");
+    expect(sendParams.to).toBe("channel:req");
+    expect(sendParams.message ?? "").toContain("announce now");
+    expect(sendParams.message ?? "").toContain("Stats:");
+    expect(deletedKey?.startsWith("agent:main:subagent:")).toBe(true);
+  });
+
+  it("sessions_spawn announces via agent.wait when lifecycle events are missing", async () => {
+    resetSubagentRegistryForTests();
+    callGatewayMock.mockReset();
+    const calls: Array<{ method?: string; params?: unknown }> = [];
+    let agentCallCount = 0;
+    let sendParams: { to?: string; channel?: string; message?: string } = {};
+    let deletedKey: string | undefined;
+    let childRunId: string | undefined;
+    let childSessionKey: string | undefined;
+    const waitCalls: Array<{ runId?: string; timeoutMs?: number }> = [];
+    const sessionLastAssistantText = new Map<string, string>();
+
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string; params?: unknown };
+      calls.push(request);
+      if (request.method === "agent") {
+        agentCallCount += 1;
+        const runId = `run-${agentCallCount}`;
+        const params = request.params as {
+          message?: string;
+          sessionKey?: string;
+          channel?: string;
+          timeout?: number;
+        };
+        const message = params?.message ?? "";
+        const sessionKey = params?.sessionKey ?? "";
+        if (message === "Sub-agent announce step.") {
+          sessionLastAssistantText.set(sessionKey, "announce now");
+        } else {
+          childRunId = runId;
+          childSessionKey = sessionKey;
+          sessionLastAssistantText.set(sessionKey, "result");
+          expect(params?.channel).toBe("discord");
+          expect(params?.timeout).toBe(1);
+        }
+        return {
+          runId,
+          status: "accepted",
+          acceptedAt: 2000 + agentCallCount,
+        };
+      }
+      if (request.method === "agent.wait") {
+        const params = request.params as
+          | { runId?: string; timeoutMs?: number }
+          | undefined;
+        waitCalls.push(params ?? {});
+        return {
+          runId: params?.runId ?? "run-1",
+          status: "ok",
+          startedAt: 3000,
+          endedAt: 4000,
+        };
+      }
+      if (request.method === "chat.history") {
+        const params = request.params as { sessionKey?: string } | undefined;
+        const text =
+          sessionLastAssistantText.get(params?.sessionKey ?? "") ?? "";
+        return {
+          messages: [{ role: "assistant", content: [{ type: "text", text }] }],
+        };
+      }
+      if (request.method === "send") {
+        const params = request.params as
+          | { to?: string; channel?: string; message?: string }
+          | undefined;
+        sendParams = {
+          to: params?.to,
+          channel: params?.channel,
+          message: params?.message,
+        };
+        return { messageId: "m-announce" };
+      }
+      if (request.method === "sessions.delete") {
+        const params = request.params as { key?: string } | undefined;
+        deletedKey = params?.key;
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const tool = createClawdbotTools({
+      agentSessionKey: "discord:group:req",
+      agentChannel: "discord",
+    }).find((candidate) => candidate.name === "sessions_spawn");
+    if (!tool) throw new Error("missing sessions_spawn tool");
+
+    const result = await tool.execute("call1b", {
+      task: "do thing",
+      runTimeoutSeconds: 1,
+      cleanup: "delete",
+    });
+    expect(result.details).toMatchObject({
+      status: "accepted",
+      runId: "run-1",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const childWait = waitCalls.find((call) => call.runId === childRunId);
+    expect(childWait?.timeoutMs).toBe(1000);
+    expect(childSessionKey?.startsWith("agent:main:subagent:")).toBe(true);
+
+    const agentCalls = calls.filter((call) => call.method === "agent");
+    expect(agentCalls).toHaveLength(2);
+    const second = agentCalls[1]?.params as
+      | { channel?: string; deliver?: boolean; lane?: string }
+      | undefined;
+    expect(second?.lane).toBe("nested");
+    expect(second?.deliver).toBe(false);
+    expect(second?.channel).toBe("webchat");
+
+    expect(sendParams.channel).toBe("discord");
     expect(sendParams.to).toBe("channel:req");
     expect(sendParams.message ?? "").toContain("announce now");
     expect(sendParams.message ?? "").toContain("Stats:");
@@ -174,9 +300,10 @@ describe("subagents", () => {
     callGatewayMock.mockReset();
     const calls: Array<{ method?: string; params?: unknown }> = [];
     let agentCallCount = 0;
-    let sendParams: { to?: string; provider?: string; message?: string } = {};
+    let sendParams: { to?: string; channel?: string; message?: string } = {};
     let childRunId: string | undefined;
     let childSessionKey: string | undefined;
+    const waitCalls: Array<{ runId?: string; timeoutMs?: number }> = [];
     const sessionLastAssistantText = new Map<string, string>();
 
     callGatewayMock.mockImplementation(async (opts: unknown) => {
@@ -187,7 +314,7 @@ describe("subagents", () => {
           sessions: [
             {
               key: "main",
-              lastProvider: "whatsapp",
+              lastChannel: "whatsapp",
               lastTo: "+123",
             },
           ],
@@ -219,10 +346,9 @@ describe("subagents", () => {
         const params = request.params as
           | { runId?: string; timeoutMs?: number }
           | undefined;
-        if (params?.timeoutMs === 0) {
-          return { runId: params?.runId ?? "run-1", status: "timeout" };
-        }
-        return { runId: params?.runId ?? "run-1", status: "ok" };
+        waitCalls.push(params ?? {});
+        const status = params?.runId === childRunId ? "timeout" : "ok";
+        return { runId: params?.runId ?? "run-1", status };
       }
       if (request.method === "chat.history") {
         const params = request.params as { sessionKey?: string } | undefined;
@@ -234,11 +360,11 @@ describe("subagents", () => {
       }
       if (request.method === "send") {
         const params = request.params as
-          | { to?: string; provider?: string; message?: string }
+          | { to?: string; channel?: string; message?: string }
           | undefined;
         sendParams = {
           to: params?.to,
-          provider: params?.provider,
+          channel: params?.channel,
           message: params?.message,
         };
         return { messageId: "m1" };
@@ -251,7 +377,7 @@ describe("subagents", () => {
 
     const tool = createClawdbotTools({
       agentSessionKey: "main",
-      agentProvider: "whatsapp",
+      agentChannel: "whatsapp",
     }).find((candidate) => candidate.name === "sessions_spawn");
     if (!tool) throw new Error("missing sessions_spawn tool");
 
@@ -279,7 +405,9 @@ describe("subagents", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(sendParams.provider).toBe("whatsapp");
+    const childWait = waitCalls.find((call) => call.runId === childRunId);
+    expect(childWait?.timeoutMs).toBe(1000);
+    expect(sendParams.channel).toBe("whatsapp");
     expect(sendParams.to).toBe("+123");
     expect(sendParams.message ?? "").toContain("hello from sub");
     expect(sendParams.message ?? "").toContain("Stats:");
@@ -292,7 +420,7 @@ describe("subagents", () => {
 
     const tool = createClawdbotTools({
       agentSessionKey: "main",
-      agentProvider: "whatsapp",
+      agentChannel: "whatsapp",
     }).find((candidate) => candidate.name === "sessions_spawn");
     if (!tool) throw new Error("missing sessions_spawn tool");
 
@@ -342,7 +470,7 @@ describe("subagents", () => {
 
     const tool = createClawdbotTools({
       agentSessionKey: "main",
-      agentProvider: "whatsapp",
+      agentChannel: "whatsapp",
     }).find((candidate) => candidate.name === "sessions_spawn");
     if (!tool) throw new Error("missing sessions_spawn tool");
 
@@ -394,7 +522,7 @@ describe("subagents", () => {
 
     const tool = createClawdbotTools({
       agentSessionKey: "main",
-      agentProvider: "whatsapp",
+      agentChannel: "whatsapp",
     }).find((candidate) => candidate.name === "sessions_spawn");
     if (!tool) throw new Error("missing sessions_spawn tool");
 
@@ -446,7 +574,7 @@ describe("subagents", () => {
 
     const tool = createClawdbotTools({
       agentSessionKey: "main",
-      agentProvider: "whatsapp",
+      agentChannel: "whatsapp",
     }).find((candidate) => candidate.name === "sessions_spawn");
     if (!tool) throw new Error("missing sessions_spawn tool");
 
@@ -484,7 +612,7 @@ describe("subagents", () => {
 
     const tool = createClawdbotTools({
       agentSessionKey: "main",
-      agentProvider: "whatsapp",
+      agentChannel: "whatsapp",
     }).find((candidate) => candidate.name === "sessions_spawn");
     if (!tool) throw new Error("missing sessions_spawn tool");
 
@@ -520,9 +648,7 @@ describe("subagents", () => {
         };
       }
       if (request.method === "agent.wait") {
-        const params = request.params as { timeoutMs?: number } | undefined;
-        if (params?.timeoutMs === 0) return { status: "timeout" };
-        return { status: "ok" };
+        return { status: "timeout" };
       }
       if (request.method === "sessions.delete") {
         return { ok: true };
@@ -561,6 +687,91 @@ describe("subagents", () => {
     });
   });
 
+  it("sessions_spawn applies default subagent model from defaults config", async () => {
+    resetSubagentRegistryForTests();
+    callGatewayMock.mockReset();
+    configOverride = {
+      session: { mainKey: "main", scope: "per-sender" },
+      agents: { defaults: { subagents: { model: "minimax/MiniMax-M2.1" } } },
+    };
+    const calls: Array<{ method?: string; params?: unknown }> = [];
+
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string; params?: unknown };
+      calls.push(request);
+      if (request.method === "sessions.patch") {
+        return { ok: true };
+      }
+      if (request.method === "agent") {
+        return { runId: "run-default-model", status: "accepted" };
+      }
+      return {};
+    });
+
+    const tool = createClawdbotTools({
+      agentSessionKey: "agent:main:main",
+      agentChannel: "discord",
+    }).find((candidate) => candidate.name === "sessions_spawn");
+    if (!tool) throw new Error("missing sessions_spawn tool");
+
+    const result = await tool.execute("call-default-model", {
+      task: "do thing",
+    });
+    expect(result.details).toMatchObject({
+      status: "accepted",
+      modelApplied: true,
+    });
+
+    const patchCall = calls.find((call) => call.method === "sessions.patch");
+    expect(patchCall?.params).toMatchObject({
+      model: "minimax/MiniMax-M2.1",
+    });
+  });
+
+  it("sessions_spawn prefers per-agent subagent model over defaults", async () => {
+    resetSubagentRegistryForTests();
+    callGatewayMock.mockReset();
+    configOverride = {
+      session: { mainKey: "main", scope: "per-sender" },
+      agents: {
+        defaults: { subagents: { model: "minimax/MiniMax-M2.1" } },
+        list: [{ id: "research", subagents: { model: "opencode/claude" } }],
+      },
+    };
+    const calls: Array<{ method?: string; params?: unknown }> = [];
+
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string; params?: unknown };
+      calls.push(request);
+      if (request.method === "sessions.patch") {
+        return { ok: true };
+      }
+      if (request.method === "agent") {
+        return { runId: "run-agent-model", status: "accepted" };
+      }
+      return {};
+    });
+
+    const tool = createClawdbotTools({
+      agentSessionKey: "agent:research:main",
+      agentChannel: "discord",
+    }).find((candidate) => candidate.name === "sessions_spawn");
+    if (!tool) throw new Error("missing sessions_spawn tool");
+
+    const result = await tool.execute("call-agent-model", {
+      task: "do thing",
+    });
+    expect(result.details).toMatchObject({
+      status: "accepted",
+      modelApplied: true,
+    });
+
+    const patchCall = calls.find((call) => call.method === "sessions.patch");
+    expect(patchCall?.params).toMatchObject({
+      model: "opencode/claude",
+    });
+  });
+
   it("sessions_spawn skips invalid model overrides and continues", async () => {
     resetSubagentRegistryForTests();
     callGatewayMock.mockReset();
@@ -583,9 +794,7 @@ describe("subagents", () => {
         };
       }
       if (request.method === "agent.wait") {
-        const params = request.params as { timeoutMs?: number } | undefined;
-        if (params?.timeoutMs === 0) return { status: "timeout" };
-        return { status: "ok" };
+        return { status: "timeout" };
       }
       if (request.method === "sessions.delete") {
         return { ok: true };
@@ -595,7 +804,7 @@ describe("subagents", () => {
 
     const tool = createClawdbotTools({
       agentSessionKey: "main",
-      agentProvider: "whatsapp",
+      agentChannel: "whatsapp",
     }).find((candidate) => candidate.name === "sessions_spawn");
     if (!tool) throw new Error("missing sessions_spawn tool");
 
@@ -631,7 +840,7 @@ describe("subagents", () => {
 
     const tool = createClawdbotTools({
       agentSessionKey: "main",
-      agentProvider: "whatsapp",
+      agentChannel: "whatsapp",
     }).find((candidate) => candidate.name === "sessions_spawn");
     if (!tool) throw new Error("missing sessions_spawn tool");
 

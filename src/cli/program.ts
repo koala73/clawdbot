@@ -1,18 +1,27 @@
 import { Command } from "commander";
+import { listChannelPlugins } from "../channels/plugins/index.js";
+import { DEFAULT_CHAT_CHANNEL } from "../channels/registry.js";
 import { agentCliCommand } from "../commands/agent-via-gateway.js";
 import {
   agentsAddCommand,
   agentsDeleteCommand,
   agentsListCommand,
 } from "../commands/agents.js";
-import { configureCommand } from "../commands/configure.js";
+import {
+  CONFIGURE_WIZARD_SECTIONS,
+  configureCommand,
+  configureCommandWithSections,
+} from "../commands/configure.js";
+import { dashboardCommand } from "../commands/dashboard.js";
 import { doctorCommand } from "../commands/doctor.js";
 import { healthCommand } from "../commands/health.js";
 import { messageCommand } from "../commands/message.js";
 import { onboardCommand } from "../commands/onboard.js";
+import { resetCommand } from "../commands/reset.js";
 import { sessionsCommand } from "../commands/sessions.js";
 import { setupCommand } from "../commands/setup.js";
 import { statusCommand } from "../commands/status.js";
+import { uninstallCommand } from "../commands/uninstall.js";
 import {
   isNixMode,
   loadConfig,
@@ -22,15 +31,18 @@ import {
 } from "../config/config.js";
 import { danger, setVerbose } from "../globals.js";
 import { autoMigrateLegacyState } from "../infra/state-migrations.js";
+import { registerPluginCliCommands } from "../plugins/cli.js";
 import { defaultRuntime } from "../runtime.js";
+import { formatDocsLink } from "../terminal/links.js";
 import { isRich, theme } from "../terminal/theme.js";
 import { VERSION } from "../version.js";
 import {
   emitCliBanner,
-  formatCliBannerArt,
   formatCliBannerLine,
+  hasEmittedCliBanner,
 } from "./banner.js";
 import { registerBrowserCli } from "./browser-cli.js";
+import { registerChannelsCli } from "./channels-cli.js";
 import { hasExplicitOptions } from "./command-options.js";
 import { registerCronCli } from "./cron-cli.js";
 import { registerDaemonCli } from "./daemon-cli.js";
@@ -40,15 +52,16 @@ import { registerDocsCli } from "./docs-cli.js";
 import { registerGatewayCli } from "./gateway-cli.js";
 import { registerHooksCli } from "./hooks-cli.js";
 import { registerLogsCli } from "./logs-cli.js";
+import { registerMemoryCli } from "./memory-cli.js";
 import { registerModelsCli } from "./models-cli.js";
 import { registerNodesCli } from "./nodes-cli.js";
 import { registerPairingCli } from "./pairing-cli.js";
+import { registerPluginsCli } from "./plugins-cli.js";
 import { forceFreePort } from "./ports.js";
-import { runProviderLogin, runProviderLogout } from "./provider-auth.js";
-import { registerProvidersCli } from "./providers-cli.js";
 import { registerSandboxCli } from "./sandbox-cli.js";
 import { registerSkillsCli } from "./skills-cli.js";
 import { registerTuiCli } from "./tui-cli.js";
+import { registerUpdateCli } from "./update-cli.js";
 
 export { forceFreePort };
 
@@ -59,6 +72,9 @@ function collectOption(value: string, previous: string[] = []): string[] {
 export function buildProgram() {
   const program = new Command();
   const PROGRAM_VERSION = VERSION;
+  const channelOptions = listChannelPlugins().map((plugin) => plugin.id);
+  const messageChannelOptions = channelOptions.join("|");
+  const agentChannelOptions = ["last", ...channelOptions].join("|");
 
   program
     .name("clawdbot")
@@ -102,10 +118,10 @@ export function buildProgram() {
   }
 
   program.addHelpText("beforeAll", () => {
+    if (hasEmittedCliBanner()) return "";
     const rich = isRich();
-    const art = formatCliBannerArt({ richTty: rich });
     const line = formatCliBannerLine(PROGRAM_VERSION, { richTty: rich });
-    return `\n${art}\n${line}\n`;
+    return `\n${line}\n`;
   });
 
   program.hook("preAction", async (_thisCommand, actionCommand) => {
@@ -150,7 +166,7 @@ export function buildProgram() {
   });
   const examples = [
     [
-      "clawdbot providers login --verbose",
+      "clawdbot channels login --verbose",
       "Link personal WhatsApp Web and show QR + connection logs.",
     ],
     [
@@ -172,7 +188,7 @@ export function buildProgram() {
       "Talk directly to the agent using the Gateway; optionally send the WhatsApp reply.",
     ],
     [
-      'clawdbot message send --provider telegram --to @mychat --message "Hi"',
+      'clawdbot message send --channel telegram --to @mychat --message "Hi"',
       "Send via your Telegram bot.",
     ],
   ] as const;
@@ -181,10 +197,12 @@ export function buildProgram() {
     .map(([cmd, desc]) => `  ${theme.command(cmd)}\n    ${theme.muted(desc)}`)
     .join("\n");
 
-  program.addHelpText(
-    "afterAll",
-    `\n${theme.heading("Examples:")}\n${fmtExamples}\n`,
-  );
+  program.addHelpText("afterAll", () => {
+    const docs = formatDocsLink("/cli", "docs.clawd.bot/cli");
+    return `\n${theme.heading("Examples:")}\n${fmtExamples}\n\n${theme.muted(
+      "Docs:",
+    )} ${docs}\n`;
+  });
 
   program
     .command("setup")
@@ -236,11 +254,16 @@ export function buildProgram() {
       "Interactive wizard to set up the gateway, workspace, and skills",
     )
     .option("--workspace <dir>", "Agent workspace directory (default: ~/clawd)")
+    .option(
+      "--reset",
+      "Reset config + credentials + sessions + workspace before running wizard",
+    )
     .option("--non-interactive", "Run without prompts", false)
+    .option("--flow <flow>", "Wizard flow: quickstart|advanced")
     .option("--mode <mode>", "Wizard mode: local|remote")
     .option(
       "--auth-choice <choice>",
-      "Auth: setup-token|claude-cli|token|openai-codex|openai-api-key|codex-cli|antigravity|gemini-api-key|apiKey|minimax-cloud|minimax|skip",
+      "Auth: setup-token|claude-cli|token|chutes|openai-codex|openai-api-key|openrouter-api-key|moonshot-api-key|synthetic-api-key|codex-cli|antigravity|gemini-api-key|zai-api-key|apiKey|minimax-api|minimax-api-lightning|opencode-zen|skip",
     )
     .option(
       "--token-provider <id>",
@@ -260,10 +283,15 @@ export function buildProgram() {
     )
     .option("--anthropic-api-key <key>", "Anthropic API key")
     .option("--openai-api-key <key>", "OpenAI API key")
+    .option("--openrouter-api-key <key>", "OpenRouter API key")
+    .option("--moonshot-api-key <key>", "Moonshot API key")
     .option("--gemini-api-key <key>", "Gemini API key")
+    .option("--zai-api-key <key>", "Z.AI API key")
     .option("--minimax-api-key <key>", "MiniMax API key")
+    .option("--synthetic-api-key <key>", "Synthetic API key")
+    .option("--opencode-zen-api-key <key>", "OpenCode Zen API key")
     .option("--gateway-port <port>", "Gateway port")
-    .option("--gateway-bind <mode>", "Gateway bind: loopback|lan|tailnet|auto")
+    .option("--gateway-bind <mode>", "Gateway bind: loopback|lan|auto|custom")
     .option("--gateway-auth <mode>", "Gateway auth: off|token|password")
     .option("--gateway-token <token>", "Gateway token (token auth)")
     .option("--gateway-password <password>", "Gateway password (password auth)")
@@ -272,31 +300,52 @@ export function buildProgram() {
     .option("--tailscale <mode>", "Tailscale: off|serve|funnel")
     .option("--tailscale-reset-on-exit", "Reset tailscale serve/funnel on exit")
     .option("--install-daemon", "Install gateway daemon")
+    .option("--no-install-daemon", "Skip gateway daemon install")
+    .option("--skip-daemon", "Skip gateway daemon install")
     .option("--daemon-runtime <runtime>", "Daemon runtime: node|bun")
+    .option("--skip-channels", "Skip channel setup")
     .option("--skip-skills", "Skip skills setup")
     .option("--skip-health", "Skip health check")
+    .option("--skip-ui", "Skip Control UI/TUI prompts")
     .option("--node-manager <name>", "Node manager for skills: npm|pnpm|bun")
     .option("--json", "Output JSON summary", false)
-    .action(async (opts) => {
+    .action(async (opts, command) => {
       try {
+        const installDaemon =
+          typeof command?.getOptionValueSource === "function"
+            ? command.getOptionValueSource("skipDaemon") === "cli"
+              ? false
+              : command.getOptionValueSource("installDaemon") === "cli"
+                ? Boolean(opts.installDaemon)
+                : undefined
+            : undefined;
         await onboardCommand(
           {
             workspace: opts.workspace as string | undefined,
             nonInteractive: Boolean(opts.nonInteractive),
+            flow: opts.flow as "quickstart" | "advanced" | undefined,
             mode: opts.mode as "local" | "remote" | undefined,
             authChoice: opts.authChoice as
               | "oauth"
               | "setup-token"
               | "claude-cli"
               | "token"
+              | "chutes"
               | "openai-codex"
               | "openai-api-key"
+              | "openrouter-api-key"
+              | "moonshot-api-key"
+              | "synthetic-api-key"
               | "codex-cli"
               | "antigravity"
               | "gemini-api-key"
+              | "zai-api-key"
               | "apiKey"
               | "minimax-cloud"
+              | "minimax-api"
+              | "minimax-api-lightning"
               | "minimax"
+              | "opencode-zen"
               | "skip"
               | undefined,
             tokenProvider: opts.tokenProvider as string | undefined,
@@ -305,8 +354,13 @@ export function buildProgram() {
             tokenExpiresIn: opts.tokenExpiresIn as string | undefined,
             anthropicApiKey: opts.anthropicApiKey as string | undefined,
             openaiApiKey: opts.openaiApiKey as string | undefined,
+            openrouterApiKey: opts.openrouterApiKey as string | undefined,
+            moonshotApiKey: opts.moonshotApiKey as string | undefined,
             geminiApiKey: opts.geminiApiKey as string | undefined,
+            zaiApiKey: opts.zaiApiKey as string | undefined,
             minimaxApiKey: opts.minimaxApiKey as string | undefined,
+            syntheticApiKey: opts.syntheticApiKey as string | undefined,
+            opencodeZenApiKey: opts.opencodeZenApiKey as string | undefined,
             gatewayPort:
               typeof opts.gatewayPort === "string"
                 ? Number.parseInt(opts.gatewayPort, 10)
@@ -314,8 +368,8 @@ export function buildProgram() {
             gatewayBind: opts.gatewayBind as
               | "loopback"
               | "lan"
-              | "tailnet"
               | "auto"
+              | "custom"
               | undefined,
             gatewayAuth: opts.gatewayAuth as
               | "off"
@@ -328,10 +382,12 @@ export function buildProgram() {
             remoteToken: opts.remoteToken as string | undefined,
             tailscale: opts.tailscale as "off" | "serve" | "funnel" | undefined,
             tailscaleResetOnExit: Boolean(opts.tailscaleResetOnExit),
-            installDaemon: Boolean(opts.installDaemon),
+            installDaemon,
             daemonRuntime: opts.daemonRuntime as "node" | "bun" | undefined,
+            skipChannels: Boolean(opts.skipChannels),
             skipSkills: Boolean(opts.skipSkills),
             skipHealth: Boolean(opts.skipHealth),
+            skipUi: Boolean(opts.skipUi),
             nodeManager: opts.nodeManager as "npm" | "pnpm" | "bun" | undefined,
             json: Boolean(opts.json),
           },
@@ -347,11 +403,40 @@ export function buildProgram() {
     .command("configure")
     .alias("config")
     .description(
-      "Interactive wizard to update models, providers, skills, and gateway",
+      "Interactive wizard to update models, channels, skills, and gateway",
     )
-    .action(async () => {
+    .option(
+      "--section <name>",
+      `Configure only one section (repeatable). One of: ${CONFIGURE_WIZARD_SECTIONS.join(", ")}`,
+      (value, previous: string[]) => [...previous, value],
+      [] as string[],
+    )
+    .action(async (opts) => {
       try {
-        await configureCommand(defaultRuntime);
+        const sections: string[] = Array.isArray(opts.section)
+          ? opts.section
+              .map((value: unknown) =>
+                typeof value === "string" ? value.trim() : "",
+              )
+              .filter(Boolean)
+          : [];
+        if (sections.length === 0) {
+          await configureCommand(defaultRuntime);
+          return;
+        }
+
+        const invalid = sections.filter(
+          (s) => !CONFIGURE_WIZARD_SECTIONS.includes(s as never),
+        );
+        if (invalid.length > 0) {
+          defaultRuntime.error(
+            `Invalid --section: ${invalid.join(", ")}. Expected one of: ${CONFIGURE_WIZARD_SECTIONS.join(", ")}.`,
+          );
+          defaultRuntime.exit(1);
+          return;
+        }
+
+        await configureCommandWithSections(sections as never, defaultRuntime);
       } catch (err) {
         defaultRuntime.error(String(err));
         defaultRuntime.exit(1);
@@ -360,7 +445,7 @@ export function buildProgram() {
 
   program
     .command("doctor")
-    .description("Health checks + quick fixes for the gateway and providers")
+    .description("Health checks + quick fixes for the gateway and channels")
     .option(
       "--no-workspace-suggestions",
       "Disable workspace memory system suggestions",
@@ -378,6 +463,11 @@ export function buildProgram() {
       "Run without prompts (safe migrations only)",
       false,
     )
+    .option(
+      "--generate-gateway-token",
+      "Generate and configure a gateway token",
+      false,
+    )
     .option("--deep", "Scan system services for extra gateway installs", false)
     .action(async (opts) => {
       try {
@@ -387,6 +477,7 @@ export function buildProgram() {
           repair: Boolean(opts.repair),
           force: Boolean(opts.force),
           nonInteractive: Boolean(opts.nonInteractive),
+          generateGatewayToken: Boolean(opts.generateGatewayToken),
           deep: Boolean(opts.deep),
         });
       } catch (err) {
@@ -395,60 +486,95 @@ export function buildProgram() {
       }
     });
 
-  // Deprecated hidden aliases: use `clawdbot providers login/logout`. Remove in a future major.
   program
-    .command("login", { hidden: true })
-    .description("Link your personal WhatsApp via QR (web provider)")
-    .option("--verbose", "Verbose connection logs", false)
-    .option("--provider <provider>", "Provider alias (default: whatsapp)")
-    .option("--account <id>", "WhatsApp account id (accountId)")
+    .command("dashboard")
+    .description("Open the Control UI with your current token")
+    .option("--no-open", "Print URL but do not launch a browser", false)
     .action(async (opts) => {
       try {
-        await runProviderLogin(
-          {
-            provider: opts.provider as string | undefined,
-            account: opts.account as string | undefined,
-            verbose: Boolean(opts.verbose),
-          },
-          defaultRuntime,
-        );
+        await dashboardCommand(defaultRuntime, {
+          noOpen: Boolean(opts.noOpen),
+        });
       } catch (err) {
-        defaultRuntime.error(danger(`Web login failed: ${String(err)}`));
+        defaultRuntime.error(String(err));
         defaultRuntime.exit(1);
       }
     });
 
   program
-    .command("logout", { hidden: true })
-    .description("Log out of WhatsApp Web (keeps config)")
-    .option("--provider <provider>", "Provider alias (default: whatsapp)")
-    .option("--account <id>", "WhatsApp account id (accountId)")
+    .command("reset")
+    .description("Reset local config/state (keeps the CLI installed)")
+    .option(
+      "--scope <scope>",
+      "config|config+creds+sessions|full (default: interactive prompt)",
+    )
+    .option("--yes", "Skip confirmation prompts", false)
+    .option(
+      "--non-interactive",
+      "Disable prompts (requires --scope + --yes)",
+      false,
+    )
+    .option("--dry-run", "Print actions without removing files", false)
     .action(async (opts) => {
       try {
-        await runProviderLogout(
-          {
-            provider: opts.provider as string | undefined,
-            account: opts.account as string | undefined,
-          },
-          defaultRuntime,
-        );
+        await resetCommand(defaultRuntime, {
+          scope: opts.scope,
+          yes: Boolean(opts.yes),
+          nonInteractive: Boolean(opts.nonInteractive),
+          dryRun: Boolean(opts.dryRun),
+        });
       } catch (err) {
-        defaultRuntime.error(danger(`Logout failed: ${String(err)}`));
+        defaultRuntime.error(String(err));
+        defaultRuntime.exit(1);
+      }
+    });
+
+  program
+    .command("uninstall")
+    .description("Uninstall the gateway service + local data (CLI remains)")
+    .option("--service", "Remove the gateway service", false)
+    .option("--state", "Remove state + config", false)
+    .option("--workspace", "Remove workspace dirs", false)
+    .option("--app", "Remove the macOS app", false)
+    .option("--all", "Remove service + state + workspace + app", false)
+    .option("--yes", "Skip confirmation prompts", false)
+    .option("--non-interactive", "Disable prompts (requires --yes)", false)
+    .option("--dry-run", "Print actions without removing files", false)
+    .action(async (opts) => {
+      try {
+        await uninstallCommand(defaultRuntime, {
+          service: Boolean(opts.service),
+          state: Boolean(opts.state),
+          workspace: Boolean(opts.workspace),
+          app: Boolean(opts.app),
+          all: Boolean(opts.all),
+          yes: Boolean(opts.yes),
+          nonInteractive: Boolean(opts.nonInteractive),
+          dryRun: Boolean(opts.dryRun),
+        });
+      } catch (err) {
+        defaultRuntime.error(String(err));
         defaultRuntime.exit(1);
       }
     });
 
   const message = program
     .command("message")
-    .description("Send messages and provider actions")
+    .description("Send messages and channel actions")
     .addHelpText(
       "after",
-      `
+      () =>
+        `
 Examples:
   clawdbot message send --to +15555550123 --message "Hi"
   clawdbot message send --to +15555550123 --message "Hi" --media photo.jpg
-  clawdbot message poll --provider discord --to channel:123 --poll-question "Snack?" --poll-option Pizza --poll-option Sushi
-  clawdbot message react --provider discord --to 123 --message-id 456 --emoji "✅"`,
+  clawdbot message poll --channel discord --to channel:123 --poll-question "Snack?" --poll-option Pizza --poll-option Sushi
+  clawdbot message react --channel discord --to 123 --message-id 456 --emoji "✅"
+
+${theme.muted("Docs:")} ${formatDocsLink(
+          "/cli/message",
+          "docs.clawd.bot/cli/message",
+        )}`,
     )
     .action(() => {
       message.help({ error: true });
@@ -456,11 +582,8 @@ Examples:
 
   const withMessageBase = (command: Command) =>
     command
-      .option(
-        "--provider <provider>",
-        "Provider: whatsapp|telegram|discord|slack|signal|imessage",
-      )
-      .option("--account <id>", "Provider account id")
+      .option("--channel <channel>", `Channel: ${messageChannelOptions}`)
+      .option("--account <id>", "Channel account id (accountId)")
       .option("--json", "Output result as JSON", false)
       .option("--dry-run", "Print payload and skip sending", false)
       .option("--verbose", "Verbose logging", false);
@@ -485,15 +608,20 @@ Examples:
     try {
       await messageCommand(
         {
-          ...opts,
+          ...(() => {
+            const { account, ...rest } = opts;
+            return {
+              ...rest,
+              accountId: typeof account === "string" ? account : undefined,
+            };
+          })(),
           action,
-          account: opts.account as string | undefined,
         },
         deps,
         defaultRuntime,
       );
     } catch (err) {
-      defaultRuntime.error(String(err));
+      defaultRuntime.error(danger(String(err)));
       defaultRuntime.exit(1);
     }
   };
@@ -508,6 +636,10 @@ Examples:
       .option(
         "--media <path-or-url>",
         "Attach media (image/audio/video/document). Accepts local paths or URLs.",
+      )
+      .option(
+        "--buttons <json>",
+        "Telegram inline keyboard buttons as JSON (array of button rows)",
       )
       .option("--reply-to <id>", "Reply-to message id")
       .option("--thread-id <id>", "Thread id (Telegram forum thread)")
@@ -921,17 +1053,17 @@ Examples:
     )
     .option("--verbose <on|off>", "Persist agent verbose level for the session")
     .option(
-      "--provider <provider>",
-      "Delivery provider: whatsapp|telegram|discord|slack|signal|imessage (default: whatsapp)",
+      "--channel <channel>",
+      `Delivery channel: ${agentChannelOptions} (default: ${DEFAULT_CHAT_CHANNEL})`,
     )
     .option(
       "--local",
-      "Run the embedded agent locally (requires provider API keys in your shell)",
+      "Run the embedded agent locally (requires model provider API keys in your shell)",
       false,
     )
     .option(
       "--deliver",
-      "Send the agent's reply back to the selected provider (requires --to)",
+      "Send the agent's reply back to the selected channel (requires --to)",
       false,
     )
     .option("--json", "Output result as JSON", false)
@@ -941,13 +1073,18 @@ Examples:
     )
     .addHelpText(
       "after",
-      `
+      () =>
+        `
 Examples:
   clawdbot agent --to +15555550123 --message "status update"
   clawdbot agent --session-id 1234 --message "Summarize inbox" --thinking medium
   clawdbot agent --to +15555550123 --message "Trace logs" --verbose on --json
   clawdbot agent --to +15555550123 --message "Summon reply" --deliver
-`,
+
+${theme.muted("Docs:")} ${formatDocsLink(
+          "/agent-send",
+          "docs.clawd.bot/agent-send",
+        )}`,
     )
     .action(async (opts) => {
       const verboseLevel =
@@ -991,8 +1128,8 @@ Examples:
     .option("--model <id>", "Model id for this agent")
     .option("--agent-dir <dir>", "Agent state directory for this agent")
     .option(
-      "--bind <provider[:accountId]>",
-      "Route provider binding (repeatable)",
+      "--bind <channel[:accountId]>",
+      "Route channel binding (repeatable)",
       collectOption,
       [],
     )
@@ -1061,6 +1198,7 @@ Examples:
   registerDaemonCli(program);
   registerGatewayCli(program);
   registerLogsCli(program);
+  registerMemoryCli(program);
   registerModelsCli(program);
   registerNodesCli(program);
   registerSandboxCli(program);
@@ -1070,17 +1208,21 @@ Examples:
   registerDocsCli(program);
   registerHooksCli(program);
   registerPairingCli(program);
-  registerProvidersCli(program);
+  registerPluginsCli(program);
+  registerChannelsCli(program);
   registerSkillsCli(program);
+  registerUpdateCli(program);
+  registerPluginCliCommands(program, loadConfig());
 
   program
     .command("status")
-    .description("Show web session health and recent session recipients")
+    .description("Show channel health and recent session recipients")
     .option("--json", "Output JSON instead of text", false)
-    .option("--usage", "Show provider usage/quota snapshots", false)
+    .option("--all", "Full diagnosis (read-only, pasteable)", false)
+    .option("--usage", "Show model provider usage/quota snapshots", false)
     .option(
       "--deep",
-      "Probe providers (WhatsApp Web + Telegram + Discord + Slack + Signal)",
+      "Probe channels (WhatsApp Web + Telegram + Discord + Slack + Signal)",
       false,
     )
     .option("--timeout <ms>", "Probe timeout in milliseconds", "10000")
@@ -1091,11 +1233,12 @@ Examples:
       `
 Examples:
   clawdbot status                   # show linked account + session store summary
+  clawdbot status --all             # full diagnosis (read-only)
   clawdbot status --json            # machine-readable output
-  clawdbot status --usage           # show provider usage/quota snapshots
-  clawdbot status --deep            # run provider probes (WA + Telegram + Discord + Slack + Signal)
+  clawdbot status --usage           # show model provider usage/quota snapshots
+  clawdbot status --deep            # run channel probes (WA + Telegram + Discord + Slack + Signal)
   clawdbot status --deep --timeout 5000 # tighten probe timeout
-  clawdbot providers status         # gateway provider runtime + probes`,
+  clawdbot channels status          # gateway channel runtime + probes`,
     )
     .action(async (opts) => {
       const verbose = Boolean(opts.verbose || opts.debug);
@@ -1114,6 +1257,7 @@ Examples:
         await statusCommand(
           {
             json: Boolean(opts.json),
+            all: Boolean(opts.all),
             deep: Boolean(opts.deep),
             usage: Boolean(opts.usage),
             timeoutMs: timeout,

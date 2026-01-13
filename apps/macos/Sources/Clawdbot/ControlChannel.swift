@@ -108,6 +108,7 @@ final class ControlChannel {
                 self.logger.info(
                     "control channel configure mode=remote " +
                         "target=\(target, privacy: .public) identitySet=\(idSet, privacy: .public)")
+                self.state = .connecting
                 _ = try await GatewayEndpointStore.shared.ensureRemoteControlTunnel()
                 await self.configure()
             } catch {
@@ -182,7 +183,7 @@ final class ControlChannel {
         {
             let reason = urlErr.failureURLString ?? urlErr.localizedDescription
             return
-                "Gateway rejected token; set CLAWDBOT_GATEWAY_TOKEN in the mac app environment " +
+                "Gateway rejected token; set gateway.auth.token (or CLAWDBOT_GATEWAY_TOKEN) " +
                 "or clear it on the gateway. " +
                 "Reason: \(reason)"
         }
@@ -211,12 +212,6 @@ final class ControlChannel {
                 return "Gateway connection was closed; start the gateway (localhost:\(port)) and retry."
             case .cannotFindHost, .cannotConnectToHost:
                 let isRemote = CommandResolver.connectionModeIsRemote()
-                if AppStateStore.attachExistingGatewayOnly, !isRemote {
-                    return """
-                    Cannot reach gateway at localhost:\(port) and “Attach existing gateway only” is enabled.
-                    Disable it in Debug Settings or start a gateway on that port.
-                    """
-                }
                 if isRemote {
                     return """
                     Cannot reach gateway at localhost:\(port).

@@ -23,9 +23,10 @@ vi.mock("../config/sessions.js", () => ({
   loadSessionStore: () => testStore,
 }));
 
-vi.mock("../web/session.js", () => ({
+vi.mock("../web/auth-store.js", () => ({
   webAuthExists: vi.fn(async () => true),
   getWebAuthAgeMs: vi.fn(() => 1234),
+  readWebSelfId: vi.fn(() => ({ e164: null, jid: null })),
   logWebSelfId: vi.fn(),
 }));
 
@@ -49,16 +50,22 @@ describe("getHealthSnapshot", () => {
     };
     vi.stubEnv("TELEGRAM_BOT_TOKEN", "");
     vi.stubEnv("DISCORD_BOT_TOKEN", "");
-    const snap = (await getHealthSnapshot(10)) satisfies HealthSummary;
+    const snap = (await getHealthSnapshot({
+      timeoutMs: 10,
+    })) satisfies HealthSummary;
     expect(snap.ok).toBe(true);
-    expect(snap.telegram.configured).toBe(false);
-    expect(snap.telegram.probe).toBeUndefined();
+    const telegram = snap.channels.telegram as {
+      configured?: boolean;
+      probe?: unknown;
+    };
+    expect(telegram.configured).toBe(false);
+    expect(telegram.probe).toBeUndefined();
     expect(snap.sessions.count).toBe(2);
     expect(snap.sessions.recent[0]?.key).toBe("foo");
   });
 
   it("probes telegram getMe + webhook info when configured", async () => {
-    testConfig = { telegram: { botToken: "t-1" } };
+    testConfig = { channels: { telegram: { botToken: "t-1" } } };
     testStore = {};
     vi.stubEnv("DISCORD_BOT_TOKEN", "");
 
@@ -98,11 +105,19 @@ describe("getHealthSnapshot", () => {
       }),
     );
 
-    const snap = await getHealthSnapshot(25);
-    expect(snap.telegram.configured).toBe(true);
-    expect(snap.telegram.probe?.ok).toBe(true);
-    expect(snap.telegram.probe?.bot?.username).toBe("bot");
-    expect(snap.telegram.probe?.webhook?.url).toMatch(/^https:/);
+    const snap = await getHealthSnapshot({ timeoutMs: 25 });
+    const telegram = snap.channels.telegram as {
+      configured?: boolean;
+      probe?: {
+        ok?: boolean;
+        bot?: { username?: string };
+        webhook?: { url?: string };
+      };
+    };
+    expect(telegram.configured).toBe(true);
+    expect(telegram.probe?.ok).toBe(true);
+    expect(telegram.probe?.bot?.username).toBe("bot");
+    expect(telegram.probe?.webhook?.url).toMatch(/^https:/);
     expect(calls.some((c) => c.includes("/getMe"))).toBe(true);
     expect(calls.some((c) => c.includes("/getWebhookInfo"))).toBe(true);
   });
@@ -111,7 +126,7 @@ describe("getHealthSnapshot", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawdbot-health-"));
     const tokenFile = path.join(tmpDir, "telegram-token");
     fs.writeFileSync(tokenFile, "t-file\n", "utf-8");
-    testConfig = { telegram: { tokenFile } };
+    testConfig = { channels: { telegram: { tokenFile } } };
     testStore = {};
     vi.stubEnv("TELEGRAM_BOT_TOKEN", "");
 
@@ -151,16 +166,20 @@ describe("getHealthSnapshot", () => {
       }),
     );
 
-    const snap = await getHealthSnapshot(25);
-    expect(snap.telegram.configured).toBe(true);
-    expect(snap.telegram.probe?.ok).toBe(true);
+    const snap = await getHealthSnapshot({ timeoutMs: 25 });
+    const telegram = snap.channels.telegram as {
+      configured?: boolean;
+      probe?: { ok?: boolean };
+    };
+    expect(telegram.configured).toBe(true);
+    expect(telegram.probe?.ok).toBe(true);
     expect(calls.some((c) => c.includes("bott-file/getMe"))).toBe(true);
 
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
   it("returns a structured telegram probe error when getMe fails", async () => {
-    testConfig = { telegram: { botToken: "bad-token" } };
+    testConfig = { channels: { telegram: { botToken: "bad-token" } } };
     testStore = {};
     vi.stubEnv("DISCORD_BOT_TOKEN", "");
 
@@ -178,15 +197,19 @@ describe("getHealthSnapshot", () => {
       }),
     );
 
-    const snap = await getHealthSnapshot(25);
-    expect(snap.telegram.configured).toBe(true);
-    expect(snap.telegram.probe?.ok).toBe(false);
-    expect(snap.telegram.probe?.status).toBe(401);
-    expect(snap.telegram.probe?.error).toMatch(/unauthorized/i);
+    const snap = await getHealthSnapshot({ timeoutMs: 25 });
+    const telegram = snap.channels.telegram as {
+      configured?: boolean;
+      probe?: { ok?: boolean; status?: number; error?: string };
+    };
+    expect(telegram.configured).toBe(true);
+    expect(telegram.probe?.ok).toBe(false);
+    expect(telegram.probe?.status).toBe(401);
+    expect(telegram.probe?.error).toMatch(/unauthorized/i);
   });
 
   it("captures unexpected probe exceptions as errors", async () => {
-    testConfig = { telegram: { botToken: "t-err" } };
+    testConfig = { channels: { telegram: { botToken: "t-err" } } };
     testStore = {};
     vi.stubEnv("DISCORD_BOT_TOKEN", "");
 
@@ -197,9 +220,13 @@ describe("getHealthSnapshot", () => {
       }),
     );
 
-    const snap = await getHealthSnapshot(25);
-    expect(snap.telegram.configured).toBe(true);
-    expect(snap.telegram.probe?.ok).toBe(false);
-    expect(snap.telegram.probe?.error).toMatch(/network down/i);
+    const snap = await getHealthSnapshot({ timeoutMs: 25 });
+    const telegram = snap.channels.telegram as {
+      configured?: boolean;
+      probe?: { ok?: boolean; error?: string };
+    };
+    expect(telegram.configured).toBe(true);
+    expect(telegram.probe?.ok).toBe(false);
+    expect(telegram.probe?.error).toMatch(/network down/i);
   });
 });

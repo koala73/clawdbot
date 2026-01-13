@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { resolveMainSessionKeyFromConfig } from "../config/sessions.js";
 import { drainSystemEvents, peekSystemEvents } from "../infra/system-events.js";
 import {
   cronIsolatedRun,
@@ -10,6 +11,8 @@ import {
 } from "./test-helpers.js";
 
 installGatewayTestHooks();
+
+const resolveMainKey = () => resolveMainSessionKeyFromConfig();
 
 describe("gateway server hooks", () => {
   test("hooks wake requires auth", async () => {
@@ -40,7 +43,7 @@ describe("gateway server hooks", () => {
     expect(res.status).toBe(200);
     const events = await waitForSystemEvent();
     expect(events.some((e) => e.includes("Ping"))).toBe(true);
-    drainSystemEvents();
+    drainSystemEvents(resolveMainKey());
     await server.close();
   });
 
@@ -63,7 +66,7 @@ describe("gateway server hooks", () => {
     expect(res.status).toBe(202);
     const events = await waitForSystemEvent();
     expect(events.some((e) => e.includes("Hook Email: done"))).toBe(true);
-    drainSystemEvents();
+    drainSystemEvents(resolveMainKey());
     await server.close();
   });
 
@@ -94,7 +97,7 @@ describe("gateway server hooks", () => {
       job?: { payload?: { model?: string } };
     };
     expect(call?.job?.payload?.model).toBe("openai/gpt-4.1-mini");
-    drainSystemEvents();
+    drainSystemEvents(resolveMainKey());
     await server.close();
   });
 
@@ -113,11 +116,11 @@ describe("gateway server hooks", () => {
     expect(res.status).toBe(200);
     const events = await waitForSystemEvent();
     expect(events.some((e) => e.includes("Query auth"))).toBe(true);
-    drainSystemEvents();
+    drainSystemEvents(resolveMainKey());
     await server.close();
   });
 
-  test("hooks agent rejects invalid provider", async () => {
+  test("hooks agent rejects invalid channel", async () => {
     testState.hooksConfig = { enabled: true, token: "hook-secret" };
     const port = await getFreePort();
     const server = await startGatewayServer(port);
@@ -127,10 +130,10 @@ describe("gateway server hooks", () => {
         "Content-Type": "application/json",
         Authorization: "Bearer hook-secret",
       },
-      body: JSON.stringify({ message: "Nope", provider: "sms" }),
+      body: JSON.stringify({ message: "Nope", channel: "sms" }),
     });
     expect(res.status).toBe(400);
-    expect(peekSystemEvents().length).toBe(0);
+    expect(peekSystemEvents(resolveMainKey()).length).toBe(0);
     await server.close();
   });
 
@@ -149,7 +152,7 @@ describe("gateway server hooks", () => {
     expect(res.status).toBe(200);
     const events = await waitForSystemEvent();
     expect(events.some((e) => e.includes("Header auth"))).toBe(true);
-    drainSystemEvents();
+    drainSystemEvents(resolveMainKey());
     await server.close();
   });
 

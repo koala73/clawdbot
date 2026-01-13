@@ -1,10 +1,13 @@
 import crypto from "node:crypto";
 import {
   resolveAgentDir,
+  resolveAgentModelFallbacksOverride,
+  resolveAgentModelPrimary,
   resolveAgentWorkspaceDir,
 } from "../agents/agent-scope.js";
 import { ensureAuthProfileStore } from "../agents/auth-profiles.js";
-import { runClaudeCliAgent } from "../agents/claude-cli-runner.js";
+import { runCliAgent } from "../agents/cli-runner.js";
+import { getCliSessionId, setCliSessionId } from "../agents/cli-session.js";
 import { lookupContextTokens } from "../agents/context.js";
 import {
   DEFAULT_CONTEXT_TOKENS,
@@ -15,6 +18,7 @@ import { loadModelCatalog } from "../agents/model-catalog.js";
 import { runWithModelFallback } from "../agents/model-fallback.js";
 import {
   buildAllowedModelSet,
+  isCliProvider,
   modelKey,
   resolveConfiguredModelRef,
   resolveThinkingDefault,
@@ -26,12 +30,25 @@ import { hasNonzeroUsage } from "../agents/usage.js";
 import { ensureAgentWorkspace } from "../agents/workspace.js";
 import type { MsgContext } from "../auto-reply/templating.js";
 import {
+  formatThinkingLevels,
+  formatXHighModelHint,
   normalizeThinkLevel,
   normalizeVerboseLevel,
+  supportsXHighThinking,
   type ThinkLevel,
   type VerboseLevel,
 } from "../auto-reply/thinking.js";
-import { type CliDeps, createDefaultDeps } from "../cli/deps.js";
+import {
+  getChannelPlugin,
+  normalizeChannelId,
+} from "../channels/plugins/index.js";
+import type { ChannelOutboundTargetMode } from "../channels/plugins/types.js";
+import { DEFAULT_CHAT_CHANNEL } from "../channels/registry.js";
+import {
+  type CliDeps,
+  createDefaultDeps,
+  createOutboundSendDeps,
+} from "../cli/deps.js";
 import { type ClawdbotConfig, loadConfig } from "../config/config.js";
 import {
   DEFAULT_IDLE_MINUTES,
@@ -56,16 +73,27 @@ import {
   normalizeOutboundPayloadsForJson,
 } from "../infra/outbound/payloads.js";
 import { resolveOutboundTarget } from "../infra/outbound/targets.js";
+import { normalizeMainKey } from "../routing/session-key.js";
 import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
+import { applyVerboseOverride } from "../sessions/level-overrides.js";
 import { resolveSendPolicy } from "../sessions/send-policy.js";
 import {
-  normalizeMessageProvider,
-  resolveMessageProvider,
-} from "../utils/message-provider.js";
-import { normalizeE164 } from "../utils.js";
+  isInternalMessageChannel,
+  resolveGatewayMessageChannel,
+  resolveMessageChannel,
+} from "../utils/message-channel.js";
+
+/** Image content block for Claude API multimodal messages. */
+type ImageContent = {
+  type: "image";
+  data: string;
+  mimeType: string;
+};
 
 type AgentCommandOpts = {
   message: string;
+  /** Optional image attachments for multimodal messages. */
+  images?: ImageContent[];
   to?: string;
   sessionId?: string;
   sessionKey?: string;
@@ -75,9 +103,10 @@ type AgentCommandOpts = {
   json?: boolean;
   timeout?: string;
   deliver?: boolean;
-  /** Message provider context (webchat|voicewake|whatsapp|...). */
-  messageProvider?: string;
-  provider?: string; // delivery provider (whatsapp|telegram|...)
+  /** Message channel context (webchat|voicewake|whatsapp|...). */
+  messageChannel?: string;
+  channel?: string; // delivery channel (whatsapp|telegram|...)
+  deliveryTargetMode?: ChannelOutboundTargetMode;
   bestEffortDeliver?: boolean;
   abortSignal?: AbortSignal;
   lane?: string;
@@ -104,7 +133,7 @@ function resolveSession(opts: {
 }): SessionResolution {
   const sessionCfg = opts.cfg.session;
   const scope = sessionCfg?.scope ?? "per-sender";
-  const mainKey = sessionCfg?.mainKey ?? "main";
+  const mainKey = normalizeMainKey(sessionCfg?.mainKey);
   const idleMinutes = Math.max(
     sessionCfg?.idleMinutes ?? DEFAULT_IDLE_MINUTES,
     1,
@@ -190,21 +219,26 @@ export async function agentCommand(
     ensureBootstrapFiles: !agentCfg?.skipBootstrap,
   });
   const workspaceDir = workspace.dir;
-
-  const allowFrom = (cfg.whatsapp?.allowFrom ?? [])
-    .map((val) => normalizeE164(val))
-    .filter((val) => val.length > 1);
+  const configuredModel = resolveConfiguredModelRef({
+    cfg,
+    defaultProvider: DEFAULT_PROVIDER,
+    defaultModel: DEFAULT_MODEL,
+  });
+  const thinkingLevelsHint = formatThinkingLevels(
+    configuredModel.provider,
+    configuredModel.model,
+  );
 
   const thinkOverride = normalizeThinkLevel(opts.thinking);
   const thinkOnce = normalizeThinkLevel(opts.thinkingOnce);
   if (opts.thinking && !thinkOverride) {
     throw new Error(
-      "Invalid thinking level. Use one of: off, minimal, low, medium, high.",
+      `Invalid thinking level. Use one of: ${thinkingLevelsHint}.`,
     );
   }
   if (opts.thinkingOnce && !thinkOnce) {
     throw new Error(
-      "Invalid one-shot thinking level. Use one of: off, minimal, low, medium, high.",
+      `Invalid one-shot thinking level. Use one of: ${thinkingLevelsHint}.`,
     );
   }
 
@@ -248,16 +282,12 @@ export async function agentCommand(
   let sessionEntry = resolvedSessionEntry;
   const runId = opts.runId?.trim() || sessionId;
 
-  if (sessionKey) {
-    registerAgentRunContext(runId, { sessionKey });
-  }
-
   if (opts.deliver === true) {
     const sendPolicy = resolveSendPolicy({
       cfg,
       entry: sessionEntry,
       sessionKey,
-      provider: sessionEntry?.provider,
+      channel: sessionEntry?.channel,
       chatType: sessionEntry?.chatType,
     });
     if (sendPolicy === "deny") {
@@ -274,6 +304,13 @@ export async function agentCommand(
     verboseOverride ??
     persistedVerbose ??
     (agentCfg?.verboseDefault as VerboseLevel | undefined);
+
+  if (sessionKey) {
+    registerAgentRunContext(runId, {
+      sessionKey,
+      verboseLevel: resolvedVerboseLevel,
+    });
+  }
 
   const needsSkillsSnapshot = isNewSession || !sessionEntry?.skillsSnapshot;
   const skillsSnapshot = needsSkillsSnapshot
@@ -305,17 +342,33 @@ export async function agentCommand(
       if (thinkOverride === "off") delete next.thinkingLevel;
       else next.thinkingLevel = thinkOverride;
     }
-    if (verboseOverride) {
-      if (verboseOverride === "off") delete next.verboseLevel;
-      else next.verboseLevel = verboseOverride;
-    }
+    applyVerboseOverride(next, verboseOverride);
     sessionStore[sessionKey] = next;
     await saveSessionStore(storePath, sessionStore);
   }
 
+  const agentModelPrimary = resolveAgentModelPrimary(cfg, sessionAgentId);
+  const cfgForModelSelection = agentModelPrimary
+    ? {
+        ...cfg,
+        agents: {
+          ...cfg.agents,
+          defaults: {
+            ...cfg.agents?.defaults,
+            model: {
+              ...(typeof cfg.agents?.defaults?.model === "object"
+                ? cfg.agents.defaults.model
+                : undefined),
+              primary: agentModelPrimary,
+            },
+          },
+        },
+      }
+    : cfg;
+
   const { provider: defaultProvider, model: defaultModel } =
     resolveConfiguredModelRef({
-      cfg,
+      cfg: cfgForModelSelection,
       defaultProvider: DEFAULT_PROVIDER,
       defaultModel: DEFAULT_MODEL,
     });
@@ -350,7 +403,7 @@ export async function agentCommand(
     if (overrideModel) {
       const key = modelKey(overrideProvider, overrideModel);
       if (
-        overrideProvider !== "claude-cli" &&
+        !isCliProvider(overrideProvider, cfg) &&
         allowedModelKeys.size > 0 &&
         !allowedModelKeys.has(key)
       ) {
@@ -369,7 +422,7 @@ export async function agentCommand(
     const candidateProvider = storedProviderOverride || defaultProvider;
     const key = modelKey(candidateProvider, storedModelOverride);
     if (
-      candidateProvider === "claude-cli" ||
+      isCliProvider(candidateProvider, cfg) ||
       allowedModelKeys.size === 0 ||
       allowedModelKeys.has(key)
     ) {
@@ -403,7 +456,32 @@ export async function agentCommand(
       catalog: catalogForThinking,
     });
   }
-  const sessionFile = resolveSessionFilePath(sessionId, sessionEntry);
+  if (
+    resolvedThinkLevel === "xhigh" &&
+    !supportsXHighThinking(provider, model)
+  ) {
+    const explicitThink = Boolean(thinkOnce || thinkOverride);
+    if (explicitThink) {
+      throw new Error(
+        `Thinking level "xhigh" is only supported for ${formatXHighModelHint()}.`,
+      );
+    }
+    resolvedThinkLevel = "high";
+    if (
+      sessionEntry &&
+      sessionStore &&
+      sessionKey &&
+      sessionEntry.thinkingLevel === "xhigh"
+    ) {
+      sessionEntry.thinkingLevel = "high";
+      sessionEntry.updatedAt = Date.now();
+      sessionStore[sessionKey] = sessionEntry;
+      await saveSessionStore(storePath, sessionStore);
+    }
+  }
+  const sessionFile = resolveSessionFilePath(sessionId, sessionEntry, {
+    agentId: sessionAgentId,
+  });
 
   const startedAt = Date.now();
   let lifecycleEnded = false;
@@ -411,19 +489,23 @@ export async function agentCommand(
   let result: Awaited<ReturnType<typeof runEmbeddedPiAgent>>;
   let fallbackProvider = provider;
   let fallbackModel = model;
-  const claudeSessionId = sessionEntry?.claudeCliSessionId?.trim();
   try {
-    const messageProvider = resolveMessageProvider(
-      opts.messageProvider,
-      opts.provider,
+    const messageChannel = resolveMessageChannel(
+      opts.messageChannel,
+      opts.channel,
     );
     const fallbackResult = await runWithModelFallback({
       cfg,
       provider,
       model,
+      fallbacksOverride: resolveAgentModelFallbacksOverride(
+        cfg,
+        sessionAgentId,
+      ),
       run: (providerOverride, modelOverride) => {
-        if (providerOverride === "claude-cli") {
-          return runClaudeCliAgent({
+        if (isCliProvider(providerOverride, cfg)) {
+          const cliSessionId = getCliSessionId(sessionEntry, providerOverride);
+          return runCliAgent({
             sessionId,
             sessionKey,
             sessionFile,
@@ -436,18 +518,20 @@ export async function agentCommand(
             timeoutMs,
             runId,
             extraSystemPrompt: opts.extraSystemPrompt,
-            claudeSessionId,
+            cliSessionId,
+            images: opts.images,
           });
         }
         return runEmbeddedPiAgent({
           sessionId,
           sessionKey,
-          messageProvider,
+          messageChannel,
           sessionFile,
           workspaceDir,
           config: cfg,
           skillsSnapshot,
           prompt: body,
+          images: opts.images,
           provider: providerOverride,
           model: modelOverride,
           authProfileId: sessionEntry?.authProfileOverride,
@@ -530,9 +614,9 @@ export async function agentCommand(
       model: modelUsed,
       contextTokens,
     };
-    if (providerUsed === "claude-cli") {
+    if (isCliProvider(providerUsed, cfg)) {
       const cliSessionId = result.meta.agentMeta?.sessionId?.trim();
-      if (cliSessionId) next.claudeCliSessionId = cliSessionId;
+      if (cliSessionId) setCliSessionId(next, providerUsed, cliSessionId);
     }
     next.abortedLastRun = result.meta.aborted ?? false;
     if (hasNonzeroUsage(usage)) {
@@ -552,37 +636,40 @@ export async function agentCommand(
   const payloads = result.payloads ?? [];
   const deliver = opts.deliver === true;
   const bestEffortDeliver = opts.bestEffortDeliver === true;
-  const deliveryProvider =
-    normalizeMessageProvider(opts.provider) ?? "whatsapp";
+  const deliveryChannel =
+    resolveGatewayMessageChannel(opts.channel) ?? DEFAULT_CHAT_CHANNEL;
+  // Channel docking: delivery channels are resolved via plugin registry.
+  const deliveryPlugin = !isInternalMessageChannel(deliveryChannel)
+    ? getChannelPlugin(normalizeChannelId(deliveryChannel) ?? deliveryChannel)
+    : undefined;
 
   const logDeliveryError = (err: unknown) => {
-    const message = `Delivery failed (${deliveryProvider}${deliveryTarget ? ` to ${deliveryTarget}` : ""}): ${String(err)}`;
+    const message = `Delivery failed (${deliveryChannel}${deliveryTarget ? ` to ${deliveryTarget}` : ""}): ${String(err)}`;
     runtime.error?.(message);
     if (!runtime.error) runtime.log(message);
   };
 
-  const isDeliveryProviderKnown =
-    deliveryProvider === "whatsapp" ||
-    deliveryProvider === "telegram" ||
-    deliveryProvider === "discord" ||
-    deliveryProvider === "slack" ||
-    deliveryProvider === "signal" ||
-    deliveryProvider === "imessage" ||
-    deliveryProvider === "webchat";
+  const isDeliveryChannelKnown =
+    isInternalMessageChannel(deliveryChannel) || Boolean(deliveryPlugin);
 
+  const targetMode: ChannelOutboundTargetMode =
+    opts.deliveryTargetMode ?? (opts.to ? "explicit" : "implicit");
   const resolvedTarget =
-    deliver && isDeliveryProviderKnown
+    deliver && isDeliveryChannelKnown && deliveryChannel
       ? resolveOutboundTarget({
-          provider: deliveryProvider,
+          channel: deliveryChannel,
           to: opts.to,
-          allowFrom,
+          cfg,
+          accountId:
+            targetMode === "implicit" ? sessionEntry?.lastAccountId : undefined,
+          mode: targetMode,
         })
       : null;
   const deliveryTarget = resolvedTarget?.ok ? resolvedTarget.to : undefined;
 
   if (deliver) {
-    if (!isDeliveryProviderKnown) {
-      const err = new Error(`Unknown provider: ${deliveryProvider}`);
+    if (!isDeliveryChannelKnown) {
+      const err = new Error(`Unknown channel: ${deliveryChannel}`);
       if (!bestEffortDeliver) throw err;
       logDeliveryError(err);
     } else if (resolvedTarget && !resolvedTarget.ok) {
@@ -626,30 +713,19 @@ export async function agentCommand(
   }
   if (
     deliver &&
-    (deliveryProvider === "whatsapp" ||
-      deliveryProvider === "telegram" ||
-      deliveryProvider === "discord" ||
-      deliveryProvider === "slack" ||
-      deliveryProvider === "signal" ||
-      deliveryProvider === "imessage")
+    deliveryChannel &&
+    !isInternalMessageChannel(deliveryChannel)
   ) {
     if (deliveryTarget) {
       await deliverOutboundPayloads({
         cfg,
-        provider: deliveryProvider,
+        channel: deliveryChannel,
         to: deliveryTarget,
         payloads: deliveryPayloads,
         bestEffort: bestEffortDeliver,
         onError: (err) => logDeliveryError(err),
         onPayload: logPayload,
-        deps: {
-          sendWhatsApp: deps.sendMessageWhatsApp,
-          sendTelegram: deps.sendMessageTelegram,
-          sendDiscord: deps.sendMessageDiscord,
-          sendSlack: deps.sendMessageSlack,
-          sendSignal: deps.sendMessageSignal,
-          sendIMessage: deps.sendMessageIMessage,
-        },
+        deps: createOutboundSendDeps(deps, cfg),
       });
     }
   }

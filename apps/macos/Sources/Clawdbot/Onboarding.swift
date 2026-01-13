@@ -1,5 +1,6 @@
 import AppKit
 import ClawdbotChatUI
+import ClawdbotDiscovery
 import ClawdbotIPC
 import Combine
 import Observation
@@ -31,7 +32,7 @@ final class OnboardingController {
         let hosting = NSHostingController(rootView: OnboardingView())
         let window = NSWindow(contentViewController: hosting)
         window.title = UIStrings.welcomeTitle
-        window.setContentSize(NSSize(width: 630, height: 684))
+        window.setContentSize(NSSize(width: OnboardingView.windowWidth, height: OnboardingView.windowHeight))
         window.styleMask = [.titled, .closable, .fullSizeContentView]
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
@@ -46,6 +47,11 @@ final class OnboardingController {
     func close() {
         self.window?.close()
         self.window = nil
+    }
+
+    func restart() {
+        self.close()
+        self.show()
     }
 }
 
@@ -92,7 +98,10 @@ struct OnboardingView: View {
     @Bindable var state: AppState
     var permissionMonitor: PermissionMonitor
 
-    let pageWidth: CGFloat = 630
+    static let windowWidth: CGFloat = 630
+    static let windowHeight: CGFloat = 752 // ~+10% to fit full onboarding content
+
+    let pageWidth: CGFloat = Self.windowWidth
     let contentHeight: CGFloat = 460
     let connectionPageIndex = 1
     let anthropicAuthPageIndex = 2
@@ -111,22 +120,26 @@ struct OnboardingView: View {
     let permissionsPageIndex = 5
     static func pageOrder(
         for mode: AppState.ConnectionMode,
-        needsBootstrap: Bool) -> [Int]
+        showOnboardingChat: Bool) -> [Int]
     {
         switch mode {
         case .remote:
             // Remote setup doesn't need local gateway/CLI/workspace setup pages,
             // and WhatsApp/Telegram setup is optional.
-            needsBootstrap ? [0, 1, 5, 8, 9] : [0, 1, 5, 9]
+            showOnboardingChat ? [0, 1, 5, 8, 9] : [0, 1, 5, 9]
         case .unconfigured:
-            needsBootstrap ? [0, 1, 8, 9] : [0, 1, 9]
+            showOnboardingChat ? [0, 1, 8, 9] : [0, 1, 9]
         case .local:
-            needsBootstrap ? [0, 1, 3, 5, 8, 9] : [0, 1, 3, 5, 9]
+            showOnboardingChat ? [0, 1, 3, 5, 8, 9] : [0, 1, 3, 5, 9]
         }
     }
 
+    var showOnboardingChat: Bool {
+        self.state.connectionMode == .local && self.needsBootstrap
+    }
+
     var pageOrder: [Int] {
-        Self.pageOrder(for: self.state.connectionMode, needsBootstrap: self.needsBootstrap)
+        Self.pageOrder(for: self.state.connectionMode, showOnboardingChat: self.showOnboardingChat)
     }
 
     var pageCount: Int { self.pageOrder.count }
@@ -142,8 +155,8 @@ struct OnboardingView: View {
 
     var canAdvance: Bool { !self.isWizardBlocking }
     var devLinkCommand: String {
-        let bundlePath = Bundle.main.bundlePath
-        return "ln -sf '\(bundlePath)/Contents/Resources/Relay/clawdbot' /usr/local/bin/clawdbot"
+        let version = GatewayEnvironment.expectedGatewayVersion()?.description ?? "latest"
+        return "npm install -g clawdbot@\(version)"
     }
 
     struct LocalGatewayProbe: Equatable {
@@ -156,7 +169,9 @@ struct OnboardingView: View {
     init(
         state: AppState = AppStateStore.shared,
         permissionMonitor: PermissionMonitor = .shared,
-        discoveryModel: GatewayDiscoveryModel = GatewayDiscoveryModel())
+        discoveryModel: GatewayDiscoveryModel = GatewayDiscoveryModel(
+            localDisplayName: InstanceIdentity.displayName,
+            filterLocalGateways: false))
     {
         self.state = state
         self.permissionMonitor = permissionMonitor

@@ -23,6 +23,43 @@ vi.mock("../config/config.js", async (importOriginal) => {
 import { createClawdbotTools } from "./clawdbot-tools.js";
 
 describe("sessions tools", () => {
+  it("uses number (not integer) in tool schemas for Gemini compatibility", () => {
+    const tools = createClawdbotTools();
+    const byName = (name: string) => {
+      const tool = tools.find((candidate) => candidate.name === name);
+      expect(tool).toBeDefined();
+      if (!tool) throw new Error(`missing ${name} tool`);
+      return tool;
+    };
+
+    const schemaProp = (toolName: string, prop: string) => {
+      const tool = byName(toolName);
+      const schema = tool.parameters as {
+        anyOf?: unknown;
+        oneOf?: unknown;
+        properties?: Record<string, unknown>;
+      };
+      expect(schema.anyOf).toBeUndefined();
+      expect(schema.oneOf).toBeUndefined();
+
+      const properties = schema.properties ?? {};
+      const value = properties[prop] as { type?: unknown } | undefined;
+      expect(value).toBeDefined();
+      if (!value) throw new Error(`missing ${toolName} schema prop: ${prop}`);
+      return value;
+    };
+
+    expect(schemaProp("sessions_history", "limit").type).toBe("number");
+    expect(schemaProp("sessions_list", "limit").type).toBe("number");
+    expect(schemaProp("sessions_list", "activeMinutes").type).toBe("number");
+    expect(schemaProp("sessions_list", "messageLimit").type).toBe("number");
+    expect(schemaProp("sessions_send", "timeoutSeconds").type).toBe("number");
+    expect(schemaProp("sessions_spawn", "runTimeoutSeconds").type).toBe(
+      "number",
+    );
+    expect(schemaProp("sessions_spawn", "timeoutSeconds").type).toBe("number");
+  });
+
   it("sessions_list filters kinds and includes messages", async () => {
     callGatewayMock.mockReset();
     callGatewayMock.mockImplementation(async (opts: unknown) => {
@@ -36,14 +73,14 @@ describe("sessions tools", () => {
               kind: "direct",
               sessionId: "s-main",
               updatedAt: 10,
-              lastProvider: "whatsapp",
+              lastChannel: "whatsapp",
             },
             {
               key: "discord:group:dev",
               kind: "group",
               sessionId: "s-group",
               updatedAt: 11,
-              provider: "discord",
+              channel: "discord",
               displayName: "discord:g-dev",
             },
             {
@@ -83,7 +120,7 @@ describe("sessions tools", () => {
     };
     expect(details.sessions).toHaveLength(3);
     const main = details.sessions?.find((s) => s.key === "main");
-    expect(main?.provider).toBe("whatsapp");
+    expect(main?.channel).toBe("whatsapp");
     expect(main?.messages?.length).toBe(1);
     expect(main?.messages?.[0]?.role).toBe("assistant");
 
@@ -196,7 +233,7 @@ describe("sessions tools", () => {
 
     const tool = createClawdbotTools({
       agentSessionKey: requesterKey,
-      agentProvider: "discord",
+      agentChannel: "discord",
     }).find((candidate) => candidate.name === "sessions_send");
     expect(tool).toBeDefined();
     if (!tool) throw new Error("missing sessions_send tool");
@@ -206,7 +243,11 @@ describe("sessions tools", () => {
       message: "ping",
       timeoutSeconds: 0,
     });
-    expect(fire.details).toMatchObject({ status: "accepted", runId: "run-1" });
+    expect(fire.details).toMatchObject({
+      status: "accepted",
+      runId: "run-1",
+      delivery: { status: "pending", mode: "announce" },
+    });
     await new Promise((resolve) => setTimeout(resolve, 0));
     await new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -219,6 +260,7 @@ describe("sessions tools", () => {
     expect(waited.details).toMatchObject({
       status: "ok",
       reply: "done",
+      delivery: { status: "pending", mode: "announce" },
     });
     expect(typeof (waited.details as { runId?: string }).runId).toBe("string");
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -231,7 +273,10 @@ describe("sessions tools", () => {
     );
     expect(agentCalls).toHaveLength(8);
     for (const call of agentCalls) {
-      expect(call.params).toMatchObject({ lane: "nested" });
+      expect(call.params).toMatchObject({
+        lane: "nested",
+        channel: "webchat",
+      });
     }
     expect(
       agentCalls.some(
@@ -276,7 +321,7 @@ describe("sessions tools", () => {
     const replyByRunId = new Map<string, string>();
     const requesterKey = "discord:group:req";
     const targetKey = "discord:group:target";
-    let sendParams: { to?: string; provider?: string; message?: string } = {};
+    let sendParams: { to?: string; channel?: string; message?: string } = {};
     callGatewayMock.mockImplementation(async (opts: unknown) => {
       const request = opts as { method?: string; params?: unknown };
       calls.push(request);
@@ -326,11 +371,11 @@ describe("sessions tools", () => {
       }
       if (request.method === "send") {
         const params = request.params as
-          | { to?: string; provider?: string; message?: string }
+          | { to?: string; channel?: string; message?: string }
           | undefined;
         sendParams = {
           to: params?.to,
-          provider: params?.provider,
+          channel: params?.channel,
           message: params?.message,
         };
         return { messageId: "m-announce" };
@@ -340,7 +385,7 @@ describe("sessions tools", () => {
 
     const tool = createClawdbotTools({
       agentSessionKey: requesterKey,
-      agentProvider: "discord",
+      agentChannel: "discord",
     }).find((candidate) => candidate.name === "sessions_send");
     expect(tool).toBeDefined();
     if (!tool) throw new Error("missing sessions_send tool");
@@ -357,6 +402,15 @@ describe("sessions tools", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     await new Promise((resolve) => setTimeout(resolve, 0));
 
+    const agentCalls = calls.filter((call) => call.method === "agent");
+    expect(agentCalls).toHaveLength(4);
+    for (const call of agentCalls) {
+      expect(call.params).toMatchObject({
+        lane: "nested",
+        channel: "webchat",
+      });
+    }
+
     const replySteps = calls.filter(
       (call) =>
         call.method === "agent" &&
@@ -369,7 +423,7 @@ describe("sessions tools", () => {
     expect(replySteps).toHaveLength(2);
     expect(sendParams).toMatchObject({
       to: "channel:target",
-      provider: "discord",
+      channel: "discord",
       message: "announce now",
     });
   });

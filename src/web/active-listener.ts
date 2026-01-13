@@ -3,6 +3,7 @@ import { DEFAULT_ACCOUNT_ID } from "../routing/session-key.js";
 
 export type ActiveWebSendOptions = {
   gifPlayback?: boolean;
+  accountId?: string;
 };
 
 export type ActiveWebListener = {
@@ -29,6 +30,24 @@ let _currentListener: ActiveWebListener | null = null;
 
 const listeners = new Map<string, ActiveWebListener>();
 
+export function resolveWebAccountId(accountId?: string | null): string {
+  return (accountId ?? "").trim() || DEFAULT_ACCOUNT_ID;
+}
+
+export function requireActiveWebListener(accountId?: string | null): {
+  accountId: string;
+  listener: ActiveWebListener;
+} {
+  const id = resolveWebAccountId(accountId);
+  const listener = listeners.get(id) ?? null;
+  if (!listener) {
+    throw new Error(
+      `No active WhatsApp Web listener (account: ${id}). Start the gateway, then link WhatsApp with: clawdbot channels login --channel whatsapp --account ${id}.`,
+    );
+  }
+  return { accountId: id, listener };
+}
+
 export function setActiveWebListener(listener: ActiveWebListener | null): void;
 export function setActiveWebListener(
   accountId: string | null | undefined,
@@ -46,7 +65,7 @@ export function setActiveWebListener(
           listener: accountIdOrListener ?? null,
         };
 
-  const id = (accountId ?? "").trim() || DEFAULT_ACCOUNT_ID;
+  const id = resolveWebAccountId(accountId);
   if (!listener) {
     listeners.delete(id);
   } else {
@@ -60,6 +79,6 @@ export function setActiveWebListener(
 export function getActiveWebListener(
   accountId?: string | null,
 ): ActiveWebListener | null {
-  const id = (accountId ?? "").trim() || DEFAULT_ACCOUNT_ID;
+  const id = resolveWebAccountId(accountId);
   return listeners.get(id) ?? null;
 }

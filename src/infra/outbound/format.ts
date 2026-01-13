@@ -1,7 +1,9 @@
+import { getChannelPlugin } from "../../channels/plugins/index.js";
+import type { ChannelId } from "../../channels/plugins/types.js";
 import type { OutboundDeliveryResult } from "./deliver.js";
 
 export type OutboundDeliveryJson = {
-  provider: string;
+  channel: string;
   via: "direct" | "gateway";
   to: string;
   messageId: string;
@@ -11,6 +13,7 @@ export type OutboundDeliveryJson = {
   conversationId?: string;
   timestamp?: number;
   toJid?: string;
+  meta?: Record<string, unknown>;
 };
 
 type OutboundDeliveryMeta = {
@@ -20,20 +23,21 @@ type OutboundDeliveryMeta = {
   conversationId?: string;
   timestamp?: number;
   toJid?: string;
+  meta?: Record<string, unknown>;
 };
 
-const resolveProviderLabel = (provider: string) =>
-  provider === "imessage" ? "iMessage" : provider;
+const resolveChannelLabel = (channel: string) =>
+  getChannelPlugin(channel as ChannelId)?.meta.label ?? channel;
 
 export function formatOutboundDeliverySummary(
-  provider: string,
+  channel: string,
   result?: OutboundDeliveryResult,
 ): string {
   if (!result) {
-    return `✅ Sent via ${resolveProviderLabel(provider)}. Message ID: unknown`;
+    return `✅ Sent via ${resolveChannelLabel(channel)}. Message ID: unknown`;
   }
 
-  const label = resolveProviderLabel(result.provider);
+  const label = resolveChannelLabel(result.channel);
   const base = `✅ Sent via ${label}. Message ID: ${result.messageId}`;
 
   if ("chatId" in result) return `${base} (chat ${result.chatId})`;
@@ -44,16 +48,16 @@ export function formatOutboundDeliverySummary(
 }
 
 export function buildOutboundDeliveryJson(params: {
-  provider: string;
+  channel: string;
   to: string;
   result?: OutboundDeliveryMeta | OutboundDeliveryResult;
   via?: "direct" | "gateway";
   mediaUrl?: string | null;
 }): OutboundDeliveryJson {
-  const { provider, to, result } = params;
+  const { channel, to, result } = params;
   const messageId = result?.messageId ?? "unknown";
   const payload: OutboundDeliveryJson = {
-    provider,
+    channel,
     via: params.via ?? "direct",
     to,
     messageId,
@@ -79,17 +83,20 @@ export function buildOutboundDeliveryJson(params: {
   if (result && "toJid" in result && result.toJid !== undefined) {
     payload.toJid = result.toJid;
   }
+  if (result && "meta" in result && result.meta !== undefined) {
+    payload.meta = result.meta;
+  }
 
   return payload;
 }
 
 export function formatGatewaySummary(params: {
   action?: string;
-  provider?: string;
+  channel?: string;
   messageId?: string | null;
 }): string {
   const action = params.action ?? "Sent";
-  const providerSuffix = params.provider ? ` (${params.provider})` : "";
+  const channelSuffix = params.channel ? ` (${params.channel})` : "";
   const messageId = params.messageId ?? "unknown";
-  return `✅ ${action} via gateway${providerSuffix}. Message ID: ${messageId}`;
+  return `✅ ${action} via gateway${channelSuffix}. Message ID: ${messageId}`;
 }

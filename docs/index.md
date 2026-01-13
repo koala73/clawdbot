@@ -3,12 +3,12 @@ summary: "Top-level overview of Clawdbot, features, and purpose"
 read_when:
   - Introducing Clawdbot to newcomers
 ---
-# CLAWDBOT 🦞
+# Clawdbot 🦞
 
 > *"EXFOLIATE! EXFOLIATE!"* — A space lobster, probably
 
 <p align="center">
-  <img src="whatsapp-clawd.jpg" alt="CLAWDBOT" width="420" />
+  <img src="whatsapp-clawd.jpg" alt="Clawdbot" width="420" />
 </p>
 
 <p align="center">
@@ -19,17 +19,17 @@ read_when:
 <p align="center">
   <a href="https://github.com/clawdbot/clawdbot">GitHub</a> ·
   <a href="https://github.com/clawdbot/clawdbot/releases">Releases</a> ·
-  <a href="https://docs.clawd.bot">Docs</a> ·
-  <a href="https://docs.clawd.bot/start/clawd">Clawdbot assistant setup</a>
+  <a href="/">Docs</a> ·
+  <a href="/start/clawd">Clawdbot assistant setup</a>
 </p>
 
-CLAWDBOT bridges WhatsApp (via WhatsApp Web / Baileys), Telegram (Bot API / grammY), Discord (Bot API / discord.js), and iMessage (imsg CLI) to coding agents like [Pi](https://github.com/badlogic/pi-mono).
+Clawdbot bridges WhatsApp (via WhatsApp Web / Baileys), Telegram (Bot API / grammY), Discord (Bot API / channels.discord.js), and iMessage (imsg CLI) to coding agents like [Pi](https://github.com/badlogic/pi-mono).
 Clawdbot also powers [Clawd](https://clawd.me), the space‑lobster assistant.
 
 ## Start here
 
-- **New install from zero:** https://docs.clawd.bot/start/getting-started
-- **Guided setup (recommended):** https://docs.clawd.bot/start/wizard (`clawdbot onboard`)
+- **New install from zero:** [Getting Started](/start/getting-started)
+- **Guided setup (recommended):** [Wizard](/start/wizard) (`clawdbot onboard`)
 - **Open the dashboard (local Gateway):** http://127.0.0.1:18789/ (or http://localhost:18789/)
 
 If the Gateway is running on the same computer, that link opens the browser Control UI
@@ -39,7 +39,7 @@ immediately. If it fails, start the Gateway first: `clawdbot gateway`.
 
 The dashboard is the browser Control UI for chat, config, nodes, sessions, and more.
 Local default: http://127.0.0.1:18789/
-Remote access: https://docs.clawd.bot/web and https://docs.clawd.bot/gateway/tailscale
+Remote access: [Web surfaces](/web) and [Tailscale](/gateway/tailscale)
 
 ## How it works
 
@@ -62,22 +62,23 @@ WhatsApp / Telegram / Discord
               └─ Android node via Bridge + pairing
 ```
 
-Most operations flow through the **Gateway** (`clawdbot gateway`), a single long-running process that owns provider connections and the WebSocket control plane.
+Most operations flow through the **Gateway** (`clawdbot gateway`), a single long-running process that owns channel connections and the WebSocket control plane.
 
 ## Network model
 
 - **One Gateway per host**: it is the only process allowed to own the WhatsApp Web session.
 - **Loopback-first**: Gateway WS defaults to `ws://127.0.0.1:18789`.
+  - The wizard now generates a gateway token by default (even for loopback).
   - For Tailnet access, run `clawdbot gateway --bind tailnet --token ...` (token is required for non-loopback binds).
 - **Bridge for nodes**: optional LAN/tailnet-facing bridge on `tcp://0.0.0.0:18790` for paired nodes (Bonjour-discoverable).
-- **Canvas host**: HTTP file server on `canvasHost.port` (default `18793`), serving `/__clawdbot__/canvas/` for node WebViews; see [`docs/configuration.md`](https://docs.clawd.bot/gateway/configuration) (`canvasHost`).
-- **Remote use**: SSH tunnel or tailnet/VPN; see [`docs/remote.md`](https://docs.clawd.bot/gateway/remote) and [`docs/discovery.md`](https://docs.clawd.bot/gateway/discovery).
+- **Canvas host**: HTTP file server on `canvasHost.port` (default `18793`), serving `/__clawdbot__/canvas/` for node WebViews; see [Gateway configuration](/gateway/configuration) (`canvasHost`).
+- **Remote use**: SSH tunnel or tailnet/VPN; see [Remote access](/gateway/remote) and [Discovery](/gateway/discovery).
 
 ## Features (high level)
 
 - 📱 **WhatsApp Integration** — Uses Baileys for WhatsApp Web protocol
 - ✈️ **Telegram Bot** — DMs + groups via grammY
-- 🎮 **Discord Bot** — DMs + guild channels via discord.js
+- 🎮 **Discord Bot** — DMs + guild channels via channels.discord.js
 - 💬 **iMessage** — Local imsg CLI integration (macOS)
 - 🤖 **Agent bridge** — Pi (RPC mode) with tool streaming
 - ⏱️ **Streaming + chunking** — Block streaming + Telegram draft streaming details ([/concepts/streaming](/concepts/streaming))
@@ -106,11 +107,13 @@ npm install -g clawdbot@latest
 clawdbot onboard --install-daemon
 
 # Pair WhatsApp Web (shows QR)
-clawdbot providers login
+clawdbot channels login
 
 # Gateway runs via daemon after onboarding; manual run is still possible:
 clawdbot gateway --port 18789
 ```
+
+Switching between npm and git installs later is easy: install the other flavor and run `clawdbot doctor` to update the gateway service entrypoint.
 
 From source (development):
 
@@ -134,77 +137,79 @@ clawdbot gateway --port 19001
 Send a test message (requires a running Gateway):
 
 ```bash
-clawdbot message send --to +15555550123 --message "Hello from CLAWDBOT"
+clawdbot message send --to +15555550123 --message "Hello from Clawdbot"
 ```
 
 ## Configuration (optional)
 
 Config lives at `~/.clawdbot/clawdbot.json`.
 
-- If you **do nothing**, CLAWDBOT uses the bundled Pi binary in RPC mode with per-sender sessions.
-- If you want to lock it down, start with `whatsapp.allowFrom` and (for groups) mention rules.
+- If you **do nothing**, Clawdbot uses the bundled Pi binary in RPC mode with per-sender sessions.
+- If you want to lock it down, start with `channels.whatsapp.allowFrom` and (for groups) mention rules.
 
 Example:
 
 ```json5
 {
-  whatsapp: {
-    allowFrom: ["+15555550123"],
-    groups: { "*": { requireMention: true } }
+  channels: {
+    whatsapp: {
+      allowFrom: ["+15555550123"],
+      groups: { "*": { requireMention: true } }
+    }
   },
-  routing: { groupChat: { mentionPatterns: ["@clawd"] } }
+  messages: { groupChat: { mentionPatterns: ["@clawd"] } }
 }
 ```
 
 ## Docs
 
 - Start here:
-  - [Docs hubs (all pages linked)](https://docs.clawd.bot/start/hubs)
-  - [FAQ](https://docs.clawd.bot/start/faq) ← *common questions answered*
-  - [Configuration](https://docs.clawd.bot/gateway/configuration)
-  - [Configuration examples](https://docs.clawd.bot/gateway/configuration-examples)
-  - [Slash commands](https://docs.clawd.bot/tools/slash-commands)
-  - [Multi-agent routing](https://docs.clawd.bot/concepts/multi-agent)
-  - [Updating / rollback](https://docs.clawd.bot/install/updating)
-  - [Pairing (DM + nodes)](https://docs.clawd.bot/start/pairing)
-  - [Nix mode](https://docs.clawd.bot/install/nix)
-  - [Clawdbot assistant setup (Clawd)](https://docs.clawd.bot/start/clawd)
-  - [Skills](https://docs.clawd.bot/tools/skills)
-  - [Skills config](https://docs.clawd.bot/tools/skills-config)
-  - [Workspace templates](https://docs.clawd.bot/reference/templates/AGENTS)
-  - [RPC adapters](https://docs.clawd.bot/reference/rpc)
-  - [Gateway runbook](https://docs.clawd.bot/gateway)
-  - [Nodes (iOS/Android)](https://docs.clawd.bot/nodes)
-  - [Web surfaces (Control UI)](https://docs.clawd.bot/web)
-  - [Discovery + transports](https://docs.clawd.bot/gateway/discovery)
-  - [Remote access](https://docs.clawd.bot/gateway/remote)
+  - [Docs hubs (all pages linked)](/start/hubs)
+  - [FAQ](/start/faq) ← *common questions answered*
+  - [Configuration](/gateway/configuration)
+  - [Configuration examples](/gateway/configuration-examples)
+  - [Slash commands](/tools/slash-commands)
+  - [Multi-agent routing](/concepts/multi-agent)
+  - [Updating / rollback](/install/updating)
+  - [Pairing (DM + nodes)](/start/pairing)
+  - [Nix mode](/install/nix)
+  - [Clawdbot assistant setup (Clawd)](/start/clawd)
+  - [Skills](/tools/skills)
+  - [Skills config](/tools/skills-config)
+  - [Workspace templates](/reference/templates/AGENTS)
+  - [RPC adapters](/reference/rpc)
+  - [Gateway runbook](/gateway)
+  - [Nodes (iOS/Android)](/nodes)
+  - [Web surfaces (Control UI)](/web)
+  - [Discovery + transports](/gateway/discovery)
+  - [Remote access](/gateway/remote)
 - Providers and UX:
-  - [WebChat](https://docs.clawd.bot/web/webchat)
-  - [Control UI (browser)](https://docs.clawd.bot/web/control-ui)
-  - [Telegram](https://docs.clawd.bot/providers/telegram)
-  - [Discord](https://docs.clawd.bot/providers/discord)
-  - [iMessage](https://docs.clawd.bot/providers/imessage)
-  - [Groups](https://docs.clawd.bot/concepts/groups)
-  - [WhatsApp group messages](https://docs.clawd.bot/concepts/group-messages)
-  - [Media: images](https://docs.clawd.bot/nodes/images)
-  - [Media: audio](https://docs.clawd.bot/nodes/audio)
+  - [WebChat](/web/webchat)
+  - [Control UI (browser)](/web/control-ui)
+  - [Telegram](/channels/telegram)
+  - [Discord](/channels/discord)
+  - [iMessage](/channels/imessage)
+  - [Groups](/concepts/groups)
+  - [WhatsApp group messages](/concepts/group-messages)
+  - [Media: images](/nodes/images)
+  - [Media: audio](/nodes/audio)
 - Companion apps:
-  - [macOS app](https://docs.clawd.bot/platforms/macos)
-  - [iOS app](https://docs.clawd.bot/platforms/ios)
-  - [Android app](https://docs.clawd.bot/platforms/android)
-  - [Windows (WSL2)](https://docs.clawd.bot/platforms/windows)
-  - [Linux app](https://docs.clawd.bot/platforms/linux)
+  - [macOS app](/platforms/macos)
+  - [iOS app](/platforms/ios)
+  - [Android app](/platforms/android)
+  - [Windows (WSL2)](/platforms/windows)
+  - [Linux app](/platforms/linux)
 - Ops and safety:
-  - [Sessions](https://docs.clawd.bot/concepts/session)
-  - [Cron jobs](https://docs.clawd.bot/automation/cron-jobs)
-  - [Webhooks](https://docs.clawd.bot/automation/webhook)
-  - [Gmail hooks (Pub/Sub)](https://docs.clawd.bot/automation/gmail-pubsub)
-  - [Security](https://docs.clawd.bot/gateway/security)
-  - [Troubleshooting](https://docs.clawd.bot/gateway/troubleshooting)
+  - [Sessions](/concepts/session)
+  - [Cron jobs](/automation/cron-jobs)
+  - [Webhooks](/automation/webhook)
+  - [Gmail hooks (Pub/Sub)](/automation/gmail-pubsub)
+  - [Security](/gateway/security)
+  - [Troubleshooting](/gateway/troubleshooting)
 
 ## The name
 
-**CLAWDBOT = CLAW + TARDIS** — because every space lobster needs a time-and-space machine.
+**Clawdbot = CLAW + TARDIS** — because every space lobster needs a time-and-space machine.
 
 ---
 

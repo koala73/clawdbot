@@ -14,18 +14,22 @@ import {
   type User,
 } from "@buape/carbon";
 import { GatewayIntents, GatewayPlugin } from "@buape/carbon/gateway";
-import type { APIAttachment } from "discord-api-types/v10";
-import { ApplicationCommandOptionType, Routes } from "discord-api-types/v10";
+import {
+  type APIAttachment,
+  ApplicationCommandOptionType,
+  Routes,
+} from "discord-api-types/v10";
 
 import {
   resolveAckReaction,
   resolveEffectiveMessagesConfig,
+  resolveHumanDelayConfig,
 } from "../agents/identity.js";
 import { resolveTextChunkLimit } from "../auto-reply/chunk.js";
 import { hasControlCommand } from "../auto-reply/command-detection.js";
 import {
   buildCommandText,
-  listNativeCommandSpecs,
+  listNativeCommandSpecsForConfig,
   shouldHandleTextCommands,
 } from "../auto-reply/commands-registry.js";
 import {
@@ -34,29 +38,36 @@ import {
 } from "../auto-reply/envelope.js";
 import { dispatchReplyFromConfig } from "../auto-reply/reply/dispatch-from-config.js";
 import {
+  buildHistoryContextFromMap,
+  clearHistoryEntries,
+  type HistoryEntry,
+} from "../auto-reply/reply/history.js";
+import {
   buildMentionRegexes,
   matchesMentionPatterns,
 } from "../auto-reply/reply/mentions.js";
-import {
-  createReplyDispatcher,
-  createReplyDispatcherWithTyping,
-} from "../auto-reply/reply/reply-dispatcher.js";
-import { getReplyFromConfig } from "../auto-reply/reply.js";
+import { dispatchReplyWithDispatcher } from "../auto-reply/reply/provider-dispatcher.js";
+import { createReplyDispatcherWithTyping } from "../auto-reply/reply/reply-dispatcher.js";
+import { createReplyReferencePlanner } from "../auto-reply/reply/reply-reference.js";
 import type { ReplyPayload } from "../auto-reply/types.js";
+import {
+  isNativeCommandsExplicitlyDisabled,
+  resolveNativeCommandsEnabled,
+} from "../config/commands.js";
 import type { ClawdbotConfig, ReplyToMode } from "../config/config.js";
 import { loadConfig } from "../config/config.js";
 import { resolveStorePath, updateLastRoute } from "../config/sessions.js";
 import { danger, logVerbose, shouldLogVerbose } from "../globals.js";
+import { recordChannelActivity } from "../infra/channel-activity.js";
 import { formatDurationSeconds } from "../infra/format-duration.js";
-import { recordProviderActivity } from "../infra/provider-activity.js";
 import { enqueueSystemEvent } from "../infra/system-events.js";
 import { getChildLogger } from "../logging.js";
-import { detectMime } from "../media/mime.js";
+import { fetchRemoteMedia } from "../media/fetch.js";
 import { saveMediaBuffer } from "../media/store.js";
 import { buildPairingReply } from "../pairing/pairing-messages.js";
 import {
-  readProviderAllowFromStore,
-  upsertProviderPairingRequest,
+  readChannelAllowFromStore,
+  upsertChannelPairingRequest,
 } from "../pairing/pairing-store.js";
 import {
   buildAgentSessionKey,
@@ -68,12 +79,17 @@ import { truncateUtf16Safe } from "../utils.js";
 import { loadWebMedia } from "../web/media.js";
 import { resolveDiscordAccount } from "./accounts.js";
 import { chunkDiscordText } from "./chunk.js";
+import { attachDiscordGatewayLogging } from "./gateway-logging.js";
 import {
   getDiscordGatewayEmitter,
   waitForDiscordGatewayStop,
 } from "./monitor.gateway.js";
 import { fetchDiscordApplicationId } from "./probe.js";
-import { reactMessageDiscord, sendMessageDiscord } from "./send.js";
+import {
+  reactMessageDiscord,
+  removeReactionDiscord,
+  sendMessageDiscord,
+} from "./send.js";
 import { normalizeDiscordToken } from "./token.js";
 
 export type MonitorDiscordOpts = {
@@ -87,19 +103,32 @@ export type MonitorDiscordOpts = {
   replyToMode?: ReplyToMode;
 };
 
+type DiscordConfig = NonNullable<ClawdbotConfig["channels"]>["discord"];
+
 type DiscordMediaInfo = {
   path: string;
   contentType?: string;
   placeholder: string;
 };
 
-type DiscordHistoryEntry = {
-  sender: string;
-  body: string;
-  timestamp?: number;
-  messageId?: string;
+type DiscordSnapshotAuthor = {
+  id?: string | null;
+  username?: string | null;
+  discriminator?: string | null;
+  global_name?: string | null;
+  name?: string | null;
 };
 
+type DiscordSnapshotMessage = {
+  content?: string | null;
+  embeds?: Array<{ description?: string | null; title?: string | null }> | null;
+  attachments?: APIAttachment[] | null;
+  author?: DiscordSnapshotAuthor | null;
+};
+
+type DiscordMessageSnapshot = {
+  message?: DiscordSnapshotMessage | null;
+};
 type DiscordReactionEvent = Parameters<MessageReactionAddListener["handle"]>[0];
 type DiscordThreadChannel = {
   id: string;
@@ -146,6 +175,19 @@ function logSlowDiscordListener(params: {
   } else {
     console.warn(message);
   }
+}
+
+export function registerDiscordListener(
+  listeners: Array<object>,
+  listener: object,
+) {
+  if (
+    listeners.some((existing) => existing.constructor === listener.constructor)
+  ) {
+    return false;
+  }
+  listeners.push(listener);
+  return true;
 }
 
 async function resolveDiscordThreadStarter(params: {
@@ -225,6 +267,7 @@ export type DiscordGuildEntryResolved = {
       enabled?: boolean;
       users?: Array<string | number>;
       systemPrompt?: string;
+      autoThread?: boolean;
     }
   >;
 };
@@ -236,6 +279,7 @@ export type DiscordChannelConfigResolved = {
   enabled?: boolean;
   users?: Array<string | number>;
   systemPrompt?: string;
+  autoThread?: boolean;
 };
 
 export type DiscordMessageEvent = Parameters<
@@ -319,6 +363,87 @@ export function resolveDiscordReplyTarget(opts: {
   return opts.hasReplied ? undefined : replyToId;
 }
 
+export function sanitizeDiscordThreadName(
+  rawName: string,
+  fallbackId: string,
+): string {
+  const cleanedName = rawName
+    .replace(/<@!?\d+>/g, "") // user mentions
+    .replace(/<@&\d+>/g, "") // role mentions
+    .replace(/<#\d+>/g, "") // channel mentions
+    .replace(/\s+/g, " ")
+    .trim();
+  const baseSource = cleanedName || `Thread ${fallbackId}`;
+  const base = truncateUtf16Safe(baseSource, 80);
+  return truncateUtf16Safe(base, 100) || `Thread ${fallbackId}`;
+}
+
+type DiscordReplyDeliveryPlan = {
+  deliverTarget: string;
+  replyTarget: string;
+  replyReference: ReturnType<typeof createReplyReferencePlanner>;
+};
+
+async function maybeCreateDiscordAutoThread(params: {
+  client: Client;
+  message: DiscordMessageEvent["message"];
+  isGuildMessage: boolean;
+  channelConfig?: DiscordChannelConfigResolved | null;
+  threadChannel?: DiscordThreadChannel | null;
+  baseText: string;
+  combinedBody: string;
+}): Promise<string | undefined> {
+  if (!params.isGuildMessage) return undefined;
+  if (!params.channelConfig?.autoThread) return undefined;
+  if (params.threadChannel) return undefined;
+  try {
+    const threadName = sanitizeDiscordThreadName(
+      params.baseText || params.combinedBody || "Thread",
+      params.message.id,
+    );
+    const created = (await params.client.rest.post(
+      `${Routes.channelMessage(params.message.channelId, params.message.id)}/threads`,
+      {
+        body: {
+          name: threadName,
+          auto_archive_duration: 60,
+        },
+      },
+    )) as { id?: string };
+    const createdId = created?.id ? String(created.id) : "";
+    return createdId || undefined;
+  } catch (err) {
+    logVerbose(
+      `discord: autoThread failed for ${params.message.channelId}/${params.message.id}: ${String(err)}`,
+    );
+    return undefined;
+  }
+}
+
+function resolveDiscordReplyDeliveryPlan(params: {
+  replyTarget: string;
+  replyToMode: ReplyToMode;
+  messageId: string;
+  threadChannel?: DiscordThreadChannel | null;
+  createdThreadId?: string | null;
+}): DiscordReplyDeliveryPlan {
+  const originalReplyTarget = params.replyTarget;
+  let deliverTarget = originalReplyTarget;
+  let replyTarget = originalReplyTarget;
+  if (params.createdThreadId) {
+    deliverTarget = `channel:${params.createdThreadId}`;
+    replyTarget = deliverTarget;
+  }
+  const allowReference = deliverTarget === originalReplyTarget;
+  const replyReference = createReplyReferencePlanner({
+    replyToMode: allowReference ? params.replyToMode : "off",
+    existingId: params.threadChannel ? params.messageId : undefined,
+    startId: params.messageId,
+    allowReference,
+  });
+  return { deliverTarget, replyTarget, replyReference };
+}
+
 function summarizeAllowList(list?: Array<string | number>) {
   if (!list || list.length === 0) return "any";
   const sample = list.slice(0, 4).map((entry) => String(entry));
@@ -364,18 +489,30 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
   const allowFrom = dmConfig?.allowFrom;
   const mediaMaxBytes =
     (opts.mediaMaxMb ?? discordCfg.mediaMaxMb ?? 8) * 1024 * 1024;
-  const textLimit = resolveTextChunkLimit(cfg, "discord", account.accountId);
+  const textLimit = resolveTextChunkLimit(cfg, "discord", account.accountId, {
+    fallbackLimit: 2000,
+  });
   const historyLimit = Math.max(
     0,
-    opts.historyLimit ?? discordCfg.historyLimit ?? 20,
+    opts.historyLimit ??
+      discordCfg.historyLimit ??
+      cfg.messages?.groupChat?.historyLimit ??
+      20,
   );
   const replyToMode = opts.replyToMode ?? discordCfg.replyToMode ?? "off";
   const dmEnabled = dmConfig?.enabled ?? true;
   const dmPolicy = dmConfig?.policy ?? "pairing";
   const groupDmEnabled = dmConfig?.groupEnabled ?? false;
   const groupDmChannels = dmConfig?.groupChannels;
-  const nativeEnabled = cfg.commands?.native === true;
-  const nativeDisabledExplicit = cfg.commands?.native === false;
+  const nativeEnabled = resolveNativeCommandsEnabled({
+    providerId: "discord",
+    providerSetting: discordCfg.commands?.native,
+    globalSetting: cfg.commands?.native,
+  });
+  const nativeDisabledExplicit = isNativeCommandsExplicitlyDisabled({
+    providerSetting: discordCfg.commands?.native,
+    globalSetting: cfg.commands?.native,
+  });
   const useAccessGroups = cfg.commands?.useAccessGroups !== false;
   const sessionPrefix = "discord:slash";
   const ephemeralDefault = true;
@@ -391,7 +528,9 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
     throw new Error("Failed to resolve Discord application id");
   }
 
-  const commandSpecs = nativeEnabled ? listNativeCommandSpecs() : [];
+  const commandSpecs = nativeEnabled
+    ? listNativeCommandSpecsForConfig(cfg)
+    : [];
   const commands = commandSpecs.map((spec) =>
     createDiscordNativeCommand({
       command: spec,
@@ -411,6 +550,11 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
       publicKey: "a",
       token,
       autoDeploy: nativeEnabled,
+      eventQueue: {
+        // Auto-threading (create thread + generate reply + post) can exceed the default
+        // 30s listener timeout in some environments.
+        listenerTimeout: 120_000,
+      },
     },
     {
       commands,
@@ -434,7 +578,7 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
   );
 
   const logger = getChildLogger({ module: "discord-auto-reply" });
-  const guildHistories = new Map<string, DiscordHistoryEntry[]>();
+  const guildHistories = new Map<string, HistoryEntry[]>();
   let botUserId: string | undefined;
 
   if (nativeDisabledExplicit) {
@@ -473,8 +617,12 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
     guildEntries,
   });
 
-  client.listeners.push(new DiscordMessageListener(messageHandler, logger));
-  client.listeners.push(
+  registerDiscordListener(
+    client.listeners,
+    new DiscordMessageListener(messageHandler, logger),
+  );
+  registerDiscordListener(
+    client.listeners,
     new DiscordReactionListener({
       cfg,
       accountId: account.accountId,
@@ -484,7 +632,8 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
       logger,
     }),
   );
-  client.listeners.push(
+  registerDiscordListener(
+    client.listeners,
     new DiscordReactionRemoveListener({
       cfg,
       accountId: account.accountId,
@@ -499,12 +648,31 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
 
   const gateway = client.getPlugin<GatewayPlugin>("gateway");
   const gatewayEmitter = getDiscordGatewayEmitter(gateway);
-  const onGatewayWarning = (warning: unknown) => {
-    logVerbose(`discord gateway warning: ${String(warning)}`);
+  const stopGatewayLogging = attachDiscordGatewayLogging({
+    emitter: gatewayEmitter,
+    runtime,
+  });
+  // Timeout to detect zombie connections where HELLO is never received.
+  const HELLO_TIMEOUT_MS = 30000;
+  let helloTimeoutId: ReturnType<typeof setTimeout> | undefined;
+  const onGatewayDebug = (msg: unknown) => {
+    const message = String(msg);
+    if (!message.includes("WebSocket connection opened")) return;
+    if (helloTimeoutId) clearTimeout(helloTimeoutId);
+    helloTimeoutId = setTimeout(() => {
+      if (!gateway?.isConnected) {
+        runtime.log?.(
+          danger(
+            `connection stalled: no HELLO received within ${HELLO_TIMEOUT_MS}ms, forcing reconnect`,
+          ),
+        );
+        gateway?.disconnect();
+        gateway?.connect(false);
+      }
+      helloTimeoutId = undefined;
+    }, HELLO_TIMEOUT_MS);
   };
-  if (shouldLogVerbose()) {
-    gatewayEmitter?.on("warning", onGatewayWarning);
-  }
+  gatewayEmitter?.on("debug", onGatewayDebug);
   try {
     await waitForDiscordGatewayStop({
       gateway: gateway
@@ -526,7 +694,10 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
       },
     });
   } finally {
-    gatewayEmitter?.removeListener("warning", onGatewayWarning);
+    stopGatewayLogging();
+    stopGatewayLogging();
+    if (helloTimeoutId) clearTimeout(helloTimeoutId);
+    gatewayEmitter?.removeListener("debug", onGatewayDebug);
   }
 }
 
@@ -552,12 +723,12 @@ async function clearDiscordNativeCommands(params: {
 
 export function createDiscordMessageHandler(params: {
   cfg: ReturnType<typeof loadConfig>;
-  discordConfig: ClawdbotConfig["discord"];
+  discordConfig: DiscordConfig;
   accountId: string;
   token: string;
   runtime: RuntimeEnv;
   botUserId?: string;
-  guildHistories: Map<string, DiscordHistoryEntry[]>;
+  guildHistories: Map<string, HistoryEntry[]>;
   historyLimit: number;
   mediaMaxBytes: number;
   textLimit: number;
@@ -594,7 +765,17 @@ export function createDiscordMessageHandler(params: {
     try {
       const message = data.message;
       const author = data.author;
-      if (!author || author.bot) return;
+      if (!author) return;
+
+      const allowBots = discordConfig?.allowBots ?? false;
+      if (author.bot) {
+        // Always ignore own messages to prevent self-reply loops
+        if (botUserId && author.id === botUserId) return;
+        if (!allowBots) {
+          logVerbose("discord: drop bot message (allowBots=false)");
+          return;
+        }
+      }
 
       const isGuildMessage = Boolean(data.guild_id);
       const channelInfo = await resolveDiscordChannelInfo(
@@ -621,7 +802,7 @@ export function createDiscordMessageHandler(params: {
           return;
         }
         if (dmPolicy !== "open") {
-          const storeAllowFrom = await readProviderAllowFromStore(
+          const storeAllowFrom = await readChannelAllowFromStore(
             "discord",
           ).catch(() => []);
           const effectiveAllowFrom = [...(allowFrom ?? []), ...storeAllowFrom];
@@ -639,8 +820,8 @@ export function createDiscordMessageHandler(params: {
           if (!permitted) {
             commandAuthorized = false;
             if (dmPolicy === "pairing") {
-              const { code, created } = await upsertProviderPairingRequest({
-                provider: "discord",
+              const { code, created } = await upsertChannelPairingRequest({
+                channel: "discord",
                 id: author.id,
                 meta: {
                   tag: formatDiscordUserTag(author),
@@ -655,7 +836,7 @@ export function createDiscordMessageHandler(params: {
                   await sendMessageDiscord(
                     `user:${author.id}`,
                     buildPairingReply({
-                      provider: "discord",
+                      channel: "discord",
                       idLine: `Your Discord user id: ${author.id}`,
                       code,
                     }),
@@ -678,15 +859,20 @@ export function createDiscordMessageHandler(params: {
         }
       }
       const botId = botUserId;
-      const baseText = resolveDiscordMessageText(message);
-      recordProviderActivity({
-        provider: "discord",
+      const baseText = resolveDiscordMessageText(message, {
+        includeForwarded: false,
+      });
+      const messageText = resolveDiscordMessageText(message, {
+        includeForwarded: true,
+      });
+      recordChannelActivity({
+        channel: "discord",
         accountId,
         direction: "inbound",
       });
       const route = resolveAgentRoute({
         cfg,
-        provider: "discord",
+        channel: "discord",
         accountId,
         guildId: data.guild_id ?? undefined,
         peer: {
@@ -704,7 +890,7 @@ export function createDiscordMessageHandler(params: {
           matchesMentionPatterns(baseText, mentionRegexes));
       if (shouldLogVerbose()) {
         logVerbose(
-          `discord: inbound id=${message.id} guild=${message.guild?.id ?? "dm"} channel=${message.channelId} mention=${wasMentioned ? "yes" : "no"} type=${isDirectMessage ? "dm" : isGroupDm ? "group-dm" : "guild"} content=${baseText ? "yes" : "no"}`,
+          `discord: inbound id=${message.id} guild=${message.guild?.id ?? "dm"} channel=${message.channelId} mention=${wasMentioned ? "yes" : "no"} type=${isDirectMessage ? "dm" : isGroupDm ? "group-dm" : "guild"} content=${messageText ? "yes" : "no"}`,
         );
       }
 
@@ -832,25 +1018,29 @@ export function createDiscordMessageHandler(params: {
         return;
       }
 
-      const textForHistory = resolveDiscordMessageText(message);
-      if (isGuildMessage && historyLimit > 0 && textForHistory) {
-        const history = guildHistories.get(message.channelId) ?? [];
-        history.push({
-          sender:
-            data.member?.nickname ??
-            author.globalName ??
-            author.username ??
-            author.id,
-          body: textForHistory,
-          timestamp: resolveTimestampMs(message.timestamp),
-          messageId: message.id,
-        });
-        while (history.length > historyLimit) history.shift();
-        guildHistories.set(message.channelId, history);
-      }
+      const textForHistory = resolveDiscordMessageText(message, {
+        includeForwarded: true,
+      });
+      const historyEntry =
+        isGuildMessage && historyLimit > 0 && textForHistory
+          ? {
+              sender:
+                data.member?.nickname ??
+                author.globalName ??
+                author.username ??
+                author.id,
+              body: textForHistory,
+              timestamp: resolveTimestampMs(message.timestamp),
+              messageId: message.id,
+            }
+          : undefined;
 
-      const shouldRequireMention =
-        channelConfig?.requireMention ?? guildInfo?.requireMention ?? true;
+      const shouldRequireMention = resolveDiscordShouldRequireMention({
+        isGuildMessage,
+        isThread: Boolean(threadChannel),
+        channelConfig,
+        guildInfo,
+      });
       const hasAnyMention = Boolean(
         !isDirectMessage &&
           (message.mentionedEveryone ||
@@ -876,7 +1066,7 @@ export function createDiscordMessageHandler(params: {
         !wasMentioned &&
         !hasAnyMention &&
         commandAuthorized &&
-        hasControlCommand(baseText);
+        hasControlCommand(baseText, cfg);
       const effectiveWasMentioned = wasMentioned || shouldBypassMention;
       const canDetectMention = Boolean(botId) || mentionRegexes.length > 0;
       if (isGuildMessage && shouldRequireMention) {
@@ -929,12 +1119,13 @@ export function createDiscordMessageHandler(params: {
       }
 
       const mediaList = await resolveMediaList(message, mediaMaxBytes);
-      const text = baseText;
+      const text = messageText;
       if (!text) {
         logVerbose(`discord: drop message ${message.id} (empty content)`);
         return;
       }
       const ackReaction = resolveAckReaction(cfg, route.agentId);
+      const removeAckAfterReply = cfg.messages?.removeAckAfterReply ?? false;
       const shouldAckReaction = () => {
         if (!ackReaction) return false;
         if (ackReactionScope === "all") return true;
@@ -949,15 +1140,19 @@ export function createDiscordMessageHandler(params: {
         }
         return false;
       };
-      if (shouldAckReaction()) {
-        reactMessageDiscord(message.channelId, message.id, ackReaction, {
-          rest: client.rest,
-        }).catch((err) => {
-          logVerbose(
-            `discord react failed for channel ${message.channelId}: ${String(err)}`,
-          );
-        });
-      }
+      const ackReactionPromise = shouldAckReaction()
+        ? reactMessageDiscord(message.channelId, message.id, ackReaction, {
+            rest: client.rest,
+          }).then(
+            () => true,
+            (err) => {
+              logVerbose(
+                `discord react failed for channel ${message.channelId}: ${String(err)}`,
+              );
+              return false;
+            },
+          )
+        : null;
 
       const fromLabel = isDirectMessage
         ? buildDirectLabel(author)
@@ -981,30 +1176,27 @@ export function createDiscordMessageHandler(params: {
           ? systemPromptParts.join("\n\n")
           : undefined;
       let combinedBody = formatAgentEnvelope({
-        provider: "Discord",
+        channel: "Discord",
         from: fromLabel,
         timestamp: resolveTimestampMs(message.timestamp),
         body: text,
       });
       let shouldClearHistory = false;
       if (!isDirectMessage) {
-        const history =
-          historyLimit > 0 ? (guildHistories.get(message.channelId) ?? []) : [];
-        const historyWithoutCurrent =
-          history.length > 0 ? history.slice(0, -1) : [];
-        if (historyWithoutCurrent.length > 0) {
-          const historyText = historyWithoutCurrent
-            .map((entry) =>
-              formatAgentEnvelope({
-                provider: "Discord",
-                from: fromLabel,
-                timestamp: entry.timestamp,
-                body: `${entry.sender}: ${entry.body} [id:${entry.messageId ?? "unknown"} channel:${message.channelId}]`,
-              }),
-            )
-            .join("\n");
-          combinedBody = `[Chat messages since your last reply - for context]\n${historyText}\n\n[Current message - respond to this]\n${combinedBody}`;
-        }
+        combinedBody = buildHistoryContextFromMap({
+          historyMap: guildHistories,
+          historyKey: message.channelId,
+          limit: historyLimit,
+          entry: historyEntry,
+          currentMessage: combinedBody,
+          formatEntry: (entry) =>
+            formatAgentEnvelope({
+              channel: "Discord",
+              from: fromLabel,
+              timestamp: entry.timestamp,
+              body: `${entry.sender}: ${entry.body} [id:${entry.messageId ?? "unknown"} channel:${message.channelId}]`,
+            }),
+        });
         const name = formatDiscordUserTag(author);
         const id = author.id;
         combinedBody = `${combinedBody}\n[from: ${name} user id:${id}]`;
@@ -1027,7 +1219,7 @@ export function createDiscordMessageHandler(params: {
         });
         if (starter?.text) {
           const starterEnvelope = formatThreadStarterEnvelope({
-            provider: "Discord",
+            channel: "Discord",
             author: starter.author,
             timestamp: starter.timestamp,
             body: starter.text,
@@ -1041,7 +1233,7 @@ export function createDiscordMessageHandler(params: {
         if (threadParentId) {
           parentSessionKey = buildAgentSessionKey({
             agentId: route.agentId,
-            provider: route.provider,
+            channel: route.channel,
             peer: { kind: "channel", id: threadParentId },
           });
         }
@@ -1056,6 +1248,8 @@ export function createDiscordMessageHandler(params: {
       });
       const ctxPayload = {
         Body: combinedBody,
+        RawBody: baseText,
+        CommandBody: baseText,
         From: isDirectMessage
           ? `discord:${author.id}`
           : `group:${message.channelId}`,
@@ -1089,11 +1283,30 @@ export function createDiscordMessageHandler(params: {
         OriginatingChannel: "discord" as const,
         OriginatingTo: discordTo,
       };
-      const replyTarget = ctxPayload.To ?? undefined;
+      let replyTarget = ctxPayload.To ?? undefined;
       if (!replyTarget) {
         runtime.error?.(danger("discord: missing reply target"));
         return;
       }
+      const createdThreadId = await maybeCreateDiscordAutoThread({
+        client,
+        message,
+        isGuildMessage,
+        channelConfig,
+        threadChannel,
+        baseText: baseText ?? "",
+        combinedBody,
+      });
+      const replyPlan = resolveDiscordReplyDeliveryPlan({
+        replyTarget,
+        replyToMode,
+        messageId: message.id,
+        threadChannel,
+        createdThreadId,
+      });
+      const deliverTarget = replyPlan.deliverTarget;
+      replyTarget = replyPlan.replyTarget;
+      const replyReference = replyPlan.replyReference;
 
       if (isDirectMessage) {
         const sessionCfg = cfg.session;
@@ -1103,7 +1316,7 @@ export function createDiscordMessageHandler(params: {
         await updateLastRoute({
           storePath,
           sessionKey: route.mainSessionKey,
-          provider: "discord",
+          channel: "discord",
           to: `user:${author.id}`,
           accountId: route.accountId,
         });
@@ -1124,19 +1337,22 @@ export function createDiscordMessageHandler(params: {
         createReplyDispatcherWithTyping({
           responsePrefix: resolveEffectiveMessagesConfig(cfg, route.agentId)
             .responsePrefix,
+          humanDelay: resolveHumanDelayConfig(cfg, route.agentId),
           deliver: async (payload) => {
+            const replyToId = replyReference.use();
             await deliverDiscordReply({
               replies: [payload],
-              target: replyTarget,
+              target: deliverTarget,
               token,
               accountId,
               rest: client.rest,
               runtime,
-              replyToMode,
+              replyToId,
               textLimit,
               maxLinesPerMessage: discordConfig?.maxLinesPerMessage,
             });
             didSendReply = true;
+            replyReference.markSent();
           },
           onError: (err, info) => {
             runtime.error?.(
@@ -1167,7 +1383,10 @@ export function createDiscordMessageHandler(params: {
           historyLimit > 0 &&
           didSendReply
         ) {
-          guildHistories.set(message.channelId, []);
+          clearHistoryEntries({
+            historyMap: guildHistories,
+            historyKey: message.channelId,
+          });
         }
         return;
       }
@@ -1178,13 +1397,34 @@ export function createDiscordMessageHandler(params: {
           `discord: delivered ${finalCount} reply${finalCount === 1 ? "" : "ies"} to ${replyTarget}`,
         );
       }
+      if (removeAckAfterReply && ackReactionPromise && ackReaction) {
+        const ackReactionValue = ackReaction;
+        void ackReactionPromise.then((didAck) => {
+          if (!didAck) return;
+          removeReactionDiscord(
+            message.channelId,
+            message.id,
+            ackReactionValue,
+            {
+              rest: client.rest,
+            },
+          ).catch((err) => {
+            logVerbose(
+              `discord: failed to remove ack reaction from ${message.channelId}/${message.id}: ${String(err)}`,
+            );
+          });
+        });
+      }
       if (
         isGuildMessage &&
         shouldClearHistory &&
         historyLimit > 0 &&
         didSendReply
       ) {
-        guildHistories.set(message.channelId, []);
+        clearHistoryEntries({
+          historyMap: guildHistories,
+          historyKey: message.channelId,
+        });
       }
     } catch (err) {
       runtime.error?.(danger(`handler failed: ${String(err)}`));
@@ -1364,7 +1604,7 @@ async function handleDiscordReactionEvent(params: {
     const text = authorLabel ? `${baseText} from ${authorLabel}` : baseText;
     const route = resolveAgentRoute({
       cfg: params.cfg,
-      provider: "discord",
+      channel: "discord",
       accountId: params.accountId,
       guildId: data.guild_id ?? undefined,
       peer: { kind: "channel", id: data.channel_id },
@@ -1380,14 +1620,14 @@ async function handleDiscordReactionEvent(params: {
   }
 }
 
-function createDiscordNativeCommand(params: {
+export function createDiscordNativeCommand(params: {
   command: {
     name: string;
     description: string;
     acceptsArgs: boolean;
   };
   cfg: ReturnType<typeof loadConfig>;
-  discordConfig: ClawdbotConfig["discord"];
+  discordConfig: DiscordConfig;
   accountId: string;
   sessionPrefix: string;
   ephemeralDefault: boolean;
@@ -1483,7 +1723,7 @@ function createDiscordNativeCommand(params: {
           return;
         }
         if (dmPolicy !== "open") {
-          const storeAllowFrom = await readProviderAllowFromStore(
+          const storeAllowFrom = await readChannelAllowFromStore(
             "discord",
           ).catch(() => []);
           const effectiveAllowFrom = [
@@ -1504,8 +1744,8 @@ function createDiscordNativeCommand(params: {
           if (!permitted) {
             commandAuthorized = false;
             if (dmPolicy === "pairing") {
-              const { code, created } = await upsertProviderPairingRequest({
-                provider: "discord",
+              const { code, created } = await upsertChannelPairingRequest({
+                channel: "discord",
                 id: user.id,
                 meta: {
                   tag: formatDiscordUserTag(user),
@@ -1515,7 +1755,7 @@ function createDiscordNativeCommand(params: {
               if (created) {
                 await interaction.reply({
                   content: buildPairingReply({
-                    provider: "discord",
+                    channel: "discord",
                     idLine: `Your Discord user id: ${user.id}`,
                     code,
                   }),
@@ -1560,7 +1800,7 @@ function createDiscordNativeCommand(params: {
       const interactionId = interaction.rawData.id;
       const route = resolveAgentRoute({
         cfg,
-        provider: "discord",
+        channel: "discord",
         accountId,
         guildId: interaction.guild?.id ?? undefined,
         peer: {
@@ -1570,6 +1810,7 @@ function createDiscordNativeCommand(params: {
       });
       const ctxPayload = {
         Body: prompt,
+        CommandBody: prompt,
         From: isDirectMessage ? `discord:${user.id}` : `group:${channelId}`,
         To: `slash:${user.id}`,
         SessionKey: `agent:${route.agentId}:${sessionPrefix}:${user.id}`,
@@ -1609,38 +1850,37 @@ function createDiscordNativeCommand(params: {
       };
 
       let didReply = false;
-      const dispatcher = createReplyDispatcher({
-        responsePrefix: resolveEffectiveMessagesConfig(cfg, route.agentId)
-          .responsePrefix,
-        deliver: async (payload, _info) => {
-          await deliverDiscordInteractionReply({
-            interaction,
-            payload,
-            textLimit: resolveTextChunkLimit(cfg, "discord", accountId),
-            maxLinesPerMessage: discordConfig?.maxLinesPerMessage,
-            preferFollowUp: didReply,
-          });
-          didReply = true;
+      await dispatchReplyWithDispatcher({
+        ctx: ctxPayload,
+        cfg,
+        dispatcherOptions: {
+          responsePrefix: resolveEffectiveMessagesConfig(cfg, route.agentId)
+            .responsePrefix,
+          humanDelay: resolveHumanDelayConfig(cfg, route.agentId),
+          deliver: async (payload) => {
+            await deliverDiscordInteractionReply({
+              interaction,
+              payload,
+              textLimit: resolveTextChunkLimit(cfg, "discord", accountId, {
+                fallbackLimit: 2000,
+              }),
+              maxLinesPerMessage: discordConfig?.maxLinesPerMessage,
+              preferFollowUp: didReply,
+            });
+            didReply = true;
+          },
+          onError: (err, info) => {
+            console.error(`discord slash ${info.kind} reply failed`, err);
+          },
         },
-        onError: (err) => {
-          console.error(err);
+        replyOptions: {
+          skillFilter: channelConfig?.skills,
+          disableBlockStreaming:
+            typeof discordConfig?.blockStreaming === "boolean"
+              ? !discordConfig.blockStreaming
+              : undefined,
         },
       });
-
-      const replyResult = await getReplyFromConfig(
-        ctxPayload,
-        { skillFilter: channelConfig?.skills },
-        cfg,
-      );
-      const replies = replyResult
-        ? Array.isArray(replyResult)
-          ? replyResult
-          : [replyResult]
-        : [];
-      for (const reply of replies) {
-        dispatcher.sendFinalReply(reply);
-      }
-      await dispatcher.waitForIdle();
     }
   })();
 }
@@ -1733,7 +1973,7 @@ async function deliverDiscordReply(params: {
   runtime: RuntimeEnv;
   textLimit: number;
   maxLinesPerMessage?: number;
-  replyToMode: ReplyToMode;
+  replyToId?: string;
 }) {
   const chunkLimit = Math.min(params.textLimit, 2000);
   for (const payload of params.replies) {
@@ -1741,8 +1981,10 @@ async function deliverDiscordReply(params: {
       payload.mediaUrls ?? (payload.mediaUrl ? [payload.mediaUrl] : []);
     const text = payload.text ?? "";
     if (!text && mediaList.length === 0) continue;
+    const replyTo = params.replyToId?.trim() || undefined;
 
     if (mediaList.length === 0) {
+      let isFirstChunk = true;
       for (const chunk of chunkDiscordText(text, {
         maxChars: chunkLimit,
         maxLines: params.maxLinesPerMessage,
@@ -1753,7 +1995,9 @@ async function deliverDiscordReply(params: {
           token: params.token,
           rest: params.rest,
           accountId: params.accountId,
+          replyTo: isFirstChunk ? replyTo : undefined,
         });
+        isFirstChunk = false;
       }
       continue;
     }
@@ -1765,6 +2009,7 @@ async function deliverDiscordReply(params: {
       rest: params.rest,
       mediaUrl: firstMedia,
       accountId: params.accountId,
+      replyTo,
     });
     for (const extra of mediaList.slice(1)) {
       await sendMessageDiscord(params.target, "", {
@@ -1829,19 +2074,16 @@ async function resolveMediaList(
   const out: DiscordMediaInfo[] = [];
   for (const attachment of attachments) {
     try {
-      const res = await fetch(attachment.url);
-      if (!res.ok) {
-        throw new Error(
-          `Failed to download discord attachment: HTTP ${res.status}`,
-        );
-      }
-      const buffer = Buffer.from(await res.arrayBuffer());
-      const mime = await detectMime({
-        buffer,
-        headerMime: attachment.content_type ?? res.headers.get("content-type"),
-        filePath: attachment.filename ?? attachment.url,
+      const fetched = await fetchRemoteMedia({
+        url: attachment.url,
+        filePathHint: attachment.filename ?? attachment.url,
       });
-      const saved = await saveMediaBuffer(buffer, mime, "inbound", maxBytes);
+      const saved = await saveMediaBuffer(
+        fetched.buffer,
+        fetched.contentType ?? attachment.content_type,
+        "inbound",
+        maxBytes,
+      );
       out.push({
         path: saved.path,
         contentType: saved.contentType,
@@ -1887,15 +2129,84 @@ function buildDiscordAttachmentPlaceholder(
 
 function resolveDiscordMessageText(
   message: Message,
-  fallbackText?: string,
+  options?: { fallbackText?: string; includeForwarded?: boolean },
 ): string {
-  return (
+  const baseText =
     message.content?.trim() ||
     buildDiscordAttachmentPlaceholder(message.attachments) ||
     message.embeds?.[0]?.description ||
-    fallbackText?.trim() ||
-    ""
+    options?.fallbackText?.trim() ||
+    "";
+  if (!options?.includeForwarded) return baseText;
+  const forwardedText = resolveDiscordForwardedMessagesText(message);
+  if (!forwardedText) return baseText;
+  if (!baseText) return forwardedText;
+  return `${baseText}\n${forwardedText}`;
+}
+
+function resolveDiscordForwardedMessagesText(message: Message): string {
+  const snapshots = resolveDiscordMessageSnapshots(message);
+  if (snapshots.length === 0) return "";
+  const forwardedBlocks = snapshots
+    .map((snapshot) => {
+      const snapshotMessage = snapshot.message;
+      if (!snapshotMessage) return null;
+      const text = resolveDiscordSnapshotMessageText(snapshotMessage);
+      if (!text) return null;
+      const authorLabel = formatDiscordSnapshotAuthor(snapshotMessage.author);
+      const heading = authorLabel
+        ? `[Forwarded message from ${authorLabel}]`
+        : "[Forwarded message]";
+      return `${heading}\n${text}`;
+    })
+    .filter((entry): entry is string => Boolean(entry));
+  if (forwardedBlocks.length === 0) return "";
+  return forwardedBlocks.join("\n\n");
+}
+
+function resolveDiscordMessageSnapshots(
+  message: Message,
+): DiscordMessageSnapshot[] {
+  const rawData = (message as { rawData?: { message_snapshots?: unknown } })
+    .rawData;
+  const snapshots =
+    rawData?.message_snapshots ??
+    (message as { message_snapshots?: unknown }).message_snapshots ??
+    (message as { messageSnapshots?: unknown }).messageSnapshots;
+  if (!Array.isArray(snapshots)) return [];
+  return snapshots.filter(
+    (entry): entry is DiscordMessageSnapshot =>
+      Boolean(entry) && typeof entry === "object",
   );
+}
+
+function resolveDiscordSnapshotMessageText(
+  snapshot: DiscordSnapshotMessage,
+): string {
+  const content = snapshot.content?.trim() ?? "";
+  const attachmentText = buildDiscordAttachmentPlaceholder(
+    snapshot.attachments ?? undefined,
+  );
+  const embed = snapshot.embeds?.[0];
+  const embedText = embed?.description?.trim() || embed?.title?.trim() || "";
+  return content || attachmentText || embedText || "";
+}
+
+function formatDiscordSnapshotAuthor(
+  author: DiscordSnapshotAuthor | null | undefined,
+): string | undefined {
+  if (!author) return undefined;
+  const globalName = author.global_name ?? undefined;
+  const username = author.username ?? undefined;
+  const name = author.name ?? undefined;
+  const discriminator = author.discriminator ?? undefined;
+  const base = globalName || username || name;
+  if (username && discriminator && discriminator !== "0") {
+    return `@${username}#${discriminator}`;
+  }
+  if (base) return `@${base}`;
+  if (author.id) return `@${author.id}`;
+  return undefined;
 }
 
 export function buildDiscordMediaPayload(
@@ -1926,14 +2237,16 @@ export function buildDiscordMediaPayload(
 function resolveReplyContext(message: Message): string | null {
   const referenced = message.referencedMessage;
   if (!referenced?.author) return null;
-  const referencedText = resolveDiscordMessageText(referenced);
+  const referencedText = resolveDiscordMessageText(referenced, {
+    includeForwarded: true,
+  });
   if (!referencedText) return null;
   const fromLabel = referenced.author
     ? buildDirectLabel(referenced.author)
     : "Unknown";
   const body = `${referencedText}\n[discord message id: ${referenced.id} channel: ${referenced.channelId} from: ${formatDiscordUserTag(referenced.author)} user id:${referenced.author?.id ?? "unknown"}]`;
   return formatAgentEnvelope({
-    provider: "Discord",
+    channel: "Discord",
     from: fromLabel,
     timestamp: resolveTimestampMs(referenced.timestamp),
     body,
@@ -2213,6 +2526,7 @@ export function resolveDiscordChannelConfig(params: {
       enabled: byId.enabled,
       users: byId.users,
       systemPrompt: byId.systemPrompt,
+      autoThread: byId.autoThread,
     };
   if (channelSlug && channels[channelSlug]) {
     const entry = channels[channelSlug];
@@ -2223,6 +2537,7 @@ export function resolveDiscordChannelConfig(params: {
       enabled: entry.enabled,
       users: entry.users,
       systemPrompt: entry.systemPrompt,
+      autoThread: entry.autoThread,
     };
   }
   if (channelName && channels[channelName]) {
@@ -2234,9 +2549,25 @@ export function resolveDiscordChannelConfig(params: {
       enabled: entry.enabled,
       users: entry.users,
       systemPrompt: entry.systemPrompt,
+      autoThread: entry.autoThread,
     };
   }
   return { allowed: false };
+}
+
+export function resolveDiscordShouldRequireMention(params: {
+  isGuildMessage: boolean;
+  isThread: boolean;
+  channelConfig?: DiscordChannelConfigResolved | null;
+  guildInfo?: DiscordGuildEntryResolved | null;
+}): boolean {
+  if (!params.isGuildMessage) return false;
+  if (params.isThread && params.channelConfig?.autoThread) return false;
+  return (
+    params.channelConfig?.requireMention ??
+    params.guildInfo?.requireMention ??
+    true
+  );
 }
 
 export function isDiscordGroupAllowedByPolicy(params: {

@@ -6,9 +6,17 @@ import { fileURLToPath } from "node:url";
 import type {
   AgentMessage,
   AgentTool,
+  StreamFn,
   ThinkingLevel,
 } from "@mariozechner/pi-agent-core";
-import type { Api, AssistantMessage, Model } from "@mariozechner/pi-ai";
+import type {
+  Api,
+  AssistantMessage,
+  ImageContent,
+  Model,
+  SimpleStreamOptions,
+} from "@mariozechner/pi-ai";
+import { streamSimple } from "@mariozechner/pi-ai";
 import {
   createAgentSession,
   discoverAuthStorage,
@@ -17,6 +25,7 @@ import {
   SettingsManager,
 } from "@mariozechner/pi-coding-agent";
 import { resolveHeartbeatPrompt } from "../auto-reply/heartbeat.js";
+import { parseReplyDirectives } from "../auto-reply/reply/reply-directives.js";
 import type {
   ReasoningLevel,
   ThinkLevel,
@@ -24,47 +33,76 @@ import type {
 } from "../auto-reply/thinking.js";
 import { formatToolAggregate } from "../auto-reply/tool-meta.js";
 import { isCacheEnabled, resolveCacheTtlMs } from "../config/cache-utils.js";
+import { resolveChannelCapabilities } from "../config/channel-capabilities.js";
 import type { ClawdbotConfig } from "../config/config.js";
 import { getMachineDisplayName } from "../infra/machine-name.js";
+import { registerUnhandledRejectionHandler } from "../infra/unhandled-rejections.js";
 import { createSubsystemLogger } from "../logging.js";
-import { splitMediaFromOutput } from "../media/parse.js";
 import {
   type enqueueCommand,
   enqueueCommandInLane,
 } from "../process/command-queue.js";
+import { normalizeMessageChannel } from "../utils/message-channel.js";
+import { isReasoningTagProvider } from "../utils/provider-utils.js";
 import { resolveUserPath } from "../utils.js";
 import { resolveClawdbotAgentDir } from "./agent-paths.js";
+import { resolveSessionAgentIds } from "./agent-scope.js";
 import {
-  markAuthProfileCooldown,
+  markAuthProfileFailure,
   markAuthProfileGood,
   markAuthProfileUsed,
 } from "./auth-profiles.js";
-import type { BashElevatedDefaults } from "./bash-tools.js";
+import type { ExecElevatedDefaults, ExecToolDefaults } from "./bash-tools.js";
+import {
+  CONTEXT_WINDOW_HARD_MIN_TOKENS,
+  CONTEXT_WINDOW_WARN_BELOW_TOKENS,
+  evaluateContextWindowGuard,
+  resolveContextWindowInfo,
+} from "./context-window-guard.js";
 import {
   DEFAULT_CONTEXT_TOKENS,
   DEFAULT_MODEL,
   DEFAULT_PROVIDER,
 } from "./defaults.js";
+import { FailoverError, resolveFailoverStatus } from "./failover-error.js";
 import {
   ensureAuthProfileStore,
   getApiKeyForModel,
   resolveAuthProfileOrder,
+  resolveModelAuthMode,
 } from "./model-auth.js";
+import { normalizeModelCompat } from "./model-compat.js";
 import { ensureClawdbotModelsJson } from "./models-config.js";
+import type { MessagingToolSend } from "./pi-embedded-messaging.js";
+import {
+  ensurePiCompactionReserveTokens,
+  resolveCompactionReserveTokensFloor,
+} from "./pi-settings.js";
+import { acquireSessionWriteLock } from "./session-write-lock.js";
+
+export type { MessagingToolSend } from "./pi-embedded-messaging.js";
+
 import {
   buildBootstrapContextFiles,
+  classifyFailoverReason,
+  downgradeGeminiHistory,
   type EmbeddedContextFile,
   ensureSessionHeader,
   formatAssistantErrorText,
   isAuthAssistantError,
-  isAuthErrorMessage,
+  isCloudCodeAssistFormatError,
+  isCompactionFailureError,
   isContextOverflowError,
+  isFailoverAssistantError,
+  isFailoverErrorMessage,
   isGoogleModelApi,
   isRateLimitAssistantError,
-  isRateLimitErrorMessage,
+  isTimeoutErrorMessage,
   pickFallbackThinkingLevel,
+  resolveBootstrapMaxChars,
   sanitizeGoogleTurnOrdering,
   sanitizeSessionMessagesImages,
+  validateAnthropicTurns,
   validateGeminiTurns,
 } from "./pi-embedded-helpers.js";
 import {
@@ -74,7 +112,7 @@ import {
 import {
   extractAssistantText,
   extractAssistantThinking,
-  formatReasoningMarkdown,
+  formatReasoningMessage,
 } from "./pi-embedded-utils.js";
 import { setContextPruningRuntime } from "./pi-extensions/context-pruning/runtime.js";
 import { computeEffectiveSettings } from "./pi-extensions/context-pruning/settings.js";
@@ -82,15 +120,22 @@ import { makeToolPrunablePredicate } from "./pi-extensions/context-pruning/tools
 import { toToolDefinitions } from "./pi-tool-definition-adapter.js";
 import { createClawdbotCodingTools } from "./pi-tools.js";
 import { resolveSandboxContext } from "./sandbox.js";
+import { guardSessionManager } from "./session-tool-result-guard-wrapper.js";
+import { sanitizeToolUseResultPairing } from "./session-transcript-repair.js";
 import {
   applySkillEnvOverrides,
   applySkillEnvOverridesFromSnapshot,
   loadWorkspaceSkillEntries,
+  resolveSkillsPromptForRun,
   type SkillSnapshot,
 } from "./skills.js";
 import { buildAgentSystemPrompt } from "./system-prompt.js";
+import { buildToolSummaryMap } from "./tool-summaries.js";
 import { normalizeUsage, type UsageLike } from "./usage.js";
-import { loadWorkspaceBootstrapFiles } from "./workspace.js";
+import {
+  filterBootstrapFilesForSession,
+  loadWorkspaceBootstrapFiles,
+} from "./workspace.js";
 
 // Optional features can be implemented as Pi extensions that run in the same Node process.
 
@@ -157,6 +202,76 @@ export function resolveExtraParams(params: {
   return extraParams;
 }
 
+/**
+ * Create a wrapped streamFn that injects extra params (like temperature) from config.
+ *
+ * @internal
+ */
+function createStreamFnWithExtraParams(
+  baseStreamFn: StreamFn | undefined,
+  extraParams: Record<string, unknown> | undefined,
+): StreamFn | undefined {
+  if (!extraParams || Object.keys(extraParams).length === 0) {
+    return undefined; // No wrapper needed
+  }
+
+  const streamParams: Partial<SimpleStreamOptions> = {};
+  if (typeof extraParams.temperature === "number") {
+    streamParams.temperature = extraParams.temperature;
+  }
+  if (typeof extraParams.maxTokens === "number") {
+    streamParams.maxTokens = extraParams.maxTokens;
+  }
+
+  if (Object.keys(streamParams).length === 0) {
+    return undefined;
+  }
+
+  log.debug(
+    `creating streamFn wrapper with params: ${JSON.stringify(streamParams)}`,
+  );
+
+  const underlying = baseStreamFn ?? streamSimple;
+  const wrappedStreamFn: StreamFn = (model, context, options) =>
+    underlying(model, context, {
+      ...streamParams,
+      ...options, // Caller options take precedence
+    });
+
+  return wrappedStreamFn;
+}
+
+/**
+ * Apply extra params (like temperature) to an agent's streamFn.
+ *
+ * @internal Exported for testing
+ */
+export function applyExtraParamsToAgent(
+  agent: { streamFn?: StreamFn },
+  cfg: ClawdbotConfig | undefined,
+  provider: string,
+  modelId: string,
+  thinkLevel?: string,
+): void {
+  const extraParams = resolveExtraParams({
+    cfg,
+    provider,
+    modelId,
+    thinkLevel,
+  });
+  const wrappedStreamFn = createStreamFnWithExtraParams(
+    agent.streamFn,
+    extraParams,
+  );
+
+  if (wrappedStreamFn) {
+    log.debug(
+      `applying extraParams to agent streamFn for ${provider}/${modelId}`,
+    );
+    agent.streamFn = wrappedStreamFn;
+  }
+}
+
 // We configure context pruning per-session via a WeakMap registry keyed by the SessionManager instance.
 
 function resolvePiExtensionPath(id: string): string {
@@ -173,41 +288,13 @@ function resolveContextWindowTokens(params: {
   modelId: string;
   model: Model<Api> | undefined;
 }): number {
-  const fromModel =
-    typeof params.model?.contextWindow === "number" &&
-    Number.isFinite(params.model.contextWindow) &&
-    params.model.contextWindow > 0
-      ? params.model.contextWindow
-      : undefined;
-  if (fromModel) return fromModel;
-
-  const fromModelsConfig = (() => {
-    const providers = params.cfg?.models?.providers as
-      | Record<
-          string,
-          { models?: Array<{ id?: string; contextWindow?: number }> }
-        >
-      | undefined;
-    const providerEntry = providers?.[params.provider];
-    const models = Array.isArray(providerEntry?.models)
-      ? providerEntry.models
-      : [];
-    const match = models.find((m) => m?.id === params.modelId);
-    return typeof match?.contextWindow === "number" && match.contextWindow > 0
-      ? match.contextWindow
-      : undefined;
-  })();
-  if (fromModelsConfig) return fromModelsConfig;
-
-  const fromAgentConfig =
-    typeof params.cfg?.agents?.defaults?.contextTokens === "number" &&
-    Number.isFinite(params.cfg.agents.defaults.contextTokens) &&
-    params.cfg.agents.defaults.contextTokens > 0
-      ? Math.floor(params.cfg.agents.defaults.contextTokens)
-      : undefined;
-  if (fromAgentConfig) return fromAgentConfig;
-
-  return DEFAULT_CONTEXT_TOKENS;
+  return resolveContextWindowInfo({
+    cfg: params.cfg,
+    provider: params.provider,
+    modelId: params.modelId,
+    modelContextWindow: params.model?.contextWindow,
+    defaultTokens: DEFAULT_CONTEXT_TOKENS,
+  }).tokens;
 }
 
 function buildContextPruningExtension(params: {
@@ -234,6 +321,30 @@ function buildContextPruningExtension(params: {
   };
 }
 
+function resolveCompactionMode(cfg?: ClawdbotConfig): "default" | "safeguard" {
+  return cfg?.agents?.defaults?.compaction?.mode === "safeguard"
+    ? "safeguard"
+    : "default";
+}
+
+function buildEmbeddedExtensionPaths(params: {
+  cfg: ClawdbotConfig | undefined;
+  sessionManager: SessionManager;
+  provider: string;
+  modelId: string;
+  model: Model<Api> | undefined;
+}): string[] {
+  const paths = [resolvePiExtensionPath("transcript-sanitize")];
+  if (resolveCompactionMode(params.cfg) === "safeguard") {
+    paths.push(resolvePiExtensionPath("compaction-safeguard"));
+  }
+  const pruning = buildContextPruningExtension(params);
+  if (pruning.additionalExtensionPaths) {
+    paths.push(...pruning.additionalExtensionPaths);
+  }
+  return paths;
+}
+
 export type EmbeddedPiAgentMeta = {
   sessionId: string;
   provider: string;
@@ -251,6 +362,10 @@ export type EmbeddedPiRunMeta = {
   durationMs: number;
   agentMeta?: EmbeddedPiAgentMeta;
   aborted?: boolean;
+  error?: {
+    kind: "context_overflow" | "compaction_failure";
+    message: string;
+  };
 };
 
 function buildModelAliasLines(cfg?: ClawdbotConfig) {
@@ -274,13 +389,6 @@ type ApiKeyInfo = {
   apiKey: string;
   profileId?: string;
   source: string;
-};
-
-export type MessagingToolSend = {
-  tool: string;
-  provider: string;
-  accountId?: string;
-  to?: string;
 };
 
 export type EmbeddedPiRunResult = {
@@ -322,6 +430,92 @@ type EmbeddedPiQueueHandle = {
 
 const log = createSubsystemLogger("agent/embedded");
 const GOOGLE_TURN_ORDERING_CUSTOM_TYPE = "google-turn-ordering-bootstrap";
+const GOOGLE_SCHEMA_UNSUPPORTED_KEYWORDS = new Set([
+  "patternProperties",
+  "additionalProperties",
+  "$schema",
+  "$id",
+  "$ref",
+  "$defs",
+  "definitions",
+  "examples",
+  "minLength",
+  "maxLength",
+  "minimum",
+  "maximum",
+  "multipleOf",
+  "pattern",
+  "format",
+  "minItems",
+  "maxItems",
+  "uniqueItems",
+  "minProperties",
+  "maxProperties",
+]);
+
+function findUnsupportedSchemaKeywords(
+  schema: unknown,
+  path: string,
+): string[] {
+  if (!schema || typeof schema !== "object") return [];
+  if (Array.isArray(schema)) {
+    return schema.flatMap((item, index) =>
+      findUnsupportedSchemaKeywords(item, `${path}[${index}]`),
+    );
+  }
+  const record = schema as Record<string, unknown>;
+  const violations: string[] = [];
+  for (const [key, value] of Object.entries(record)) {
+    if (GOOGLE_SCHEMA_UNSUPPORTED_KEYWORDS.has(key)) {
+      violations.push(`${path}.${key}`);
+    }
+    if (value && typeof value === "object") {
+      violations.push(
+        ...findUnsupportedSchemaKeywords(value, `${path}.${key}`),
+      );
+    }
+  }
+  return violations;
+}
+
+function logToolSchemasForGoogle(params: {
+  tools: AgentTool[];
+  provider: string;
+}) {
+  if (
+    params.provider !== "google-antigravity" &&
+    params.provider !== "google-gemini-cli"
+  ) {
+    return;
+  }
+  const toolNames = params.tools.map((tool, index) => `${index}:${tool.name}`);
+  log.info("google tool schema snapshot", {
+    provider: params.provider,
+    toolCount: params.tools.length,
+    tools: toolNames,
+  });
+  for (const [index, tool] of params.tools.entries()) {
+    const violations = findUnsupportedSchemaKeywords(
+      tool.parameters,
+      `${tool.name}.parameters`,
+    );
+    if (violations.length > 0) {
+      log.warn("google tool schema has unsupported keywords", {
+        index,
+        tool: tool.name,
+        violations: violations.slice(0, 12),
+        violationCount: violations.length,
+      });
+    }
+  }
+}
+
+registerUnhandledRejectionHandler((reason) => {
+  const message = describeUnknownError(reason);
+  if (!isCompactionFailureError(message)) return false;
+  log.error(`Auto-compaction failed (unhandled): ${message}`);
+  return true;
+});
 
 type CustomEntryLike = { type?: unknown; customType?: unknown };
 
@@ -387,13 +581,131 @@ async function sanitizeSessionHistory(params: {
   const sanitizedImages = await sanitizeSessionMessagesImages(
     params.messages,
     "session:history",
+    {
+      sanitizeToolCallIds: isGoogleModelApi(params.modelApi),
+      enforceToolCallLast: params.modelApi === "anthropic-messages",
+    },
   );
+  const repairedTools = sanitizeToolUseResultPairing(sanitizedImages);
+
+  // Downgrade tool calls missing thought_signature if using Gemini
+  const downgraded = isGoogleModelApi(params.modelApi)
+    ? downgradeGeminiHistory(repairedTools)
+    : repairedTools;
+
   return applyGoogleTurnOrderingFix({
-    messages: sanitizedImages,
+    messages: downgraded,
     modelApi: params.modelApi,
     sessionManager: params.sessionManager,
     sessionId: params.sessionId,
   }).messages;
+}
+
+/**
+ * Limits conversation history to the last N user turns (and their associated
+ * assistant responses). This reduces token usage for long-running DM sessions.
+ *
+ * @param messages - The full message history
+ * @param limit - Max number of user turns to keep (undefined = no limit)
+ * @returns Messages trimmed to the last `limit` user turns
+ */
+export function limitHistoryTurns(
+  messages: AgentMessage[],
+  limit: number | undefined,
+): AgentMessage[] {
+  if (!limit || limit <= 0 || messages.length === 0) return messages;
+
+  // Count user messages from the end, find cutoff point
+  let userCount = 0;
+  let lastUserIndex = messages.length;
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") {
+      userCount++;
+      if (userCount > limit) {
+        // We exceeded the limit; keep from the last valid user turn onwards
+        return messages.slice(lastUserIndex);
+      }
+      lastUserIndex = i;
+    }
+  }
+  // Fewer than limit user turns, keep all
+  return messages;
+}
+
+/**
+ * Extracts the provider name and user ID from a session key and looks up
+ * dmHistoryLimit from the provider config, with per-DM override support.
+ *
+ * Session key formats:
+ * - `telegram:dm:123` → provider = telegram, userId = 123
+ * - `agent:main:telegram:dm:123` → provider = telegram, userId = 123
+ *
+ * Resolution order:
+ * 1. Per-DM override: provider.dms[userId].historyLimit
+ * 2. Provider default: provider.dmHistoryLimit
+ */
+export function getDmHistoryLimitFromSessionKey(
+  sessionKey: string | undefined,
+  config: ClawdbotConfig | undefined,
+): number | undefined {
+  if (!sessionKey || !config) return undefined;
+
+  const parts = sessionKey.split(":").filter(Boolean);
+  // Handle agent-prefixed keys: agent:<agentId>:<provider>:...
+  const providerParts =
+    parts.length >= 3 && parts[0] === "agent" ? parts.slice(2) : parts;
+
+  const provider = providerParts[0]?.toLowerCase();
+  if (!provider) return undefined;
+
+  // Extract userId: format is provider:dm:userId or provider:dm:userId:...
+  // The userId may contain colons (e.g., email addresses), so join remaining parts
+  const kind = providerParts[1]?.toLowerCase();
+  const userId = providerParts.slice(2).join(":");
+  if (kind !== "dm") return undefined;
+
+  // Helper to get limit with per-DM override support
+  const getLimit = (
+    providerConfig:
+      | {
+          dmHistoryLimit?: number;
+          dms?: Record<string, { historyLimit?: number }>;
+        }
+      | undefined,
+  ): number | undefined => {
+    if (!providerConfig) return undefined;
+    // Check per-DM override first
+    if (
+      userId &&
+      kind === "dm" &&
+      providerConfig.dms?.[userId]?.historyLimit !== undefined
+    ) {
+      return providerConfig.dms[userId].historyLimit;
+    }
+    // Fall back to provider default
+    return providerConfig.dmHistoryLimit;
+  };
+
+  // Map provider to config key
+  switch (provider) {
+    case "telegram":
+      return getLimit(config.channels?.telegram);
+    case "whatsapp":
+      return getLimit(config.channels?.whatsapp);
+    case "discord":
+      return getLimit(config.channels?.discord);
+    case "slack":
+      return getLimit(config.channels?.slack);
+    case "signal":
+      return getLimit(config.channels?.signal);
+    case "imessage":
+      return getLimit(config.channels?.imessage);
+    case "msteams":
+      return getLimit(config.channels?.msteams);
+    default:
+      return undefined;
+  }
 }
 
 const ACTIVE_EMBEDDED_RUNS = new Map<string, EmbeddedPiQueueHandle>();
@@ -481,6 +793,14 @@ type EmbeddedSandboxInfo = {
   agentWorkspaceMount?: string;
   browserControlUrl?: string;
   browserNoVncUrl?: string;
+  hostBrowserAllowed?: boolean;
+  allowedControlUrls?: string[];
+  allowedControlHosts?: string[];
+  allowedControlPorts?: number[];
+  elevated?: {
+    allowed: boolean;
+    defaultLevel: "on" | "off";
+  };
 };
 
 function resolveSessionLane(key: string) {
@@ -554,8 +874,12 @@ function describeUnknownError(error: unknown): string {
 
 export function buildEmbeddedSandboxInfo(
   sandbox?: Awaited<ReturnType<typeof resolveSandboxContext>>,
+  execElevated?: ExecElevatedDefaults,
 ): EmbeddedSandboxInfo | undefined {
   if (!sandbox?.enabled) return undefined;
+  const elevatedAllowed = Boolean(
+    execElevated?.enabled && execElevated.allowed,
+  );
   return {
     enabled: true,
     workspaceDir: sandbox.workspaceDir,
@@ -564,22 +888,38 @@ export function buildEmbeddedSandboxInfo(
       sandbox.workspaceAccess === "ro" ? "/agent" : undefined,
     browserControlUrl: sandbox.browser?.controlUrl,
     browserNoVncUrl: sandbox.browser?.noVncUrl,
+    hostBrowserAllowed: sandbox.browserAllowHostControl,
+    allowedControlUrls: sandbox.browserAllowedControlUrls,
+    allowedControlHosts: sandbox.browserAllowedControlHosts,
+    allowedControlPorts: sandbox.browserAllowedControlPorts,
+    ...(elevatedAllowed
+      ? {
+          elevated: {
+            allowed: true,
+            defaultLevel: execElevated?.defaultLevel ?? "off",
+          },
+        }
+      : {}),
   };
 }
 
 function buildEmbeddedSystemPrompt(params: {
   workspaceDir: string;
   defaultThinkLevel?: ThinkLevel;
+  reasoningLevel?: ReasoningLevel;
   extraSystemPrompt?: string;
   ownerNumbers?: string[];
   reasoningTagHint: boolean;
   heartbeatPrompt?: string;
+  skillsPrompt?: string;
   runtimeInfo: {
     host: string;
     os: string;
     arch: string;
     node: string;
     model: string;
+    provider?: string;
+    capabilities?: string[];
   };
   sandboxInfo?: EmbeddedSandboxInfo;
   tools: AgentTool[];
@@ -591,13 +931,16 @@ function buildEmbeddedSystemPrompt(params: {
   return buildAgentSystemPrompt({
     workspaceDir: params.workspaceDir,
     defaultThinkLevel: params.defaultThinkLevel,
+    reasoningLevel: params.reasoningLevel,
     extraSystemPrompt: params.extraSystemPrompt,
     ownerNumbers: params.ownerNumbers,
     reasoningTagHint: params.reasoningTagHint,
     heartbeatPrompt: params.heartbeatPrompt,
+    skillsPrompt: params.skillsPrompt,
     runtimeInfo: params.runtimeInfo,
     sandboxInfo: params.sandboxInfo,
     toolNames: params.tools.map((tool) => tool.name),
+    toolSummaries: buildToolSummaryMap(params.tools),
     modelAliasLines: params.modelAliasLines,
     userTimezone: params.userTimezone,
     userTime: params.userTime,
@@ -612,10 +955,8 @@ export function createSystemPromptOverride(
   return () => trimmed;
 }
 
-// Tool names are now capitalized (Bash, Read, Write, Edit) to bypass Anthropic's
-// OAuth token blocking of lowercase names. However, pi-coding-agent's SDK has
-// hardcoded lowercase names in its built-in tool registry, so we must pass ALL
-// tools as customTools to bypass the SDK's filtering.
+// We always pass tools via `customTools` so our policy filtering, sandbox integration,
+// and extended toolset remain consistent across providers.
 
 type AnyAgentTool = AgentTool;
 
@@ -626,9 +967,8 @@ export function splitSdkTools(options: {
   builtInTools: AnyAgentTool[];
   customTools: ReturnType<typeof toToolDefinitions>;
 } {
-  // Always pass all tools as customTools to bypass pi-coding-agent's built-in
-  // tool filtering, which expects lowercase names (bash, read, write, edit).
-  // Our tools are now capitalized (Bash, Read, Write, Edit) for OAuth compatibility.
+  // Always pass all tools as customTools so the SDK doesn't "helpfully" swap in
+  // its own built-in implementations (we need our tool wrappers + policy).
   const { tools } = options;
   return {
     builtInTools: [],
@@ -710,15 +1050,26 @@ export function resolveEmbeddedSessionLane(key: string) {
 }
 
 function mapThinkingLevel(level?: ThinkLevel): ThinkingLevel {
-  // pi-agent-core supports "xhigh" too; Clawdbot doesn't surface it for now.
+  // pi-agent-core supports "xhigh"; Clawdbot enables it for specific models.
   if (!level) return "off";
   return level;
+}
+
+function resolveExecToolDefaults(
+  config?: ClawdbotConfig,
+): ExecToolDefaults | undefined {
+  const tools = config?.tools;
+  if (!tools) return undefined;
+  if (!tools.exec) return tools.bash;
+  if (!tools.bash) return tools.exec;
+  return { ...tools.bash, ...tools.exec };
 }
 
 function resolveModel(
   provider: string,
   modelId: string,
   agentDir?: string,
+  cfg?: ClawdbotConfig,
 ): {
   model?: Model<Api>;
   error?: string;
@@ -730,18 +1081,51 @@ function resolveModel(
   const modelRegistry = discoverModels(authStorage, resolvedAgentDir);
   const model = modelRegistry.find(provider, modelId) as Model<Api> | null;
   if (!model) {
+    const providers = cfg?.models?.providers ?? {};
+    const inlineModels =
+      providers[provider]?.models ??
+      Object.values(providers)
+        .flatMap((entry) => entry?.models ?? [])
+        .map((entry) => ({ ...entry, provider }));
+    const inlineMatch = inlineModels.find((entry) => entry.id === modelId);
+    if (inlineMatch) {
+      const normalized = normalizeModelCompat(inlineMatch as Model<Api>);
+      return {
+        model: normalized,
+        authStorage,
+        modelRegistry,
+      };
+    }
+    const providerCfg = providers[provider];
+    if (providerCfg || modelId.startsWith("mock-")) {
+      const fallbackModel: Model<Api> = normalizeModelCompat({
+        id: modelId,
+        name: modelId,
+        api: providerCfg?.api ?? "openai-responses",
+        provider,
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow:
+          providerCfg?.models?.[0]?.contextWindow ?? DEFAULT_CONTEXT_TOKENS,
+        maxTokens:
+          providerCfg?.models?.[0]?.maxTokens ?? DEFAULT_CONTEXT_TOKENS,
+      } as Model<Api>);
+      return { model: fallbackModel, authStorage, modelRegistry };
+    }
     return {
       error: `Unknown model: ${provider}/${modelId}`,
       authStorage,
       modelRegistry,
     };
   }
-  return { model, authStorage, modelRegistry };
+  return { model: normalizeModelCompat(model), authStorage, modelRegistry };
 }
 
 export async function compactEmbeddedPiSession(params: {
   sessionId: string;
   sessionKey?: string;
+  messageChannel?: string;
   messageProvider?: string;
   agentAccountId?: string;
   sessionFile: string;
@@ -752,7 +1136,8 @@ export async function compactEmbeddedPiSession(params: {
   provider?: string;
   model?: string;
   thinkLevel?: ThinkLevel;
-  bashElevated?: BashElevatedDefaults;
+  reasoningLevel?: ReasoningLevel;
+  bashElevated?: ExecElevatedDefaults;
   customInstructions?: string;
   lane?: string;
   enqueue?: typeof enqueueCommand;
@@ -774,12 +1159,13 @@ export async function compactEmbeddedPiSession(params: {
       const provider =
         (params.provider ?? DEFAULT_PROVIDER).trim() || DEFAULT_PROVIDER;
       const modelId = (params.model ?? DEFAULT_MODEL).trim() || DEFAULT_MODEL;
-      await ensureClawdbotModelsJson(params.config);
       const agentDir = params.agentDir ?? resolveClawdbotAgentDir();
+      await ensureClawdbotModelsJson(params.config, agentDir);
       const { model, error, authStorage, modelRegistry } = resolveModel(
         provider,
         modelId,
         agentDir,
+        params.config,
       );
       if (!model) {
         return {
@@ -793,7 +1179,18 @@ export async function compactEmbeddedPiSession(params: {
           model,
           cfg: params.config,
         });
-        authStorage.setRuntimeApiKey(model.provider, apiKeyInfo.apiKey);
+
+        if (model.provider === "github-copilot") {
+          const { resolveCopilotApiToken } = await import(
+            "../providers/github-copilot-token.js"
+          );
+          const copilotToken = await resolveCopilotApiToken({
+            githubToken: apiKeyInfo.apiKey,
+          });
+          authStorage.setRuntimeApiKey(model.provider, copilotToken.token);
+        } else {
+          authStorage.setRuntimeApiKey(model.provider, apiKeyInfo.apiKey);
+        }
       } catch (err) {
         return {
           ok: false,
@@ -838,45 +1235,91 @@ export async function compactEmbeddedPiSession(params: {
               skills: skillEntries ?? [],
               config: params.config,
             });
+        const skillsPrompt = resolveSkillsPromptForRun({
+          skillsSnapshot: params.skillsSnapshot,
+          entries: shouldLoadSkillEntries ? skillEntries : undefined,
+          config: params.config,
+          workspaceDir: effectiveWorkspace,
+        });
 
-        const bootstrapFiles =
-          await loadWorkspaceBootstrapFiles(effectiveWorkspace);
-        const contextFiles = buildBootstrapContextFiles(bootstrapFiles);
+        const bootstrapFiles = filterBootstrapFilesForSession(
+          await loadWorkspaceBootstrapFiles(effectiveWorkspace),
+          params.sessionKey ?? params.sessionId,
+        );
+        const sessionLabel = params.sessionKey ?? params.sessionId;
+        const contextFiles = buildBootstrapContextFiles(bootstrapFiles, {
+          maxChars: resolveBootstrapMaxChars(params.config),
+          warn: (message) =>
+            log.warn(`${message} (sessionKey=${sessionLabel})`),
+        });
+        const runAbortController = new AbortController();
         const tools = createClawdbotCodingTools({
-          bash: {
-            ...params.config?.tools?.bash,
+          exec: {
+            ...resolveExecToolDefaults(params.config),
             elevated: params.bashElevated,
           },
           sandbox,
-          messageProvider: params.messageProvider,
+          messageProvider: params.messageChannel ?? params.messageProvider,
           agentAccountId: params.agentAccountId,
           sessionKey: params.sessionKey ?? params.sessionId,
           agentDir,
+          workspaceDir: effectiveWorkspace,
           config: params.config,
+          abortSignal: runAbortController.signal,
+          modelProvider: model.provider,
+          modelId,
+          modelAuthMode: resolveModelAuthMode(model.provider, params.config),
+          // No currentChannelId/currentThreadTs for compaction - not in message context
         });
+        logToolSchemasForGoogle({ tools, provider });
         const machineName = await getMachineDisplayName();
+        const runtimeChannel = normalizeMessageChannel(
+          params.messageChannel ?? params.messageProvider,
+        );
+        const runtimeCapabilities = runtimeChannel
+          ? (resolveChannelCapabilities({
+              cfg: params.config,
+              channel: runtimeChannel,
+              accountId: params.agentAccountId,
+            }) ?? [])
+          : undefined;
         const runtimeInfo = {
           host: machineName,
           os: `${os.type()} ${os.release()}`,
           arch: os.arch(),
           node: process.version,
           model: `${provider}/${modelId}`,
+          channel: runtimeChannel,
+          capabilities: runtimeCapabilities,
         };
-        const sandboxInfo = buildEmbeddedSandboxInfo(sandbox);
-        const reasoningTagHint = provider === "ollama";
+        const sandboxInfo = buildEmbeddedSandboxInfo(
+          sandbox,
+          params.bashElevated,
+        );
+        const reasoningTagHint = isReasoningTagProvider(provider);
         const userTimezone = resolveUserTimezone(
           params.config?.agents?.defaults?.userTimezone,
         );
         const userTime = formatUserTime(new Date(), userTimezone);
+        // Only include heartbeat prompt for the default agent
+        const { defaultAgentId, sessionAgentId } = resolveSessionAgentIds({
+          sessionKey: params.sessionKey,
+          config: params.config,
+        });
+        const isDefaultAgent = sessionAgentId === defaultAgentId;
         const appendPrompt = buildEmbeddedSystemPrompt({
           workspaceDir: effectiveWorkspace,
           defaultThinkLevel: params.thinkLevel,
+          reasoningLevel: params.reasoningLevel ?? "off",
           extraSystemPrompt: params.extraSystemPrompt,
           ownerNumbers: params.ownerNumbers,
           reasoningTagHint,
-          heartbeatPrompt: resolveHeartbeatPrompt(
-            params.config?.agents?.defaults?.heartbeat?.prompt,
-          ),
+          heartbeatPrompt: isDefaultAgent
+            ? resolveHeartbeatPrompt(
+                params.config?.agents?.defaults?.heartbeat?.prompt,
+              )
+            : undefined,
+          skillsPrompt,
           runtimeInfo,
           sandboxInfo,
           tools,
@@ -887,70 +1330,102 @@ export async function compactEmbeddedPiSession(params: {
         });
         const systemPrompt = createSystemPromptOverride(appendPrompt);
 
-        // Pre-warm session file to bring it into OS page cache
-        await prewarmSessionFile(params.sessionFile);
-        const sessionManager = SessionManager.open(params.sessionFile);
-        trackSessionManagerAccess(params.sessionFile);
-        const settingsManager = SettingsManager.create(
-          effectiveWorkspace,
-          agentDir,
-        );
-        const pruning = buildContextPruningExtension({
-          cfg: params.config,
-          sessionManager,
-          provider,
-          modelId,
-          model,
+        const sessionLock = await acquireSessionWriteLock({
+          sessionFile: params.sessionFile,
         });
-        const additionalExtensionPaths = pruning.additionalExtensionPaths;
-
-        const { builtInTools, customTools } = splitSdkTools({
-          tools,
-          sandboxEnabled: !!sandbox?.enabled,
-        });
-
-        let session: Awaited<ReturnType<typeof createAgentSession>>["session"];
-        ({ session } = await createAgentSession({
-          cwd: resolvedWorkspace,
-          agentDir,
-          authStorage,
-          modelRegistry,
-          model,
-          thinkingLevel: mapThinkingLevel(params.thinkLevel),
-          systemPrompt,
-          tools: builtInTools,
-          customTools,
-          sessionManager,
-          settingsManager,
-          skills: [],
-          contextFiles: [],
-          additionalExtensionPaths,
-        }));
-
         try {
-          const prior = await sanitizeSessionHistory({
-            messages: session.messages,
-            modelApi: model.api,
-            sessionManager,
-            sessionId: params.sessionId,
+          // Pre-warm session file to bring it into OS page cache
+          await prewarmSessionFile(params.sessionFile);
+          const sessionManager = guardSessionManager(
+            SessionManager.open(params.sessionFile),
+          );
+          trackSessionManagerAccess(params.sessionFile);
+          const settingsManager = SettingsManager.create(
+            effectiveWorkspace,
+            agentDir,
+          );
+          ensurePiCompactionReserveTokens({
+            settingsManager,
+            minReserveTokens: resolveCompactionReserveTokensFloor(
+              params.config,
+            ),
           });
-          const validated = validateGeminiTurns(prior);
-          if (validated.length > 0) {
-            session.agent.replaceMessages(validated);
+          const additionalExtensionPaths = buildEmbeddedExtensionPaths({
+            cfg: params.config,
+            sessionManager,
+            provider,
+            modelId,
+            model,
+          });
+
+          const { builtInTools, customTools } = splitSdkTools({
+            tools,
+            sandboxEnabled: !!sandbox?.enabled,
+          });
+
+          let session: Awaited<
+            ReturnType<typeof createAgentSession>
+          >["session"];
+          ({ session } = await createAgentSession({
+            cwd: resolvedWorkspace,
+            agentDir,
+            authStorage,
+            modelRegistry,
+            model,
+            thinkingLevel: mapThinkingLevel(params.thinkLevel),
+            systemPrompt,
+            tools: builtInTools,
+            customTools,
+            sessionManager,
+            settingsManager,
+            skills: [],
+            contextFiles: [],
+            additionalExtensionPaths,
+          }));
+
+          // Wire up config-driven model params (e.g., temperature/maxTokens)
+          applyExtraParamsToAgent(
+            session.agent,
+            params.config,
+            provider,
+            modelId,
+            params.thinkLevel,
+          );
+
+          try {
+            const prior = await sanitizeSessionHistory({
+              messages: session.messages,
+              modelApi: model.api,
+              sessionManager,
+              sessionId: params.sessionId,
+            });
+            // Validate turn ordering for both Gemini (consecutive assistant) and Anthropic (consecutive user)
+            const validatedGemini = validateGeminiTurns(prior);
+            const validated = validateAnthropicTurns(validatedGemini);
+            const limited = limitHistoryTurns(
+              validated,
+              getDmHistoryLimitFromSessionKey(params.sessionKey, params.config),
+            );
+            if (limited.length > 0) {
+              session.agent.replaceMessages(limited);
+            }
+            const result = await session.compact(params.customInstructions);
+            return {
+              ok: true,
+              compacted: true,
+              result: {
+                summary: result.summary,
+                firstKeptEntryId: result.firstKeptEntryId,
+                tokensBefore: result.tokensBefore,
+                details: result.details,
+              },
+            };
+          } finally {
+            sessionManager.flushPendingToolResults?.();
+            session.dispose();
           }
-          const result = await session.compact(params.customInstructions);
-          return {
-            ok: true,
-            compacted: true,
-            result: {
-              summary: result.summary,
-              firstKeptEntryId: result.firstKeptEntryId,
-              tokensBefore: result.tokensBefore,
-              details: result.details,
-            },
-          };
         } finally {
-          session.dispose();
+          await sessionLock.release();
         }
       } catch (err) {
         return {
@@ -969,21 +1444,32 @@ export async function compactEmbeddedPiSession(params: {
 export async function runEmbeddedPiAgent(params: {
   sessionId: string;
   sessionKey?: string;
+  messageChannel?: string;
   messageProvider?: string;
   agentAccountId?: string;
+  /** Current channel ID for auto-threading (Slack). */
+  currentChannelId?: string;
+  /** Current thread timestamp for auto-threading (Slack). */
+  currentThreadTs?: string;
+  /** Reply-to mode for Slack auto-threading. */
+  replyToMode?: "off" | "first" | "all";
+  /** Mutable ref to track if a reply was sent (for "first" mode). */
+  hasRepliedRef?: { value: boolean };
   sessionFile: string;
   workspaceDir: string;
   agentDir?: string;
   config?: ClawdbotConfig;
   skillsSnapshot?: SkillSnapshot;
   prompt: string;
+  /** Optional image attachments for multimodal messages. */
+  images?: ImageContent[];
   provider?: string;
   model?: string;
   authProfileId?: string;
   thinkLevel?: ThinkLevel;
   verboseLevel?: VerboseLevel;
   reasoningLevel?: ReasoningLevel;
-  bashElevated?: BashElevatedDefaults;
+  bashElevated?: ExecElevatedDefaults;
   timeoutMs: number;
   runId: string;
   abortSignal?: AbortSignal;
@@ -992,10 +1478,14 @@ export async function runEmbeddedPiAgent(params: {
     text?: string;
     mediaUrls?: string[];
   }) => void | Promise<void>;
+  onAssistantMessageStart?: () => void | Promise<void>;
   onBlockReply?: (payload: {
     text?: string;
     mediaUrls?: string[];
+    audioAsVoice?: boolean;
   }) => void | Promise<void>;
+  /** Flush pending block replies (e.g., before tool execution to preserve message boundaries). */
+  onBlockReplyFlush?: () => void | Promise<void>;
   blockReplyBreak?: "text_end" | "message_end";
   blockReplyChunking?: BlockReplyChunking;
   onReasoningStream?: (payload: {
@@ -1023,6 +1513,7 @@ export async function runEmbeddedPiAgent(params: {
   const enqueueGlobal =
     params.enqueue ??
     ((task, opts) => enqueueCommandInLane(globalLane, task, opts));
+  const runAbortController = new AbortController();
   return enqueueCommandInLane(sessionLane, () =>
     enqueueGlobal(async () => {
       const started = Date.now();
@@ -1032,15 +1523,43 @@ export async function runEmbeddedPiAgent(params: {
       const provider =
         (params.provider ?? DEFAULT_PROVIDER).trim() || DEFAULT_PROVIDER;
       const modelId = (params.model ?? DEFAULT_MODEL).trim() || DEFAULT_MODEL;
-      await ensureClawdbotModelsJson(params.config);
       const agentDir = params.agentDir ?? resolveClawdbotAgentDir();
+      await ensureClawdbotModelsJson(params.config, agentDir);
       const { model, error, authStorage, modelRegistry } = resolveModel(
         provider,
         modelId,
         agentDir,
+        params.config,
       );
       if (!model) {
         throw new Error(error ?? `Unknown model: ${provider}/${modelId}`);
+      }
+
+      const ctxInfo = resolveContextWindowInfo({
+        cfg: params.config,
+        provider,
+        modelId,
+        modelContextWindow: model.contextWindow,
+        defaultTokens: DEFAULT_CONTEXT_TOKENS,
+      });
+      const ctxGuard = evaluateContextWindowGuard({
+        info: ctxInfo,
+        warnBelowTokens: CONTEXT_WINDOW_WARN_BELOW_TOKENS,
+        hardMinTokens: CONTEXT_WINDOW_HARD_MIN_TOKENS,
+      });
+      if (ctxGuard.shouldWarn) {
+        log.warn(
+          `low context window: ${provider}/${modelId} ctx=${ctxGuard.tokens} (warn<${CONTEXT_WINDOW_WARN_BELOW_TOKENS}) source=${ctxGuard.source}`,
+        );
+      }
+      if (ctxGuard.shouldBlock) {
+        log.error(
+          `blocked model (context window too small): ${provider}/${modelId} ctx=${ctxGuard.tokens} (min=${CONTEXT_WINDOW_HARD_MIN_TOKENS}) source=${ctxGuard.source}`,
+        );
+        throw new FailoverError(
+          `Model context window too small (${ctxGuard.tokens} tokens). Minimum is ${CONTEXT_WINDOW_HARD_MIN_TOKENS}.`,
+          { reason: "unknown", provider, model: modelId },
+        );
       }
       const authStore = ensureAuthProfileStore(agentDir);
       const explicitProfileId = params.authProfileId?.trim();
@@ -1075,7 +1594,19 @@ export async function runEmbeddedPiAgent(params: {
 
       const applyApiKeyInfo = async (candidate?: string): Promise<void> => {
         apiKeyInfo = await resolveApiKeyForCandidate(candidate);
-        authStorage.setRuntimeApiKey(model.provider, apiKeyInfo.apiKey);
+
+        if (model.provider === "github-copilot") {
+          const { resolveCopilotApiToken } = await import(
+            "../providers/github-copilot-token.js"
+          );
+          const copilotToken = await resolveCopilotApiToken({
+            githubToken: apiKeyInfo.apiKey,
+          });
+          authStorage.setRuntimeApiKey(model.provider, copilotToken.token);
+        } else {
+          authStorage.setRuntimeApiKey(model.provider, apiKeyInfo.apiKey);
+        }
+
         lastProfileId = apiKeyInfo.profileId;
       };
 
@@ -1110,7 +1641,7 @@ export async function runEmbeddedPiAgent(params: {
         attemptedThinking.add(thinkLevel);
 
         log.debug(
-          `embedded run start: runId=${params.runId} sessionId=${params.sessionId} provider=${provider} model=${modelId} thinking=${thinkLevel} messageProvider=${params.messageProvider ?? "unknown"}`,
+          `embedded run start: runId=${params.runId} sessionId=${params.sessionId} provider=${provider} model=${modelId} thinking=${thinkLevel} messageChannel=${params.messageChannel ?? params.messageProvider ?? "unknown"}`,
         );
 
         await fs.mkdir(resolvedWorkspace, { recursive: true });
@@ -1126,11 +1657,6 @@ export async function runEmbeddedPiAgent(params: {
             : sandbox.workspaceDir
           : resolvedWorkspace;
         await fs.mkdir(effectiveWorkspace, { recursive: true });
-        await ensureSessionHeader({
-          sessionFile: params.sessionFile,
-          sessionId: params.sessionId,
-          cwd: effectiveWorkspace,
-        });
 
         let restoreSkillEnv: (() => void) | undefined;
         process.chdir(effectiveWorkspace);
@@ -1149,24 +1675,47 @@ export async function runEmbeddedPiAgent(params: {
                 skills: skillEntries ?? [],
                 config: params.config,
               });
+          const skillsPrompt = resolveSkillsPromptForRun({
+            skillsSnapshot: params.skillsSnapshot,
+            entries: shouldLoadSkillEntries ? skillEntries : undefined,
+            config: params.config,
+            workspaceDir: effectiveWorkspace,
+          });
 
-          const bootstrapFiles =
-            await loadWorkspaceBootstrapFiles(effectiveWorkspace);
-          const contextFiles = buildBootstrapContextFiles(bootstrapFiles);
+          const bootstrapFiles = filterBootstrapFilesForSession(
+            await loadWorkspaceBootstrapFiles(effectiveWorkspace),
+            params.sessionKey ?? params.sessionId,
+          );
+          const sessionLabel = params.sessionKey ?? params.sessionId;
+          const contextFiles = buildBootstrapContextFiles(bootstrapFiles, {
+            maxChars: resolveBootstrapMaxChars(params.config),
+            warn: (message) =>
+              log.warn(`${message} (sessionKey=${sessionLabel})`),
+          });
           // Tool schemas must be provider-compatible (OpenAI requires top-level `type: "object"`).
           // `createClawdbotCodingTools()` normalizes schemas so the session can pass them through unchanged.
           const tools = createClawdbotCodingTools({
-            bash: {
-              ...params.config?.tools?.bash,
+            exec: {
+              ...resolveExecToolDefaults(params.config),
               elevated: params.bashElevated,
             },
             sandbox,
-            messageProvider: params.messageProvider,
+            messageProvider: params.messageChannel ?? params.messageProvider,
             agentAccountId: params.agentAccountId,
             sessionKey: params.sessionKey ?? params.sessionId,
             agentDir,
+            workspaceDir: effectiveWorkspace,
             config: params.config,
+            abortSignal: runAbortController.signal,
+            modelProvider: model.provider,
+            modelId,
+            modelAuthMode: resolveModelAuthMode(model.provider, params.config),
+            currentChannelId: params.currentChannelId,
+            currentThreadTs: params.currentThreadTs,
+            replyToMode: params.replyToMode,
+            hasRepliedRef: params.hasRepliedRef,
           });
+          logToolSchemasForGoogle({ tools, provider });
           const machineName = await getMachineDisplayName();
           const runtimeInfo = {
             host: machineName,
@@ -1175,21 +1724,34 @@ export async function runEmbeddedPiAgent(params: {
             node: process.version,
             model: `${provider}/${modelId}`,
           };
-          const sandboxInfo = buildEmbeddedSandboxInfo(sandbox);
-          const reasoningTagHint = provider === "ollama";
+          const sandboxInfo = buildEmbeddedSandboxInfo(
+            sandbox,
+            params.bashElevated,
+          );
+          const reasoningTagHint = isReasoningTagProvider(provider);
           const userTimezone = resolveUserTimezone(
             params.config?.agents?.defaults?.userTimezone,
           );
           const userTime = formatUserTime(new Date(), userTimezone);
+          // Only include heartbeat prompt for the default agent
+          const { defaultAgentId, sessionAgentId } = resolveSessionAgentIds({
+            sessionKey: params.sessionKey,
+            config: params.config,
+          });
+          const isDefaultAgent = sessionAgentId === defaultAgentId;
           const appendPrompt = buildEmbeddedSystemPrompt({
             workspaceDir: effectiveWorkspace,
             defaultThinkLevel: thinkLevel,
+            reasoningLevel: params.reasoningLevel ?? "off",
             extraSystemPrompt: params.extraSystemPrompt,
             ownerNumbers: params.ownerNumbers,
             reasoningTagHint,
-            heartbeatPrompt: resolveHeartbeatPrompt(
-              params.config?.agents?.defaults?.heartbeat?.prompt,
-            ),
+            heartbeatPrompt: isDefaultAgent
+              ? resolveHeartbeatPrompt(
+                  params.config?.agents?.defaults?.heartbeat?.prompt,
+                )
+              : undefined,
+            skillsPrompt,
             runtimeInfo,
             sandboxInfo,
             tools,
@@ -1200,22 +1762,32 @@ export async function runEmbeddedPiAgent(params: {
           });
           const systemPrompt = createSystemPromptOverride(appendPrompt);
 
+          const sessionLock = await acquireSessionWriteLock({
+            sessionFile: params.sessionFile,
+          });
           // Pre-warm session file to bring it into OS page cache
           await prewarmSessionFile(params.sessionFile);
-          const sessionManager = SessionManager.open(params.sessionFile);
+          const sessionManager = guardSessionManager(
+            SessionManager.open(params.sessionFile),
+          );
           trackSessionManagerAccess(params.sessionFile);
           const settingsManager = SettingsManager.create(
             effectiveWorkspace,
             agentDir,
           );
-          const pruning = buildContextPruningExtension({
+          ensurePiCompactionReserveTokens({
+            settingsManager,
+            minReserveTokens: resolveCompactionReserveTokensFloor(
+              params.config,
+            ),
+          });
+          const additionalExtensionPaths = buildEmbeddedExtensionPaths({
             cfg: params.config,
             sessionManager,
             provider,
             modelId,
             model,
           });
-          const additionalExtensionPaths = pruning.additionalExtensionPaths;
 
           const { builtInTools, customTools } = splitSdkTools({
             tools,
@@ -1244,6 +1816,15 @@ export async function runEmbeddedPiAgent(params: {
             additionalExtensionPaths,
           }));
 
+          // Wire up config-driven model params (e.g., temperature/maxTokens)
+          applyExtraParamsToAgent(
+            session.agent,
+            params.config,
+            provider,
+            modelId,
+            params.thinkLevel,
+          );
+
           try {
             const prior = await sanitizeSessionHistory({
               messages: session.messages,
@@ -1251,12 +1832,20 @@ export async function runEmbeddedPiAgent(params: {
               sessionManager,
               sessionId: params.sessionId,
             });
-            const validated = validateGeminiTurns(prior);
-            if (validated.length > 0) {
-              session.agent.replaceMessages(validated);
+            // Validate turn ordering for both Gemini (consecutive assistant) and Anthropic (consecutive user)
+            const validatedGemini = validateGeminiTurns(prior);
+            const validated = validateAnthropicTurns(validatedGemini);
+            const limited = limitHistoryTurns(
+              validated,
+              getDmHistoryLimitFromSessionKey(params.sessionKey, params.config),
+            );
+            if (limited.length > 0) {
+              session.agent.replaceMessages(limited);
             }
           } catch (err) {
+            sessionManager.flushPendingToolResults?.();
             session.dispose();
+            await sessionLock.release();
             throw err;
           }
           let aborted = Boolean(params.abortSignal?.aborted);
@@ -1264,6 +1853,7 @@ export async function runEmbeddedPiAgent(params: {
           const abortRun = (isTimeout = false) => {
             aborted = true;
             if (isTimeout) timedOut = true;
+            runAbortController.abort();
             void session.abort();
           };
           let subscription: ReturnType<typeof subscribeEmbeddedPiSession>;
@@ -1277,14 +1867,18 @@ export async function runEmbeddedPiAgent(params: {
               onToolResult: params.onToolResult,
               onReasoningStream: params.onReasoningStream,
               onBlockReply: params.onBlockReply,
+              onBlockReplyFlush: params.onBlockReplyFlush,
               blockReplyBreak: params.blockReplyBreak,
               blockReplyChunking: params.blockReplyChunking,
               onPartialReply: params.onPartialReply,
+              onAssistantMessageStart: params.onAssistantMessageStart,
               onAgentEvent: params.onAgentEvent,
               enforceFinalTag: params.enforceFinalTag,
             });
           } catch (err) {
+            sessionManager.flushPendingToolResults?.();
             session.dispose();
+            await sessionLock.release();
             throw err;
           }
           const {
@@ -1347,7 +1941,9 @@ export async function runEmbeddedPiAgent(params: {
               `embedded run prompt start: runId=${params.runId} sessionId=${params.sessionId}`,
             );
             try {
-              await session.prompt(params.prompt);
+              await session.prompt(params.prompt, {
+                images: params.images,
+              });
             } catch (err) {
               promptError = err;
             } finally {
@@ -1378,18 +1974,23 @@ export async function runEmbeddedPiAgent(params: {
               ACTIVE_EMBEDDED_RUNS.delete(params.sessionId);
               notifyEmbeddedRunEnded(params.sessionId);
             }
+            sessionManager.flushPendingToolResults?.();
             session.dispose();
+            await sessionLock.release();
             params.abortSignal?.removeEventListener?.("abort", onAbort);
           }
           if (promptError && !aborted) {
             const errorText = describeUnknownError(promptError);
             if (isContextOverflowError(errorText)) {
+              const kind = isCompactionFailureError(errorText)
+                ? "compaction_failure"
+                : "context_overflow";
               return {
                 payloads: [
                   {
                     text:
-                      "Context overflow: the conversation history is too large for the model. " +
-                      "Use /new or /reset to start a fresh session, or try a model with a larger context window.",
+                      "Context overflow: prompt too large for the model. " +
+                      "Try again with less input or a larger-context model.",
                     isError: true,
                   },
                 ],
@@ -1400,12 +2001,27 @@ export async function runEmbeddedPiAgent(params: {
                     provider,
                     model: model.id,
                   },
+                  error: { kind, message: errorText },
                 },
               };
             }
+            const promptFailoverReason = classifyFailoverReason(errorText);
             if (
-              (isAuthErrorMessage(errorText) ||
-                isRateLimitErrorMessage(errorText)) &&
+              promptFailoverReason &&
+              promptFailoverReason !== "timeout" &&
+              lastProfileId
+            ) {
+              await markAuthProfileFailure({
+                store: authStore,
+                profileId: lastProfileId,
+                reason: promptFailoverReason,
+                cfg: params.config,
+                agentDir: params.agentDir,
+              });
+            }
+            if (
+              isFailoverErrorMessage(errorText) &&
+              promptFailoverReason !== "timeout" &&
               (await advanceAuthProfile())
             ) {
               continue;
@@ -1448,21 +2064,39 @@ export async function runEmbeddedPiAgent(params: {
             0;
           const authFailure = isAuthAssistantError(lastAssistant);
           const rateLimitFailure = isRateLimitAssistantError(lastAssistant);
+          const failoverFailure = isFailoverAssistantError(lastAssistant);
+          const assistantFailoverReason = classifyFailoverReason(
+            lastAssistant?.errorMessage ?? "",
+          );
+          const cloudCodeAssistFormatError = lastAssistant?.errorMessage
+            ? isCloudCodeAssistFormatError(lastAssistant.errorMessage)
+            : false;
 
           // Treat timeout as potential rate limit (Antigravity hangs on rate limit)
-          const shouldRotate =
-            (!aborted && (authFailure || rateLimitFailure)) || timedOut;
+          const shouldRotate = (!aborted && failoverFailure) || timedOut;
 
           if (shouldRotate) {
             // Mark current profile for cooldown before rotating
             if (lastProfileId) {
-              await markAuthProfileCooldown({
+              const reason =
+                timedOut || assistantFailoverReason === "timeout"
+                  ? "timeout"
+                  : (assistantFailoverReason ?? "unknown");
+              await markAuthProfileFailure({
                 store: authStore,
                 profileId: lastProfileId,
+                reason,
+                cfg: params.config,
+                agentDir: params.agentDir,
               });
               if (timedOut) {
                 log.warn(
                   `Profile ${lastProfileId} timed out (possible rate limit). Trying next account...`,
+                );
+              }
+              if (cloudCodeAssistFormatError) {
+                log.warn(
+                  `Profile ${lastProfileId} hit Cloud Code Assist format error. Tool calls will be sanitized on retry.`,
                 );
               }
             }
@@ -1474,14 +2108,28 @@ export async function runEmbeddedPiAgent(params: {
               const message =
                 lastAssistant?.errorMessage?.trim() ||
                 (lastAssistant
-                  ? formatAssistantErrorText(lastAssistant)
+                  ? formatAssistantErrorText(lastAssistant, {
+                      cfg: params.config,
+                      sessionKey: params.sessionKey ?? params.sessionId,
+                    })
                   : "") ||
                 (timedOut
                   ? "LLM request timed out."
                   : rateLimitFailure
                     ? "LLM request rate limited."
-                    : "LLM request unauthorized.");
-              throw new Error(message);
+                    : authFailure
+                      ? "LLM request unauthorized."
+                      : "LLM request failed.");
+              const status =
+                resolveFailoverStatus(assistantFailoverReason ?? "unknown") ??
+                (isTimeoutErrorMessage(message) ? 408 : undefined);
+              throw new FailoverError(message, {
+                reason: assistantFailoverReason ?? "unknown",
+                provider,
+                model: modelId,
+                profileId: lastProfileId,
+                status,
+              });
             }
           }
 
@@ -1497,10 +2145,17 @@ export async function runEmbeddedPiAgent(params: {
             text: string;
             media?: string[];
             isError?: boolean;
+            audioAsVoice?: boolean;
+            replyToId?: string;
+            replyToTag?: boolean;
+            replyToCurrent?: boolean;
           }> = [];
 
           const errorText = lastAssistant
-            ? formatAssistantErrorText(lastAssistant)
+            ? formatAssistantErrorText(lastAssistant, {
+                cfg: params.config,
+                sessionKey: params.sessionKey ?? params.sessionId,
+              })
             : undefined;
 
           if (errorText) replyItems.push({ text: errorText, isError: true });
@@ -1513,42 +2168,81 @@ export async function runEmbeddedPiAgent(params: {
           if (inlineToolResults) {
             for (const { toolName, meta } of toolMetas) {
               const agg = formatToolAggregate(toolName, meta ? [meta] : []);
-              const { text: cleanedText, mediaUrls } =
-                splitMediaFromOutput(agg);
+              const {
+                text: cleanedText,
+                mediaUrls,
+                audioAsVoice,
+                replyToId,
+                replyToTag,
+                replyToCurrent,
+              } = parseReplyDirectives(agg);
               if (cleanedText)
-                replyItems.push({ text: cleanedText, media: mediaUrls });
+                replyItems.push({
+                  text: cleanedText,
+                  media: mediaUrls,
+                  audioAsVoice,
+                  replyToId,
+                  replyToTag,
+                  replyToCurrent,
+                });
             }
           }
 
-          const fallbackText = lastAssistant
-            ? (() => {
-                const base = extractAssistantText(lastAssistant);
-                if (params.reasoningLevel !== "on") return base;
-                const thinking = extractAssistantThinking(lastAssistant);
-                const formatted = thinking
-                  ? formatReasoningMarkdown(thinking)
-                  : "";
-                if (!formatted) return base;
-                return base ? `${formatted}\n\n${base}` : formatted;
-              })()
+          const reasoningText =
+            lastAssistant && params.reasoningLevel === "on"
+              ? formatReasoningMessage(extractAssistantThinking(lastAssistant))
+              : "";
+          if (reasoningText) replyItems.push({ text: reasoningText });
+
+          const fallbackAnswerText = lastAssistant
+            ? extractAssistantText(lastAssistant)
             : "";
-          for (const text of assistantTexts.length
+          const answerTexts = assistantTexts.length
             ? assistantTexts
-            : fallbackText
-              ? [fallbackText]
-              : []) {
-            const { text: cleanedText, mediaUrls } = splitMediaFromOutput(text);
-            if (!cleanedText && (!mediaUrls || mediaUrls.length === 0))
+            : fallbackAnswerText
+              ? [fallbackAnswerText]
+              : [];
+          for (const text of answerTexts) {
+            const {
+              text: cleanedText,
+              mediaUrls,
+              audioAsVoice,
+              replyToId,
+              replyToTag,
+              replyToCurrent,
+            } = parseReplyDirectives(text);
+            if (
+              !cleanedText &&
+              (!mediaUrls || mediaUrls.length === 0) &&
+              !audioAsVoice
+            )
               continue;
-            replyItems.push({ text: cleanedText, media: mediaUrls });
+            replyItems.push({
+              text: cleanedText,
+              media: mediaUrls,
+              audioAsVoice,
+              replyToId,
+              replyToTag,
+              replyToCurrent,
+            });
           }
 
+          // Check if any replyItem has audioAsVoice tag - if so, apply to all media payloads
+          const hasAudioAsVoiceTag = replyItems.some(
+            (item) => item.audioAsVoice,
+          );
           const payloads = replyItems
             .map((item) => ({
               text: item.text?.trim() ? item.text.trim() : undefined,
               mediaUrls: item.media?.length ? item.media : undefined,
               mediaUrl: item.media?.[0],
               isError: item.isError,
+              replyToId: item.replyToId,
+              replyToTag: item.replyToTag,
+              replyToCurrent: item.replyToCurrent,
+              // Apply audioAsVoice to media payloads if tag was found anywhere in response
+              audioAsVoice:
+                item.audioAsVoice || (hasAudioAsVoiceTag && item.media?.length),
             }))
             .filter(
               (p) =>

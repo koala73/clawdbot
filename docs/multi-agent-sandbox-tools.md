@@ -19,6 +19,7 @@ This allows you to run multiple agents with different security profiles:
 - Public-facing agents in sandboxes
 
 For how sandboxing behaves at runtime, see [Sandboxing](/gateway/sandboxing).
+For debugging “why is this blocked?”, see [Sandbox vs Tool Policy vs Elevated](/gateway/sandbox-vs-tool-policy-vs-elevated) and `clawdbot sandbox explain`.
 
 ---
 
@@ -47,7 +48,7 @@ For how sandboxing behaves at runtime, see [Sandboxing](/gateway/sandboxing).
         },
         "tools": {
           "allow": ["read"],
-          "deny": ["bash", "write", "edit", "process", "browser"]
+          "deny": ["exec", "write", "edit", "apply_patch", "process", "browser"]
         }
       }
     ]
@@ -94,7 +95,7 @@ For how sandboxing behaves at runtime, see [Sandboxing](/gateway/sandboxing).
           "workspaceRoot": "/tmp/work-sandboxes"
         },
         "tools": {
-          "allow": ["read", "write", "bash"],
+          "allow": ["read", "write", "apply_patch", "exec"],
           "deny": ["browser", "gateway", "discord"]
         }
       }
@@ -102,6 +103,28 @@ For how sandboxing behaves at runtime, see [Sandboxing](/gateway/sandboxing).
   }
 }
 ```
+
+---
+
+### Example 2b: Global coding profile + messaging-only agent
+
+```json
+{
+  "tools": { "profile": "coding" },
+  "agents": {
+    "list": [
+      {
+        "id": "support",
+        "tools": { "profile": "messaging", "allow": ["slack"] }
+      }
+    ]
+  }
+}
+```
+
+**Result:**
+- default agents get coding tools
+- `support` agent is messaging-only (+ Slack tool)
 
 ---
 
@@ -133,7 +156,7 @@ For how sandboxing behaves at runtime, see [Sandboxing](/gateway/sandboxing).
         },
         "tools": {
           "allow": ["read"],
-          "deny": ["bash", "write", "edit"]
+          "deny": ["exec", "write", "edit", "apply_patch"]
         }
       }
     ]
@@ -164,21 +187,38 @@ agents.list[].sandbox.prune.* > agents.defaults.sandbox.prune.*
 
 ### Tool Restrictions
 The filtering order is:
-1. **Global tool policy** (`tools.allow` / `tools.deny`)
-2. **Agent-specific tool policy** (`agents.list[].tools`)
-3. **Sandbox tool policy** (`tools.sandbox.tools` or `agents.list[].tools.sandbox.tools`)
-4. **Subagent tool policy** (`tools.subagents.tools`, if applicable)
+1. **Tool profile** (`tools.profile` or `agents.list[].tools.profile`)
+2. **Global tool policy** (`tools.allow` / `tools.deny`)
+3. **Agent-specific tool policy** (`agents.list[].tools`)
+4. **Sandbox tool policy** (`tools.sandbox.tools` or `agents.list[].tools.sandbox.tools`)
+5. **Subagent tool policy** (`tools.subagents.tools`, if applicable)
 
 Each level can further restrict tools, but cannot grant back denied tools from earlier levels.
 If `agents.list[].tools.sandbox.tools` is set, it replaces `tools.sandbox.tools` for that agent.
+If `agents.list[].tools.profile` is set, it overrides `tools.profile` for that agent.
 
-### Elevated Mode (global)
-`tools.elevated` is **global** and **sender-based** (per-provider allowlist). It is **not** configurable per agent.
+### Tool groups (shorthands)
+
+Tool policies (global, agent, sandbox) support `group:*` entries that expand to multiple concrete tools:
+
+- `group:runtime`: `exec`, `bash`, `process`
+- `group:fs`: `read`, `write`, `edit`, `apply_patch`
+- `group:sessions`: `sessions_list`, `sessions_history`, `sessions_send`, `sessions_spawn`, `session_status`
+- `group:memory`: `memory_search`, `memory_get`
+- `group:ui`: `browser`, `canvas`
+- `group:automation`: `cron`, `gateway`
+- `group:messaging`: `message`
+- `group:nodes`: `nodes`
+- `group:clawdbot`: all built-in Clawdbot tools (excludes provider plugins)
+
+### Elevated Mode
+`tools.elevated` is the global baseline (sender-based allowlist). `agents.list[].tools.elevated` can further restrict elevated for specific agents (both must allow).
 
 Mitigation patterns:
-- Deny `bash` for untrusted agents (`agents.list[].tools.deny: ["bash"]`)
+- Deny `exec` for untrusted agents (`agents.list[].tools.deny: ["exec"]`)
 - Avoid allowlisting senders that route to restricted agents
 - Disable elevated globally (`tools.elevated.enabled: false`) if you only want sandboxed execution
+- Disable elevated per agent (`agents.list[].tools.elevated.enabled: false`) for sensitive profiles
 
 ---
 
@@ -198,7 +238,7 @@ Mitigation patterns:
   "tools": {
     "sandbox": {
       "tools": {
-        "allow": ["read", "write", "bash"],
+        "allow": ["read", "write", "apply_patch", "exec"],
         "deny": []
       }
     }
@@ -233,7 +273,7 @@ Legacy `agent.*` configs are migrated by `clawdbot doctor`; prefer `agents.defau
 {
   "tools": {
     "allow": ["read"],
-    "deny": ["bash", "write", "edit", "process"]
+    "deny": ["exec", "write", "edit", "apply_patch", "process"]
   }
 }
 ```
@@ -242,8 +282,8 @@ Legacy `agent.*` configs are migrated by `clawdbot doctor`; prefer `agents.defau
 ```json
 {
   "tools": {
-    "allow": ["read", "bash", "process"],
-    "deny": ["write", "edit", "browser", "gateway"]
+    "allow": ["read", "exec", "process"],
+    "deny": ["write", "edit", "apply_patch", "browser", "gateway"]
   }
 }
 ```
@@ -252,8 +292,8 @@ Legacy `agent.*` configs are migrated by `clawdbot doctor`; prefer `agents.defau
 ```json
 {
   "tools": {
-    "allow": ["sessions_list", "sessions_send", "sessions_history"],
-    "deny": ["bash", "write", "edit", "read", "browser"]
+    "allow": ["sessions_list", "sessions_send", "sessions_history", "session_status"],
+    "deny": ["exec", "write", "edit", "apply_patch", "read", "browser"]
   }
 }
 ```
@@ -274,12 +314,12 @@ sandbox, set `agents.list[].sandbox.mode: "off"`.
 After configuring multi-agent sandbox and tools:
 
 1. **Check agent resolution:**
-   ```bash
+   ```exec
    clawdbot agents list --bindings
    ```
 
 2. **Verify sandbox containers:**
-   ```bash
+   ```exec
    docker ps --filter "label=clawdbot.sandbox=1"
    ```
 
@@ -288,7 +328,7 @@ After configuring multi-agent sandbox and tools:
    - Verify the agent cannot use denied tools
 
 4. **Monitor logs:**
-   ```bash
+   ```exec
    tail -f "${CLAWDBOT_STATE_DIR:-$HOME/.clawdbot}/logs/gateway.log" | grep -E "routing|sandbox|tools"
    ```
 

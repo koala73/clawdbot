@@ -1,15 +1,21 @@
 # Repository Guidelines
+- Repo: https://github.com/clawdbot/clawdbot
+- GitHub issues: use literal multiline strings or $'...' for newlines; avoid "\\n" escapes in `gh issue create/edit`.
 
 ## Project Structure & Module Organization
 - Source code: `src/` (CLI wiring in `src/cli`, commands in `src/commands`, web provider in `src/provider-web.ts`, infra in `src/infra`, media pipeline in `src/media`).
 - Tests: colocated `*.test.ts`.
 - Docs: `docs/` (images, queue, Pi config). Built output lives in `dist/`.
+- Installers served from `https://clawd.bot/*`: live in the sibling repo `../clawd.bot` (`public/install.sh`, `public/install-cli.sh`, `public/install.ps1`).
 
 ## Docs Linking (Mintlify)
 - Docs are hosted on Mintlify (docs.clawd.bot).
 - Internal doc links in `docs/**/*.md`: root-relative, no `.md`/`.mdx` (example: `[Config](/configuration)`).
 - Section cross-references: use anchors on root-relative paths (example: `[Hooks](/configuration#hooks)`).
+- When Peter asks for links, reply with full `https://docs.clawd.bot/...` URLs (not root-relative).
+- When you touch docs, end the reply with the `https://docs.clawd.bot/...` URLs you referenced.
 - README (GitHub): keep absolute docs URLs (`https://docs.clawd.bot/...`) so links work on GitHub.
+- Docs content must be generic: no personal device names/hostnames/paths; use placeholders like `user@gateway-host` and “gateway host”.
 
 ## Build, Test, and Development Commands
 - Runtime baseline: Node **22+** (keep Node + Bun paths working).
@@ -34,6 +40,8 @@
 - Framework: Vitest with V8 coverage thresholds (70% lines/branches/functions/statements).
 - Naming: match source names with `*.test.ts`; e2e in `*.e2e.test.ts`.
 - Run `pnpm test` (or `pnpm test:coverage`) before pushing when you touch logic.
+- Live tests (real keys): `CLAWDBOT_LIVE_TEST=1 pnpm test:live` (Clawdbot-only) or `LIVE=1 pnpm test:live` (includes provider live tests). Docker: `pnpm test:docker:live-models`, `pnpm test:docker:live-gateway`. Onboarding Docker E2E: `pnpm test:docker:onboard`.
+- Full kit + what’s covered: `docs/testing.md`.
 - Pure test additions/fixes generally do **not** need a changelog entry unless they alter user-facing behavior or the user asks for one.
 - Mobile: before using a simulator, check for connected real devices (iOS + Android) and prefer them when available.
 
@@ -41,6 +49,7 @@
 - Create commits with `scripts/committer "<msg>" <file...>`; avoid manual `git add`/`git commit` so staging stays scoped.
 - Follow concise, action-oriented commit messages (e.g., `CLI: add verbose flag to send`).
 - Group related changes; avoid bundling unrelated refactors.
+- Changelog workflow: keep latest released version at top (no `Unreleased`); after publishing, bump version and start a new top section.
 - PRs should summarize scope, note testing performed, and mention any user-facing changes or new flags.
 - PR review flow: when given a PR link, review via `gh pr view`/`gh pr diff` and do **not** change branches.
 - PR merge flow: create a temp branch from `main`, merge the PR branch into it (prefer squash unless commit history is important; use rebase/merge when it is). Always try to merge the PR unless it’s truly difficult, then use another approach. If we squash, add the PR author as a co-contributor. Apply fixes, add changelog entry (include PR # + thanks), run full gate before the final commit, commit, merge back to `main`, delete the temp branch, and end on `main`.
@@ -57,6 +66,7 @@
 ## Security & Configuration Tips
 - Web provider stores creds at `~/.clawdbot/credentials/`; rerun `clawdbot login` if logged out.
 - Pi sessions live under `~/.clawdbot/sessions/` by default; the base directory is not configurable.
+- Environment variables: see `~/.profile`.
 - Never commit or publish real phone numbers, videos, or live configuration values. Use obviously fake placeholders in docs, tests, and examples.
 
 ## Troubleshooting
@@ -65,6 +75,9 @@
 ## Agent-Specific Notes
 - Vocabulary: "makeup" = "mac app".
 - When answering questions, respond with high-confidence answers only: verify in code; do not guess.
+- Never update the Carbon dependency.
+- CLI progress: use `src/cli/progress.ts` (`osc-progress` + `@clack/prompts` spinner); don’t hand-roll spinners/bars.
+- Status output: keep tables + ANSI-safe wrapping (`src/terminal/table.ts`); `status --all` = read-only/pasteable, `status --deep` = probes.
 - Gateway currently runs only as the menubar app; there is no separate LaunchAgent/helper label installed. Restart via the Clawdbot Mac app or `scripts/restart-mac.sh`; to verify/kill use `launchctl print gui/$UID | grep clawdbot` rather than assuming a fixed label. **When debugging on macOS, start/stop the gateway via the app, not ad-hoc tmux sessions; kill any temporary tunnels before handoff.**
 - macOS logs: use `./scripts/clawlog.sh` (aka `vtlog`) to query unified logs for the Clawdbot subsystem; it supports follow/tail/category filters and expects passwordless sudo for `/usr/bin/log`.
 - If shared guardrails are available locally, review them; otherwise follow this repo's guidance.
@@ -87,6 +100,7 @@
 - **Multi-agent safety:** focus reports on your edits; avoid guard-rail disclaimers unless truly blocked; when multiple agents touch the same file, continue if safe; end with a brief “other files present” note only if relevant.
 - Bug investigations: read source code of relevant npm dependencies and all related local code before concluding; aim for high-confidence root cause.
 - Code style: add brief comments for tricky logic; keep files under ~500 LOC when feasible (split/refactor as needed).
+- Tool schema guardrails (google-antigravity): avoid `Type.Union` in tool input schemas; no `anyOf`/`oneOf`/`allOf`. Use `stringEnum`/`optionalStringEnum` (Type.Unsafe enum) for string lists, and `Type.Optional(...)` instead of `... | null`. Keep top-level tool schema as `type: "object"` with `properties`.
 - When asked to open a “session” file, open the Pi session logs under `~/.clawdbot/agents/main/sessions/*.jsonl` (newest unless a specific ID is given), not the default `sessions.json`. If logs are needed from another machine, SSH via Tailscale and read the same path there.
 - Menubar dimming + restart flow mirrors Trimmy: use `scripts/restart-mac.sh` (kills all Clawdbot variants, runs `swift build`, packages, relaunches). Icon dimming depends on MenuBarExtraAccess wiring in AppMain; keep `appearsDisabled` updates intact when touching the status item.
 - Do not rebuild the macOS app over SSH; rebuilds must be run directly on the Mac.

@@ -3,23 +3,26 @@ import { randomUUID } from "node:crypto";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../agents/defaults.js";
 import type { ModelCatalogEntry } from "../agents/model-catalog.js";
 import {
-  buildAllowedModelSet,
-  buildModelAliasIndex,
-  modelKey,
+  resolveAllowedModelRef,
   resolveConfiguredModelRef,
-  resolveModelRefFromString,
 } from "../agents/model-selection.js";
 import { normalizeGroupActivation } from "../auto-reply/group-activation.js";
 import {
+  formatThinkingLevels,
+  formatXHighModelHint,
   normalizeElevatedLevel,
   normalizeReasoningLevel,
   normalizeThinkLevel,
   normalizeUsageDisplay,
-  normalizeVerboseLevel,
+  supportsXHighThinking,
 } from "../auto-reply/thinking.js";
 import type { ClawdbotConfig } from "../config/config.js";
 import type { SessionEntry } from "../config/sessions.js";
 import { isSubagentSessionKey } from "../routing/session-key.js";
+import {
+  applyVerboseOverride,
+  parseVerboseOverride,
+} from "../sessions/level-overrides.js";
 import { normalizeSendPolicy } from "../sessions/send-policy.js";
 import { parseSessionLabel } from "../sessions/session-label.js";
 import {
@@ -95,8 +98,17 @@ export async function applySessionsPatchToStore(params: {
     } else if (raw !== undefined) {
       const normalized = normalizeThinkLevel(String(raw));
       if (!normalized) {
+        const resolvedDefault = resolveConfiguredModelRef({
+          cfg,
+          defaultProvider: DEFAULT_PROVIDER,
+          defaultModel: DEFAULT_MODEL,
+        });
+        const hintProvider =
+          existing?.providerOverride?.trim() || resolvedDefault.provider;
+        const hintModel =
+          existing?.modelOverride?.trim() || resolvedDefault.model;
         return invalid(
-          "invalid thinkingLevel (use off|minimal|low|medium|high)",
+          `invalid thinkingLevel (use ${formatThinkingLevels(hintProvider, hintModel, "|")})`,
         );
       }
       if (normalized === "off") delete next.thinkingLevel;
@@ -106,14 +118,9 @@ export async function applySessionsPatchToStore(params: {
 
   if ("verboseLevel" in patch) {
     const raw = patch.verboseLevel;
-    if (raw === null) {
-      delete next.verboseLevel;
-    } else if (raw !== undefined) {
-      const normalized = normalizeVerboseLevel(String(raw));
-      if (!normalized) return invalid('invalid verboseLevel (use "on"|"off")');
-      if (normalized === "off") delete next.verboseLevel;
-      else next.verboseLevel = normalized;
-    }
+    const parsed = parseVerboseOverride(raw);
+    if (!parsed.ok) return invalid(parsed.error);
+    applyVerboseOverride(next, parsed.value);
   }
 
   if ("reasoningLevel" in patch) {
@@ -149,8 +156,8 @@ export async function applySessionsPatchToStore(params: {
     } else if (raw !== undefined) {
       const normalized = normalizeElevatedLevel(String(raw));
       if (!normalized) return invalid('invalid elevatedLevel (use "on"|"off")');
-      if (normalized === "off") delete next.elevatedLevel;
-      else next.elevatedLevel = normalized;
+      // Persist "off" explicitly so patches can override defaults.
+      next.elevatedLevel = normalized;
     }
   }
 
@@ -168,17 +175,6 @@ export async function applySessionsPatchToStore(params: {
         defaultProvider: DEFAULT_PROVIDER,
         defaultModel: DEFAULT_MODEL,
       });
-      const aliasIndex = buildModelAliasIndex({
-        cfg,
-        defaultProvider: resolvedDefault.provider,
-      });
-      const resolved = resolveModelRefFromString({
-        raw: trimmed,
-        defaultProvider: resolvedDefault.provider,
-        aliasIndex,
-      });
-      if (!resolved) return invalid(`invalid model: ${trimmed}`);
-
       if (!params.loadGatewayModelCatalog) {
         return {
           ok: false,
@@ -189,15 +185,15 @@ export async function applySessionsPatchToStore(params: {
         };
       }
       const catalog = await params.loadGatewayModelCatalog();
-      const allowed = buildAllowedModelSet({
+      const resolved = resolveAllowedModelRef({
         cfg,
         catalog,
+        raw: trimmed,
         defaultProvider: resolvedDefault.provider,
         defaultModel: resolvedDefault.model,
       });
-      const key = modelKey(resolved.ref.provider, resolved.ref.model);
-      if (!allowed.allowAny && !allowed.allowedKeys.has(key)) {
-        return invalid(`model not allowed: ${key}`);
+      if ("error" in resolved) {
+        return invalid(resolved.error);
       }
       if (
         resolved.ref.provider === resolvedDefault.provider &&
@@ -209,6 +205,24 @@ export async function applySessionsPatchToStore(params: {
         next.providerOverride = resolved.ref.provider;
         next.modelOverride = resolved.ref.model;
       }
+    }
+  }
+
+  if (next.thinkingLevel === "xhigh") {
+    const resolvedDefault = resolveConfiguredModelRef({
+      cfg,
+      defaultProvider: DEFAULT_PROVIDER,
+      defaultModel: DEFAULT_MODEL,
+    });
+    const effectiveProvider = next.providerOverride ?? resolvedDefault.provider;
+    const effectiveModel = next.modelOverride ?? resolvedDefault.model;
+    if (!supportsXHighThinking(effectiveProvider, effectiveModel)) {
+      if ("thinkingLevel" in patch) {
+        return invalid(
+          `thinkingLevel "xhigh" is only supported for ${formatXHighModelHint()}`,
+        );
+      }
+      next.thinkingLevel = "high";
     }
   }
 

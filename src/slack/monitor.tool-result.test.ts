@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { HISTORY_CONTEXT_MARKER } from "../auto-reply/reply/history.js";
+import { resetInboundDedupe } from "../auto-reply/reply/inbound-dedupe.js";
+import { CURRENT_MESSAGE_MARKER } from "../auto-reply/reply/mentions.js";
 import { monitorSlackProvider } from "./monitor.js";
 
 const sendMock = vi.fn();
@@ -35,9 +38,9 @@ vi.mock("./send.js", () => ({
 }));
 
 vi.mock("../pairing/pairing-store.js", () => ({
-  readProviderAllowFromStore: (...args: unknown[]) =>
+  readChannelAllowFromStore: (...args: unknown[]) =>
     readAllowFromStoreMock(...args),
-  upsertProviderPairingRequest: (...args: unknown[]) =>
+  upsertChannelPairingRequest: (...args: unknown[]) =>
     upsertPairingRequestMock(...args),
 }));
 
@@ -98,13 +101,19 @@ async function waitForEvent(name: string) {
 }
 
 beforeEach(() => {
+  resetInboundDedupe();
   config = {
     messages: {
       responsePrefix: "PFX",
       ackReaction: "👀",
       ackReactionScope: "group-mentions",
     },
-    slack: { dm: { enabled: true, policy: "open", allowFrom: ["*"] } },
+    channels: {
+      slack: {
+        dm: { enabled: true, policy: "open", allowFrom: ["*"] },
+        groupPolicy: "open",
+      },
+    },
   };
   sendMock.mockReset().mockResolvedValue(undefined);
   replyMock.mockReset();
@@ -154,7 +163,7 @@ describe("monitorSlackProvider tool results", () => {
     expect(sendMock.mock.calls[1][1]).toBe("PFX final reply");
   });
 
-  it("derives responsePrefix from routed agent identity when unset", async () => {
+  it("does not derive responsePrefix from routed agent identity when unset", async () => {
     config = {
       agents: {
         list: [
@@ -172,14 +181,16 @@ describe("monitorSlackProvider tool results", () => {
       bindings: [
         {
           agentId: "rich",
-          match: { provider: "slack", peer: { kind: "dm", id: "U1" } },
+          match: { channel: "slack", peer: { kind: "dm", id: "U1" } },
         },
       ],
       messages: {
         ackReaction: "👀",
         ackReactionScope: "group-mentions",
       },
-      slack: { dm: { enabled: true, policy: "open", allowFrom: ["*"] } },
+      channels: {
+        slack: { dm: { enabled: true, policy: "open", allowFrom: ["*"] } },
+      },
     };
 
     replyMock.mockImplementation(async (_ctx, opts) => {
@@ -214,8 +225,72 @@ describe("monitorSlackProvider tool results", () => {
     await run;
 
     expect(sendMock).toHaveBeenCalledTimes(2);
-    expect(sendMock.mock.calls[0][1]).toBe("[Richbot] tool update");
-    expect(sendMock.mock.calls[1][1]).toBe("[Richbot] final reply");
+    expect(sendMock.mock.calls[0][1]).toBe("tool update");
+    expect(sendMock.mock.calls[1][1]).toBe("final reply");
+  });
+
+  it("wraps room history in Body and preserves RawBody", async () => {
+    config = {
+      messages: { ackReactionScope: "group-mentions" },
+      channels: {
+        slack: {
+          historyLimit: 5,
+          dm: { enabled: true, policy: "open", allowFrom: ["*"] },
+          channels: { "*": { requireMention: false } },
+        },
+      },
+    };
+
+    let capturedCtx: { Body?: string; RawBody?: string; CommandBody?: string } =
+      {};
+    replyMock.mockImplementation(async (ctx) => {
+      capturedCtx = ctx ?? {};
+      return undefined;
+    });
+
+    const controller = new AbortController();
+    const run = monitorSlackProvider({
+      botToken: "bot-token",
+      appToken: "app-token",
+      abortSignal: controller.signal,
+    });
+
+    await waitForEvent("message");
+    const handler = getSlackHandlers()?.get("message");
+    if (!handler) throw new Error("Slack message handler not registered");
+
+    await handler({
+      event: {
+        type: "message",
+        user: "U1",
+        text: "first",
+        ts: "123",
+        channel: "C1",
+        channel_type: "channel",
+      },
+    });
+
+    await handler({
+      event: {
+        type: "message",
+        user: "U2",
+        text: "second",
+        ts: "124",
+        channel: "C1",
+        channel_type: "channel",
+      },
+    });
+
+    await flush();
+    controller.abort();
+    await run;
+
+    expect(replyMock).toHaveBeenCalledTimes(2);
+    expect(capturedCtx.Body).toContain(HISTORY_CONTEXT_MARKER);
+    expect(capturedCtx.Body).toContain(CURRENT_MESSAGE_MARKER);
+    expect(capturedCtx.Body).toContain("first");
+    expect(capturedCtx.RawBody).toBe("second");
+    expect(capturedCtx.CommandBody).toBe("second");
   });
 
   it("updates assistant thread status when replies start", async () => {
@@ -275,9 +350,11 @@ describe("monitorSlackProvider tool results", () => {
         responsePrefix: "PFX",
         groupChat: { mentionPatterns: ["\\bclawd\\b"] },
       },
-      slack: {
-        dm: { enabled: true, policy: "open", allowFrom: ["*"] },
-        channels: { C1: { allow: true, requireMention: true } },
+      channels: {
+        slack: {
+          dm: { enabled: true, policy: "open", allowFrom: ["*"] },
+          channels: { C1: { allow: true, requireMention: true } },
+        },
       },
     };
     replyMock.mockResolvedValue({ text: "hi" });
@@ -353,9 +430,11 @@ describe("monitorSlackProvider tool results", () => {
         ackReaction: "👀",
         ackReactionScope: "group-mentions",
       },
-      slack: {
-        dm: { enabled: true, policy: "open", allowFrom: ["*"] },
-        replyToMode: "off",
+      channels: {
+        slack: {
+          dm: { enabled: true, policy: "open", allowFrom: ["*"] },
+          replyToMode: "off",
+        },
       },
     };
 
@@ -398,9 +477,11 @@ describe("monitorSlackProvider tool results", () => {
         ackReaction: "👀",
         ackReactionScope: "group-mentions",
       },
-      slack: {
-        dm: { enabled: true, policy: "open", allowFrom: ["*"] },
-        replyToMode: "all",
+      channels: {
+        slack: {
+          dm: { enabled: true, policy: "open", allowFrom: ["*"] },
+          replyToMode: "all",
+        },
       },
     };
 
@@ -491,9 +572,11 @@ describe("monitorSlackProvider tool results", () => {
 
     config = {
       messages: { responsePrefix: "PFX" },
-      slack: {
-        dm: { enabled: true, policy: "open", allowFrom: ["*"] },
-        channels: { C1: { allow: true, requireMention: false } },
+      channels: {
+        slack: {
+          dm: { enabled: true, policy: "open", allowFrom: ["*"] },
+          channels: { C1: { allow: true, requireMention: false } },
+        },
       },
     };
 
@@ -541,12 +624,14 @@ describe("monitorSlackProvider tool results", () => {
     replyMock.mockResolvedValue({ text: "ok" });
     config = {
       messages: { responsePrefix: "PFX" },
-      slack: {
-        dm: { enabled: true, policy: "open", allowFrom: ["*"] },
-        channels: { C1: { allow: true, requireMention: false } },
+      channels: {
+        slack: {
+          dm: { enabled: true, policy: "open", allowFrom: ["*"] },
+          channels: { C1: { allow: true, requireMention: false } },
+        },
       },
       bindings: [
-        { agentId: "support", match: { provider: "slack", teamId: "T1" } },
+        { agentId: "support", match: { channel: "slack", teamId: "T1" } },
       ],
     };
 
@@ -601,7 +686,7 @@ describe("monitorSlackProvider tool results", () => {
     expect(ctx.ParentSessionKey).toBe("agent:support:slack:channel:C1");
   });
 
-  it("keeps replies in channel root when message is not threaded", async () => {
+  it("keeps replies in channel root when message is not threaded (replyToMode off)", async () => {
     replyMock.mockResolvedValue({ text: "root reply" });
     config = {
       messages: {
@@ -609,9 +694,11 @@ describe("monitorSlackProvider tool results", () => {
         ackReaction: "👀",
         ackReactionScope: "group-mentions",
       },
-      slack: {
-        dm: { enabled: true, policy: "open", allowFrom: ["*"] },
-        replyToMode: "first",
+      channels: {
+        slack: {
+          dm: { enabled: true, policy: "open", allowFrom: ["*"] },
+          replyToMode: "off",
+        },
       },
     };
 
@@ -645,6 +732,53 @@ describe("monitorSlackProvider tool results", () => {
     expect(sendMock.mock.calls[0][2]).toMatchObject({ threadTs: undefined });
   });
 
+  it("threads first reply when replyToMode is first and message is not threaded", async () => {
+    replyMock.mockResolvedValue({ text: "first reply" });
+    config = {
+      messages: {
+        responsePrefix: "PFX",
+        ackReaction: "👀",
+        ackReactionScope: "group-mentions",
+      },
+      channels: {
+        slack: {
+          dm: { enabled: true, policy: "open", allowFrom: ["*"] },
+          replyToMode: "first",
+        },
+      },
+    };
+
+    const controller = new AbortController();
+    const run = monitorSlackProvider({
+      botToken: "bot-token",
+      appToken: "app-token",
+      abortSignal: controller.signal,
+    });
+
+    await waitForEvent("message");
+    const handler = getSlackHandlers()?.get("message");
+    if (!handler) throw new Error("Slack message handler not registered");
+
+    await handler({
+      event: {
+        type: "message",
+        user: "U1",
+        text: "hello",
+        ts: "789",
+        channel: "C1",
+        channel_type: "im",
+      },
+    });
+
+    await flush();
+    controller.abort();
+    await run;
+
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    // First reply starts a thread under the incoming message
+    expect(sendMock.mock.calls[0][2]).toMatchObject({ threadTs: "789" });
+  });
+
   it("forces thread replies when replyToId is set", async () => {
     replyMock.mockResolvedValue({ text: "forced reply", replyToId: "555" });
     config = {
@@ -653,9 +787,11 @@ describe("monitorSlackProvider tool results", () => {
         ackReaction: "👀",
         ackReactionScope: "group-mentions",
       },
-      slack: {
-        dm: { enabled: true, policy: "open", allowFrom: ["*"] },
-        replyToMode: "off",
+      channels: {
+        slack: {
+          dm: { enabled: true, policy: "open", allowFrom: ["*"] },
+          replyToMode: "off",
+        },
       },
     };
 
@@ -736,7 +872,13 @@ describe("monitorSlackProvider tool results", () => {
   it("replies with pairing code when dmPolicy is pairing and no allowFrom is set", async () => {
     config = {
       ...config,
-      slack: { dm: { enabled: true, policy: "pairing", allowFrom: [] } },
+      channels: {
+        ...config.channels,
+        slack: {
+          ...config.channels?.slack,
+          dm: { enabled: true, policy: "pairing", allowFrom: [] },
+        },
+      },
     };
 
     const controller = new AbortController();
@@ -779,7 +921,13 @@ describe("monitorSlackProvider tool results", () => {
   it("does not resend pairing code when a request is already pending", async () => {
     config = {
       ...config,
-      slack: { dm: { enabled: true, policy: "pairing", allowFrom: [] } },
+      channels: {
+        ...config.channels,
+        slack: {
+          ...config.channels?.slack,
+          dm: { enabled: true, policy: "pairing", allowFrom: [] },
+        },
+      },
     };
     upsertPairingRequestMock
       .mockResolvedValueOnce({ code: "PAIRCODE", created: true })

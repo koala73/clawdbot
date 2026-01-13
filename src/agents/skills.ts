@@ -13,6 +13,19 @@ import { CONFIG_DIR, resolveUserPath } from "../utils.js";
 
 const fsp = fs.promises;
 
+const SKILLS_SYNC_QUEUE = new Map<string, Promise<unknown>>();
+
+async function serializeByKey<T>(key: string, task: () => Promise<T>) {
+  const prev = SKILLS_SYNC_QUEUE.get(key) ?? Promise.resolve();
+  const next = prev.then(task, task);
+  SKILLS_SYNC_QUEUE.set(key, next);
+  try {
+    return await next;
+  } finally {
+    if (SKILLS_SYNC_QUEUE.get(key) === next) SKILLS_SYNC_QUEUE.delete(key);
+  }
+}
+
 export type SkillInstallSpec = {
   id?: string;
   kind: "brew" | "node" | "go" | "uv";
@@ -610,6 +623,24 @@ export function buildWorkspaceSkillsPrompt(
   return formatSkillsForPrompt(eligible.map((entry) => entry.skill));
 }
 
+export function resolveSkillsPromptForRun(params: {
+  skillsSnapshot?: SkillSnapshot;
+  entries?: SkillEntry[];
+  config?: ClawdbotConfig;
+  workspaceDir: string;
+}): string {
+  const snapshotPrompt = params.skillsSnapshot?.prompt?.trim();
+  if (snapshotPrompt) return snapshotPrompt;
+  if (params.entries && params.entries.length > 0) {
+    const prompt = buildWorkspaceSkillsPrompt(params.workspaceDir, {
+      entries: params.entries,
+      config: params.config,
+    });
+    return prompt.trim() ? prompt : "";
+  }
+  return "";
+}
+
 export function loadWorkspaceSkillEntries(
   workspaceDir: string,
   opts?: {
@@ -631,29 +662,35 @@ export async function syncSkillsToWorkspace(params: {
   const sourceDir = resolveUserPath(params.sourceWorkspaceDir);
   const targetDir = resolveUserPath(params.targetWorkspaceDir);
   if (sourceDir === targetDir) return;
-  const targetSkillsDir = path.join(targetDir, "skills");
 
-  const entries = loadSkillEntries(sourceDir, {
-    config: params.config,
-    managedSkillsDir: params.managedSkillsDir,
-    bundledSkillsDir: params.bundledSkillsDir,
-  });
+  await serializeByKey(`syncSkills:${targetDir}`, async () => {
+    const targetSkillsDir = path.join(targetDir, "skills");
 
-  await fsp.rm(targetSkillsDir, { recursive: true, force: true });
-  await fsp.mkdir(targetSkillsDir, { recursive: true });
+    const entries = loadSkillEntries(sourceDir, {
+      config: params.config,
+      managedSkillsDir: params.managedSkillsDir,
+      bundledSkillsDir: params.bundledSkillsDir,
+    });
 
-  for (const entry of entries) {
-    const dest = path.join(targetSkillsDir, entry.skill.name);
-    try {
-      await fsp.cp(entry.skill.baseDir, dest, { recursive: true, force: true });
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : JSON.stringify(error);
-      console.warn(
-        `[skills] Failed to copy ${entry.skill.name} to sandbox: ${message}`,
-      );
+    await fsp.rm(targetSkillsDir, { recursive: true, force: true });
+    await fsp.mkdir(targetSkillsDir, { recursive: true });
+
+    for (const entry of entries) {
+      const dest = path.join(targetSkillsDir, entry.skill.name);
+      try {
+        await fsp.cp(entry.skill.baseDir, dest, {
+          recursive: true,
+          force: true,
+        });
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : JSON.stringify(error);
+        console.warn(
+          `[skills] Failed to copy ${entry.skill.name} to sandbox: ${message}`,
+        );
+      }
     }
-  }
+  });
 }
 
 export function filterWorkspaceSkillEntries(

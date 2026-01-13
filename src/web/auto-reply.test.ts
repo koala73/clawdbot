@@ -17,12 +17,13 @@ vi.mock("../agents/pi-embedded.js", () => ({
 }));
 
 import { runEmbeddedPiAgent } from "../agents/pi-embedded.js";
+import { resetInboundDedupe } from "../auto-reply/reply/inbound-dedupe.js";
 import { getReplyFromConfig } from "../auto-reply/reply.js";
 import type { ClawdbotConfig } from "../config/config.js";
 import { resetLogger, setLoggerOverride } from "../logging.js";
 import {
   HEARTBEAT_TOKEN,
-  monitorWebProvider,
+  monitorWebChannel,
   SILENT_REPLY_TOKEN,
 } from "./auto-reply.js";
 import {
@@ -57,6 +58,7 @@ const rmDirWithRetries = async (dir: string): Promise<void> => {
 };
 
 beforeEach(async () => {
+  resetInboundDedupe();
   previousHome = process.env.HOME;
   tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "clawdbot-web-home-"));
   process.env.HOME = tempHome;
@@ -113,14 +115,12 @@ describe("partial reply gating", () => {
     const replyResolver = vi.fn().mockResolvedValue({ text: "final reply" });
 
     const mockConfig: ClawdbotConfig = {
-      whatsapp: {
-        allowFrom: ["*"],
-      },
+      channels: { whatsapp: { allowFrom: ["*"] } },
     };
 
     setLoadConfigMock(mockConfig);
 
-    await monitorWebProvider(
+    await monitorWebChannel(
       false,
       async ({ onMessage }) => {
         await onMessage({
@@ -151,6 +151,55 @@ describe("partial reply gating", () => {
     expect(reply).toHaveBeenCalledWith("final reply");
   });
 
+  it("falls back from empty senderJid to senderE164 for SenderId", async () => {
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const sendComposing = vi.fn().mockResolvedValue(undefined);
+    const sendMedia = vi.fn().mockResolvedValue(undefined);
+
+    const replyResolver = vi.fn().mockResolvedValue({ text: "final reply" });
+
+    const mockConfig: ClawdbotConfig = {
+      channels: {
+        whatsapp: {
+          allowFrom: ["*"],
+        },
+      },
+    };
+
+    setLoadConfigMock(mockConfig);
+
+    await monitorWebChannel(
+      false,
+      async ({ onMessage }) => {
+        await onMessage({
+          id: "m1",
+          from: "+1000",
+          conversationId: "+1000",
+          to: "+2000",
+          body: "hello",
+          timestamp: Date.now(),
+          chatType: "direct",
+          chatId: "direct:+1000",
+          senderJid: "",
+          senderE164: "+1000",
+          sendComposing,
+          reply,
+          sendMedia,
+        });
+        return { close: vi.fn().mockResolvedValue(undefined) };
+      },
+      false,
+      replyResolver,
+    );
+
+    resetLoadConfigMock();
+
+    expect(replyResolver).toHaveBeenCalledTimes(1);
+    const ctx = replyResolver.mock.calls[0]?.[0] ?? {};
+    expect(ctx.SenderE164).toBe("+1000");
+    expect(ctx.SenderId).toBe("+1000");
+  });
+
   it("updates last-route for direct chats without senderE164", async () => {
     const now = Date.now();
     const mainSessionKey = "agent:main:main";
@@ -161,15 +210,13 @@ describe("partial reply gating", () => {
     const replyResolver = vi.fn().mockResolvedValue(undefined);
 
     const mockConfig: ClawdbotConfig = {
-      whatsapp: {
-        allowFrom: ["*"],
-      },
+      channels: { whatsapp: { allowFrom: ["*"] } },
       session: { store: store.storePath },
     };
 
     setLoadConfigMock(mockConfig);
 
-    await monitorWebProvider(
+    await monitorWebChannel(
       false,
       async ({ onMessage }) => {
         await onMessage({
@@ -193,22 +240,19 @@ describe("partial reply gating", () => {
 
     let stored: Record<
       string,
-      { lastProvider?: string; lastTo?: string }
+      { lastChannel?: string; lastTo?: string }
     > | null = null;
     for (let attempt = 0; attempt < 50; attempt += 1) {
       stored = JSON.parse(await fs.readFile(store.storePath, "utf8")) as Record<
         string,
-        { lastProvider?: string; lastTo?: string }
+        { lastChannel?: string; lastTo?: string }
       >;
-      if (
-        stored[mainSessionKey]?.lastProvider &&
-        stored[mainSessionKey]?.lastTo
-      )
+      if (stored[mainSessionKey]?.lastChannel && stored[mainSessionKey]?.lastTo)
         break;
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
     if (!stored) throw new Error("store not loaded");
-    expect(stored[mainSessionKey]?.lastProvider).toBe("whatsapp");
+    expect(stored[mainSessionKey]?.lastChannel).toBe("whatsapp");
     expect(stored[mainSessionKey]?.lastTo).toBe("+1000");
 
     resetLoadConfigMock();
@@ -225,15 +269,13 @@ describe("partial reply gating", () => {
     const replyResolver = vi.fn().mockResolvedValue(undefined);
 
     const mockConfig: ClawdbotConfig = {
-      whatsapp: {
-        allowFrom: ["*"],
-      },
+      channels: { whatsapp: { allowFrom: ["*"] } },
       session: { store: store.storePath },
     };
 
     setLoadConfigMock(mockConfig);
 
-    await monitorWebProvider(
+    await monitorWebChannel(
       false,
       async ({ onMessage }) => {
         await onMessage({
@@ -261,15 +303,15 @@ describe("partial reply gating", () => {
 
     let stored: Record<
       string,
-      { lastProvider?: string; lastTo?: string; lastAccountId?: string }
+      { lastChannel?: string; lastTo?: string; lastAccountId?: string }
     > | null = null;
     for (let attempt = 0; attempt < 50; attempt += 1) {
       stored = JSON.parse(await fs.readFile(store.storePath, "utf8")) as Record<
         string,
-        { lastProvider?: string; lastTo?: string; lastAccountId?: string }
+        { lastChannel?: string; lastTo?: string; lastAccountId?: string }
       >;
       if (
-        stored[groupSessionKey]?.lastProvider &&
+        stored[groupSessionKey]?.lastChannel &&
         stored[groupSessionKey]?.lastTo &&
         stored[groupSessionKey]?.lastAccountId
       )
@@ -277,7 +319,7 @@ describe("partial reply gating", () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
     if (!stored) throw new Error("store not loaded");
-    expect(stored[groupSessionKey]?.lastProvider).toBe("whatsapp");
+    expect(stored[groupSessionKey]?.lastChannel).toBe("whatsapp");
     expect(stored[groupSessionKey]?.lastTo).toBe("123@g.us");
     expect(stored[groupSessionKey]?.lastAccountId).toBe("work");
 
@@ -345,14 +387,12 @@ describe("typing controller idle", () => {
     });
 
     const mockConfig: ClawdbotConfig = {
-      whatsapp: {
-        allowFrom: ["*"],
-      },
+      channels: { whatsapp: { allowFrom: ["*"] } },
     };
 
     setLoadConfigMock(mockConfig);
 
-    await monitorWebProvider(
+    await monitorWebChannel(
       false,
       async ({ onMessage }) => {
         await onMessage({
@@ -410,7 +450,7 @@ describe("web auto-reply", () => {
       exit: vi.fn(),
     };
     const controller = new AbortController();
-    const run = monitorWebProvider(
+    const run = monitorWebChannel(
       false,
       listenerFactory,
       true,
@@ -481,7 +521,7 @@ describe("web auto-reply", () => {
       exit: vi.fn(),
     };
     const controller = new AbortController();
-    const run = monitorWebProvider(
+    const run = monitorWebChannel(
       false,
       listenerFactory,
       true,
@@ -540,7 +580,7 @@ describe("web auto-reply", () => {
         exit: vi.fn(),
       };
 
-      const run = monitorWebProvider(
+      const run = monitorWebChannel(
         false,
         listenerFactory,
         true,
@@ -604,7 +644,7 @@ describe("web auto-reply", () => {
         session: { store: store.storePath },
       }));
 
-      await monitorWebProvider(false, listenerFactory, false, resolver);
+      await monitorWebChannel(false, listenerFactory, false, resolver);
       expect(capturedOnMessage).toBeDefined();
 
       // Two messages from the same sender with fixed timestamps
@@ -693,7 +733,7 @@ describe("web auto-reply", () => {
       status: 200,
     } as Response);
 
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
 
     expect(capturedOnMessage).toBeDefined();
     await capturedOnMessage?.({
@@ -742,7 +782,7 @@ describe("web auto-reply", () => {
       headers: { get: () => "text/plain" },
     } as unknown as Response);
 
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
     expect(capturedOnMessage).toBeDefined();
 
     await capturedOnMessage?.({
@@ -809,7 +849,7 @@ describe("web auto-reply", () => {
       status: 200,
     } as Response);
 
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
     expect(capturedOnMessage).toBeDefined();
 
     await capturedOnMessage?.({
@@ -911,7 +951,7 @@ describe("web auto-reply", () => {
           status: 200,
         } as Response);
 
-        await monitorWebProvider(false, listenerFactory, false, resolver);
+        await monitorWebChannel(false, listenerFactory, false, resolver);
         expect(capturedOnMessage).toBeDefined();
 
         await capturedOnMessage?.({
@@ -985,7 +1025,7 @@ describe("web auto-reply", () => {
       status: 200,
     } as Response);
 
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
     expect(capturedOnMessage).toBeDefined();
 
     await capturedOnMessage?.({
@@ -1040,7 +1080,7 @@ describe("web auto-reply", () => {
       status: 200,
     } as Response);
 
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
     expect(capturedOnMessage).toBeDefined();
 
     await capturedOnMessage?.({
@@ -1085,7 +1125,7 @@ describe("web auto-reply", () => {
       return { close: vi.fn() };
     };
 
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
     expect(capturedOnMessage).toBeDefined();
 
     await capturedOnMessage?.({
@@ -1127,9 +1167,159 @@ describe("web auto-reply", () => {
     expect(resolver).toHaveBeenCalledTimes(1);
     const payload = resolver.mock.calls[0][0];
     expect(payload.Body).toContain("Chat messages since your last reply");
-    expect(payload.Body).toContain("Alice: hello group");
+    expect(payload.Body).toContain("Alice (+111): hello group");
+    expect(payload.Body).toContain("[message_id: g1]");
     expect(payload.Body).toContain("@bot ping");
     expect(payload.Body).toContain("[from: Bob (+222)]");
+  });
+
+  it("detects LID mentions using authDir mapping", async () => {
+    const sendMedia = vi.fn();
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const sendComposing = vi.fn();
+    const resolver = vi.fn().mockResolvedValue({ text: "ok" });
+
+    let capturedOnMessage:
+      | ((msg: import("./inbound.js").WebInboundMessage) => Promise<void>)
+      | undefined;
+    const listenerFactory = async (opts: {
+      onMessage: (
+        msg: import("./inbound.js").WebInboundMessage,
+      ) => Promise<void>;
+    }) => {
+      capturedOnMessage = opts.onMessage;
+      return { close: vi.fn() };
+    };
+
+    const authDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "clawdbot-wa-auth-"),
+    );
+
+    try {
+      await fs.writeFile(
+        path.join(authDir, "lid-mapping-555_reverse.json"),
+        JSON.stringify("15551234"),
+      );
+
+      setLoadConfigMock(() => ({
+        channels: {
+          whatsapp: {
+            allowFrom: ["*"],
+            accounts: {
+              default: { authDir },
+            },
+          },
+        },
+      }));
+
+      await monitorWebChannel(false, listenerFactory, false, resolver);
+      expect(capturedOnMessage).toBeDefined();
+
+      await capturedOnMessage?.({
+        body: "hello group",
+        from: "123@g.us",
+        conversationId: "123@g.us",
+        chatId: "123@g.us",
+        chatType: "group",
+        to: "+2",
+        id: "g1",
+        senderE164: "+111",
+        senderName: "Alice",
+        selfE164: "+15551234",
+        sendComposing,
+        reply,
+        sendMedia,
+      });
+
+      await capturedOnMessage?.({
+        body: "@bot ping",
+        from: "123@g.us",
+        conversationId: "123@g.us",
+        chatId: "123@g.us",
+        chatType: "group",
+        to: "+2",
+        id: "g2",
+        senderE164: "+222",
+        senderName: "Bob",
+        mentionedJids: ["555@lid"],
+        selfE164: "+15551234",
+        selfJid: "15551234@s.whatsapp.net",
+        sendComposing,
+        reply,
+        sendMedia,
+      });
+
+      expect(resolver).toHaveBeenCalledTimes(1);
+    } finally {
+      resetLoadConfigMock();
+      await rmDirWithRetries(authDir);
+    }
+  });
+
+  it("derives self E.164 from LID selfJid for mention gating", async () => {
+    const sendMedia = vi.fn();
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const sendComposing = vi.fn();
+    const resolver = vi.fn().mockResolvedValue({ text: "ok" });
+
+    let capturedOnMessage:
+      | ((msg: import("./inbound.js").WebInboundMessage) => Promise<void>)
+      | undefined;
+    const listenerFactory = async (opts: {
+      onMessage: (
+        msg: import("./inbound.js").WebInboundMessage,
+      ) => Promise<void>;
+    }) => {
+      capturedOnMessage = opts.onMessage;
+      return { close: vi.fn() };
+    };
+
+    const authDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "clawdbot-wa-auth-"),
+    );
+
+    try {
+      await fs.writeFile(
+        path.join(authDir, "lid-mapping-777_reverse.json"),
+        JSON.stringify("15550077"),
+      );
+
+      setLoadConfigMock(() => ({
+        channels: {
+          whatsapp: {
+            allowFrom: ["*"],
+            accounts: {
+              default: { authDir },
+            },
+          },
+        },
+      }));
+
+      await monitorWebChannel(false, listenerFactory, false, resolver);
+      expect(capturedOnMessage).toBeDefined();
+
+      await capturedOnMessage?.({
+        body: "@bot ping",
+        from: "123@g.us",
+        conversationId: "123@g.us",
+        chatId: "123@g.us",
+        chatType: "group",
+        to: "+2",
+        id: "g3",
+        senderE164: "+333",
+        senderName: "Cara",
+        mentionedJids: ["777@lid"],
+        selfJid: "777@lid",
+        sendComposing,
+        reply,
+        sendMedia,
+      });
+
+      expect(resolver).toHaveBeenCalledTimes(1);
+    } finally {
+      resetLoadConfigMock();
+      await rmDirWithRetries(authDir);
+    }
   });
 
   it("sets OriginatingTo to the sender for queued routing", async () => {
@@ -1150,7 +1340,7 @@ describe("web auto-reply", () => {
       return { close: vi.fn() };
     };
 
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
     expect(capturedOnMessage).toBeDefined();
 
     await capturedOnMessage?.({
@@ -1178,9 +1368,11 @@ describe("web auto-reply", () => {
     const resolver = vi.fn().mockResolvedValue({ text: "ok" });
 
     setLoadConfigMock(() => ({
-      whatsapp: {
-        allowFrom: ["*"],
-        groups: { "*": { requireMention: true } },
+      channels: {
+        whatsapp: {
+          allowFrom: ["*"],
+          groups: { "*": { requireMention: true } },
+        },
       },
       messages: {
         groupChat: { mentionPatterns: ["@global"] },
@@ -1216,7 +1408,7 @@ describe("web auto-reply", () => {
       return { close: vi.fn() };
     };
 
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
     expect(capturedOnMessage).toBeDefined();
 
     await capturedOnMessage?.({
@@ -1261,9 +1453,11 @@ describe("web auto-reply", () => {
     const resolver = vi.fn().mockResolvedValue({ text: "ok" });
 
     setLoadConfigMock(() => ({
-      whatsapp: {
-        allowFrom: ["*"],
-        groups: { "*": { requireMention: false } },
+      channels: {
+        whatsapp: {
+          allowFrom: ["*"],
+          groups: { "*": { requireMention: false } },
+        },
       },
       messages: { groupChat: { mentionPatterns: ["@clawd"] } },
     }));
@@ -1280,7 +1474,7 @@ describe("web auto-reply", () => {
       return { close: vi.fn() };
     };
 
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
     expect(capturedOnMessage).toBeDefined();
 
     await capturedOnMessage?.({
@@ -1310,9 +1504,11 @@ describe("web auto-reply", () => {
     const resolver = vi.fn().mockResolvedValue({ text: "ok" });
 
     setLoadConfigMock(() => ({
-      whatsapp: {
-        allowFrom: ["*"],
-        groups: { "999@g.us": { requireMention: false } },
+      channels: {
+        whatsapp: {
+          allowFrom: ["*"],
+          groups: { "999@g.us": { requireMention: false } },
+        },
       },
       messages: { groupChat: { mentionPatterns: ["@clawd"] } },
     }));
@@ -1329,7 +1525,7 @@ describe("web auto-reply", () => {
       return { close: vi.fn() };
     };
 
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
     expect(capturedOnMessage).toBeDefined();
 
     await capturedOnMessage?.({
@@ -1361,11 +1557,13 @@ describe("web auto-reply", () => {
     const resolver = vi.fn().mockResolvedValue({ text: "ok" });
 
     setLoadConfigMock(() => ({
-      whatsapp: {
-        allowFrom: ["*"],
-        groups: {
-          "*": { requireMention: true },
-          "123@g.us": { requireMention: false },
+      channels: {
+        whatsapp: {
+          allowFrom: ["*"],
+          groups: {
+            "*": { requireMention: true },
+            "123@g.us": { requireMention: false },
+          },
         },
       },
       messages: { groupChat: { mentionPatterns: ["@clawd"] } },
@@ -1383,7 +1581,7 @@ describe("web auto-reply", () => {
       return { close: vi.fn() };
     };
 
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
     expect(capturedOnMessage).toBeDefined();
 
     await capturedOnMessage?.({
@@ -1442,7 +1640,7 @@ describe("web auto-reply", () => {
       return { close: vi.fn() };
     };
 
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
     expect(capturedOnMessage).toBeDefined();
 
     await capturedOnMessage?.({
@@ -1483,7 +1681,8 @@ describe("web auto-reply", () => {
     expect(resolver).toHaveBeenCalledTimes(2);
     const payload = resolver.mock.calls[1][0];
     expect(payload.Body).toContain("Chat messages since your last reply");
-    expect(payload.Body).toContain("Alice: first");
+    expect(payload.Body).toContain("Alice (+111): first");
+    expect(payload.Body).toContain("[message_id: g-always-1]");
     expect(payload.Body).toContain("Bob: second");
     expect(reply).toHaveBeenCalledTimes(1);
 
@@ -1498,10 +1697,12 @@ describe("web auto-reply", () => {
     const resolver = vi.fn().mockResolvedValue({ text: "ok" });
 
     setLoadConfigMock(() => ({
-      whatsapp: {
-        // Self-chat heuristic: allowFrom includes selfE164.
-        allowFrom: ["+999"],
-        groups: { "*": { requireMention: true } },
+      channels: {
+        whatsapp: {
+          // Self-chat heuristic: allowFrom includes selfE164.
+          allowFrom: ["+999"],
+          groups: { "*": { requireMention: true } },
+        },
       },
       messages: {
         groupChat: {
@@ -1522,7 +1723,7 @@ describe("web auto-reply", () => {
       return { close: vi.fn() };
     };
 
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
     expect(capturedOnMessage).toBeDefined();
 
     // WhatsApp @mention of the owner should NOT trigger the bot in self-chat mode.
@@ -1588,7 +1789,7 @@ describe("web auto-reply", () => {
       return { close: vi.fn(), onClose };
     });
 
-    const run = monitorWebProvider(
+    const run = monitorWebChannel(
       false,
       listenerFactory,
       true,
@@ -1629,7 +1830,7 @@ describe("web auto-reply", () => {
     };
 
     const resolver = vi.fn().mockResolvedValue({ text: "auto" });
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
     expect(capturedOnMessage).toBeDefined();
 
     await capturedOnMessage?.({
@@ -1650,9 +1851,7 @@ describe("web auto-reply", () => {
   it("prefixes body with same-phone marker when from === to", async () => {
     // Enable messagePrefix for same-phone mode testing
     setLoadConfigMock(() => ({
-      whatsapp: {
-        allowFrom: ["*"],
-      },
+      channels: { whatsapp: { allowFrom: ["*"] } },
       messages: {
         messagePrefix: "[same-phone]",
         responsePrefix: undefined,
@@ -1673,7 +1872,7 @@ describe("web auto-reply", () => {
 
     const resolver = vi.fn().mockResolvedValue({ text: "reply" });
 
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
     expect(capturedOnMessage).toBeDefined();
 
     await capturedOnMessage?.({
@@ -1709,7 +1908,7 @@ describe("web auto-reply", () => {
 
     const resolver = vi.fn().mockResolvedValue({ text: "reply" });
 
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
     expect(capturedOnMessage).toBeDefined();
 
     await capturedOnMessage?.({
@@ -1743,7 +1942,7 @@ describe("web auto-reply", () => {
 
     const resolver = vi.fn().mockResolvedValue({ text: "reply" });
 
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
     expect(capturedOnMessage).toBeDefined();
 
     await capturedOnMessage?.({
@@ -1774,9 +1973,7 @@ describe("web auto-reply", () => {
 
   it("applies responsePrefix to regular replies", async () => {
     setLoadConfigMock(() => ({
-      whatsapp: {
-        allowFrom: ["*"],
-      },
+      channels: { whatsapp: { allowFrom: ["*"] } },
       messages: {
         messagePrefix: undefined,
         responsePrefix: "🦞",
@@ -1798,7 +1995,7 @@ describe("web auto-reply", () => {
 
     const resolver = vi.fn().mockResolvedValue({ text: "hello there" });
 
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
     expect(capturedOnMessage).toBeDefined();
 
     await capturedOnMessage?.({
@@ -1818,9 +2015,7 @@ describe("web auto-reply", () => {
 
   it("does not deliver HEARTBEAT_OK responses", async () => {
     setLoadConfigMock(() => ({
-      whatsapp: {
-        allowFrom: ["*"],
-      },
+      channels: { whatsapp: { allowFrom: ["*"] } },
       messages: {
         messagePrefix: undefined,
         responsePrefix: "🦞",
@@ -1843,7 +2038,7 @@ describe("web auto-reply", () => {
     // Resolver returns exact HEARTBEAT_OK
     const resolver = vi.fn().mockResolvedValue({ text: HEARTBEAT_TOKEN });
 
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
     expect(capturedOnMessage).toBeDefined();
 
     await capturedOnMessage?.({
@@ -1862,9 +2057,7 @@ describe("web auto-reply", () => {
 
   it("does not double-prefix if responsePrefix already present", async () => {
     setLoadConfigMock(() => ({
-      whatsapp: {
-        allowFrom: ["*"],
-      },
+      channels: { whatsapp: { allowFrom: ["*"] } },
       messages: {
         messagePrefix: undefined,
         responsePrefix: "🦞",
@@ -1887,7 +2080,7 @@ describe("web auto-reply", () => {
     // Resolver returns text that already has prefix
     const resolver = vi.fn().mockResolvedValue({ text: "🦞 already prefixed" });
 
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
     expect(capturedOnMessage).toBeDefined();
 
     await capturedOnMessage?.({
@@ -1907,9 +2100,7 @@ describe("web auto-reply", () => {
 
   it("sends tool summaries immediately with responsePrefix", async () => {
     setLoadConfigMock(() => ({
-      whatsapp: {
-        allowFrom: ["*"],
-      },
+      channels: { whatsapp: { allowFrom: ["*"] } },
       messages: {
         messagePrefix: undefined,
         responsePrefix: "🦞",
@@ -1942,7 +2133,7 @@ describe("web auto-reply", () => {
         },
       );
 
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
     expect(capturedOnMessage).toBeDefined();
 
     await capturedOnMessage?.({
@@ -1979,7 +2170,7 @@ describe("web auto-reply", () => {
         {
           agentId: "rich",
           match: {
-            provider: "whatsapp",
+            channel: "whatsapp",
             peer: { kind: "dm", id: "+1555" },
           },
         },
@@ -2001,7 +2192,7 @@ describe("web auto-reply", () => {
 
     const resolver = vi.fn().mockResolvedValue({ text: "hello" });
 
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
     expect(capturedOnMessage).toBeDefined();
 
     await capturedOnMessage?.({
@@ -2022,7 +2213,7 @@ describe("web auto-reply", () => {
     resetLoadConfigMock();
   });
 
-  it("uses identity.name for responsePrefix when set", async () => {
+  it("does not derive responsePrefix from identity.name when unset", async () => {
     setLoadConfigMock(() => ({
       agents: {
         list: [
@@ -2041,7 +2232,7 @@ describe("web auto-reply", () => {
         {
           agentId: "rich",
           match: {
-            provider: "whatsapp",
+            channel: "whatsapp",
             peer: { kind: "dm", id: "+1555" },
           },
         },
@@ -2063,7 +2254,7 @@ describe("web auto-reply", () => {
 
     const resolver = vi.fn().mockResolvedValue({ text: "hello there" });
 
-    await monitorWebProvider(false, listenerFactory, false, resolver);
+    await monitorWebChannel(false, listenerFactory, false, resolver);
     expect(capturedOnMessage).toBeDefined();
 
     await capturedOnMessage?.({
@@ -2076,8 +2267,295 @@ describe("web auto-reply", () => {
       sendMedia: vi.fn(),
     });
 
-    // Reply should have identity-based responsePrefix prepended
-    expect(reply).toHaveBeenCalledWith("[Richbot] hello there");
+    // No implicit responsePrefix.
+    expect(reply).toHaveBeenCalledWith("hello there");
+    resetLoadConfigMock();
+  });
+});
+
+describe("broadcast groups", () => {
+  it("broadcasts sequentially in configured order", async () => {
+    setLoadConfigMock({
+      channels: { whatsapp: { allowFrom: ["*"] } },
+      agents: {
+        defaults: { maxConcurrent: 10 },
+        list: [{ id: "alfred" }, { id: "baerbel" }],
+      },
+      broadcast: {
+        strategy: "sequential",
+        "+1000": ["alfred", "baerbel"],
+      },
+    } satisfies ClawdbotConfig);
+
+    const sendMedia = vi.fn();
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const sendComposing = vi.fn();
+    const seen: string[] = [];
+    const resolver = vi.fn(async (ctx: { SessionKey?: unknown }) => {
+      seen.push(String(ctx.SessionKey));
+      return { text: "ok" };
+    });
+
+    let capturedOnMessage:
+      | ((msg: import("./inbound.js").WebInboundMessage) => Promise<void>)
+      | undefined;
+    const listenerFactory = async (opts: {
+      onMessage: (
+        msg: import("./inbound.js").WebInboundMessage,
+      ) => Promise<void>;
+    }) => {
+      capturedOnMessage = opts.onMessage;
+      return { close: vi.fn() };
+    };
+
+    await monitorWebChannel(false, listenerFactory, false, resolver);
+    expect(capturedOnMessage).toBeDefined();
+
+    await capturedOnMessage?.({
+      id: "m1",
+      from: "+1000",
+      conversationId: "+1000",
+      to: "+2000",
+      body: "hello",
+      timestamp: Date.now(),
+      chatType: "direct",
+      chatId: "direct:+1000",
+      sendComposing,
+      reply,
+      sendMedia,
+    });
+
+    expect(resolver).toHaveBeenCalledTimes(2);
+    expect(seen[0]).toContain("agent:alfred:");
+    expect(seen[1]).toContain("agent:baerbel:");
+    resetLoadConfigMock();
+  });
+
+  it("shares group history across broadcast agents and clears after replying", async () => {
+    setLoadConfigMock({
+      channels: { whatsapp: { allowFrom: ["*"] } },
+      agents: {
+        defaults: { maxConcurrent: 10 },
+        list: [{ id: "alfred" }, { id: "baerbel" }],
+      },
+      broadcast: {
+        strategy: "sequential",
+        "123@g.us": ["alfred", "baerbel"],
+      },
+    } satisfies ClawdbotConfig);
+
+    const sendMedia = vi.fn();
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const sendComposing = vi.fn();
+    const resolver = vi.fn().mockResolvedValue({ text: "ok" });
+
+    let capturedOnMessage:
+      | ((msg: import("./inbound.js").WebInboundMessage) => Promise<void>)
+      | undefined;
+    const listenerFactory = async (opts: {
+      onMessage: (
+        msg: import("./inbound.js").WebInboundMessage,
+      ) => Promise<void>;
+    }) => {
+      capturedOnMessage = opts.onMessage;
+      return { close: vi.fn() };
+    };
+
+    await monitorWebChannel(false, listenerFactory, false, resolver);
+    expect(capturedOnMessage).toBeDefined();
+
+    await capturedOnMessage?.({
+      body: "hello group",
+      from: "123@g.us",
+      conversationId: "123@g.us",
+      chatId: "123@g.us",
+      chatType: "group",
+      to: "+2",
+      id: "g1",
+      senderE164: "+111",
+      senderName: "Alice",
+      selfE164: "+999",
+      sendComposing,
+      reply,
+      sendMedia,
+    });
+
+    expect(resolver).not.toHaveBeenCalled();
+
+    await capturedOnMessage?.({
+      body: "@bot ping",
+      from: "123@g.us",
+      conversationId: "123@g.us",
+      chatId: "123@g.us",
+      chatType: "group",
+      to: "+2",
+      id: "g2",
+      senderE164: "+222",
+      senderName: "Bob",
+      mentionedJids: ["999@s.whatsapp.net"],
+      selfE164: "+999",
+      selfJid: "999@s.whatsapp.net",
+      sendComposing,
+      reply,
+      sendMedia,
+    });
+
+    expect(resolver).toHaveBeenCalledTimes(2);
+    for (const call of resolver.mock.calls.slice(0, 2)) {
+      const payload = call[0] as { Body: string };
+      expect(payload.Body).toContain("Chat messages since your last reply");
+      expect(payload.Body).toContain("Alice (+111): hello group");
+      expect(payload.Body).toContain("[message_id: g1]");
+      expect(payload.Body).toContain("@bot ping");
+      expect(payload.Body).toContain("[from: Bob (+222)]");
+    }
+
+    await capturedOnMessage?.({
+      body: "@bot ping 2",
+      from: "123@g.us",
+      conversationId: "123@g.us",
+      chatId: "123@g.us",
+      chatType: "group",
+      to: "+2",
+      id: "g3",
+      senderE164: "+333",
+      senderName: "Clara",
+      mentionedJids: ["999@s.whatsapp.net"],
+      selfE164: "+999",
+      selfJid: "999@s.whatsapp.net",
+      sendComposing,
+      reply,
+      sendMedia,
+    });
+
+    expect(resolver).toHaveBeenCalledTimes(4);
+    for (const call of resolver.mock.calls.slice(2, 4)) {
+      const payload = call[0] as { Body: string };
+      expect(payload.Body).not.toContain("Alice (+111): hello group");
+      expect(payload.Body).not.toContain("Chat messages since your last reply");
+    }
+
+    resetLoadConfigMock();
+  });
+
+  it("broadcasts in parallel by default", async () => {
+    setLoadConfigMock({
+      channels: { whatsapp: { allowFrom: ["*"] } },
+      agents: {
+        defaults: { maxConcurrent: 10 },
+        list: [{ id: "alfred" }, { id: "baerbel" }],
+      },
+      broadcast: {
+        strategy: "parallel",
+        "+1000": ["alfred", "baerbel"],
+      },
+    } satisfies ClawdbotConfig);
+
+    const sendMedia = vi.fn();
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const sendComposing = vi.fn();
+
+    let started = 0;
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const resolver = vi.fn(async () => {
+      started += 1;
+      if (started < 2) {
+        await gate;
+      } else {
+        release?.();
+      }
+      return { text: "ok" };
+    });
+
+    let capturedOnMessage:
+      | ((msg: import("./inbound.js").WebInboundMessage) => Promise<void>)
+      | undefined;
+    const listenerFactory = async (opts: {
+      onMessage: (
+        msg: import("./inbound.js").WebInboundMessage,
+      ) => Promise<void>;
+    }) => {
+      capturedOnMessage = opts.onMessage;
+      return { close: vi.fn() };
+    };
+
+    await monitorWebChannel(false, listenerFactory, false, resolver);
+    expect(capturedOnMessage).toBeDefined();
+
+    await capturedOnMessage?.({
+      id: "m1",
+      from: "+1000",
+      conversationId: "+1000",
+      to: "+2000",
+      body: "hello",
+      timestamp: Date.now(),
+      chatType: "direct",
+      chatId: "direct:+1000",
+      sendComposing,
+      reply,
+      sendMedia,
+    });
+
+    expect(resolver).toHaveBeenCalledTimes(2);
+    resetLoadConfigMock();
+  });
+
+  it("skips unknown broadcast agent ids when agents.list is present", async () => {
+    setLoadConfigMock({
+      channels: { whatsapp: { allowFrom: ["*"] } },
+      agents: {
+        defaults: { maxConcurrent: 10 },
+        list: [{ id: "alfred" }],
+      },
+      broadcast: {
+        "+1000": ["alfred", "missing"],
+      },
+    } satisfies ClawdbotConfig);
+
+    const sendMedia = vi.fn();
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const sendComposing = vi.fn();
+    const seen: string[] = [];
+    const resolver = vi.fn(async (ctx: { SessionKey?: unknown }) => {
+      seen.push(String(ctx.SessionKey));
+      return { text: "ok" };
+    });
+
+    let capturedOnMessage:
+      | ((msg: import("./inbound.js").WebInboundMessage) => Promise<void>)
+      | undefined;
+    const listenerFactory = async (opts: {
+      onMessage: (
+        msg: import("./inbound.js").WebInboundMessage,
+      ) => Promise<void>;
+    }) => {
+      capturedOnMessage = opts.onMessage;
+      return { close: vi.fn() };
+    };
+
+    await monitorWebChannel(false, listenerFactory, false, resolver);
+    expect(capturedOnMessage).toBeDefined();
+
+    await capturedOnMessage?.({
+      id: "m1",
+      from: "+1000",
+      conversationId: "+1000",
+      to: "+2000",
+      body: "hello",
+      timestamp: Date.now(),
+      chatType: "direct",
+      chatId: "direct:+1000",
+      sendComposing,
+      reply,
+      sendMedia,
+    });
+
+    expect(resolver).toHaveBeenCalledTimes(1);
+    expect(seen[0]).toContain("agent:alfred:");
     resetLoadConfigMock();
   });
 });

@@ -2,7 +2,7 @@ import ClawdbotProtocol
 import Foundation
 import Observation
 
-struct ProvidersStatusSnapshot: Codable {
+struct ChannelsStatusSnapshot: Codable {
     struct WhatsAppSelf: Codable {
         let e164: String?
         let jid: String?
@@ -121,12 +121,54 @@ struct ProvidersStatusSnapshot: Codable {
         let lastProbeAt: Double?
     }
 
+    struct ChannelAccountSnapshot: Codable {
+        let accountId: String
+        let name: String?
+        let enabled: Bool?
+        let configured: Bool?
+        let linked: Bool?
+        let running: Bool?
+        let connected: Bool?
+        let reconnectAttempts: Int?
+        let lastConnectedAt: Double?
+        let lastError: String?
+        let lastStartAt: Double?
+        let lastStopAt: Double?
+        let lastInboundAt: Double?
+        let lastOutboundAt: Double?
+        let lastProbeAt: Double?
+        let mode: String?
+        let dmPolicy: String?
+        let allowFrom: [String]?
+        let tokenSource: String?
+        let botTokenSource: String?
+        let appTokenSource: String?
+        let baseUrl: String?
+        let allowUnmentionedGroups: Bool?
+        let cliPath: String?
+        let dbPath: String?
+        let port: Int?
+        let probe: AnyCodable?
+        let audit: AnyCodable?
+        let application: AnyCodable?
+    }
+
     let ts: Double
-    let whatsapp: WhatsAppStatus
-    let telegram: TelegramStatus
-    let discord: DiscordStatus?
-    let signal: SignalStatus?
-    let imessage: IMessageStatus?
+    let channelOrder: [String]
+    let channelLabels: [String: String]
+    let channels: [String: AnyCodable]
+    let channelAccounts: [String: [ChannelAccountSnapshot]]
+    let channelDefaultAccountId: [String: String]
+
+    func decodeChannel<T: Decodable>(_ id: String, as type: T.Type) -> T? {
+        guard let value = self.channels[id] else { return nil }
+        do {
+            let data = try JSONEncoder().encode(value)
+            return try JSONDecoder().decode(type, from: data)
+        } catch {
+            return nil
+        }
+    }
 }
 
 struct ConfigSnapshot: Codable {
@@ -188,7 +230,7 @@ struct DiscordGuildForm: Identifiable {
 final class ConnectionsStore {
     static let shared = ConnectionsStore()
 
-    var snapshot: ProvidersStatusSnapshot?
+    var snapshot: ChannelsStatusSnapshot?
     var lastError: String?
     var lastSuccess: Date?
     var isRefreshing = false

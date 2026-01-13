@@ -2,6 +2,15 @@ export const DEFAULT_AGENT_ID = "main";
 export const DEFAULT_MAIN_KEY = "main";
 export const DEFAULT_ACCOUNT_ID = "default";
 
+function normalizeToken(value: string | undefined | null): string {
+  return (value ?? "").trim().toLowerCase();
+}
+
+export function normalizeMainKey(value: string | undefined | null): string {
+  const trimmed = (value ?? "").trim();
+  return trimmed ? trimmed : DEFAULT_MAIN_KEY;
+}
+
 export type ParsedAgentSessionKey = {
   agentId: string;
   rest: string;
@@ -73,15 +82,14 @@ export function buildAgentMainSessionKey(params: {
   mainKey?: string | undefined;
 }): string {
   const agentId = normalizeAgentId(params.agentId);
-  const mainKey =
-    (params.mainKey ?? DEFAULT_MAIN_KEY).trim() || DEFAULT_MAIN_KEY;
+  const mainKey = normalizeMainKey(params.mainKey);
   return `agent:${agentId}:${mainKey}`;
 }
 
 export function buildAgentPeerSessionKey(params: {
   agentId: string;
   mainKey?: string | undefined;
-  provider: string;
+  channel: string;
   peerKind?: "dm" | "group" | "channel" | null;
   peerId?: string | null;
 }): string {
@@ -92,9 +100,21 @@ export function buildAgentPeerSessionKey(params: {
       mainKey: params.mainKey,
     });
   }
-  const provider = (params.provider ?? "").trim().toLowerCase() || "unknown";
+  const channel = (params.channel ?? "").trim().toLowerCase() || "unknown";
   const peerId = (params.peerId ?? "").trim() || "unknown";
-  return `agent:${normalizeAgentId(params.agentId)}:${provider}:${peerKind}:${peerId}`;
+  return `agent:${normalizeAgentId(params.agentId)}:${channel}:${peerKind}:${peerId}`;
+}
+
+export function buildGroupHistoryKey(params: {
+  channel: string;
+  accountId?: string | null;
+  peerKind: "group" | "channel";
+  peerId: string;
+}): string {
+  const channel = normalizeToken(params.channel) || "unknown";
+  const accountId = normalizeAccountId(params.accountId);
+  const peerId = params.peerId.trim() || "unknown";
+  return `${channel}:${accountId}:${params.peerKind}:${peerId}`;
 }
 
 export function resolveThreadSessionKeys(params: {

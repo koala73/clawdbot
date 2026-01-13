@@ -4,9 +4,15 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, expect, vi } from "vitest";
 import { WebSocket } from "ws";
+import { resolveMainSessionKeyFromConfig } from "../config/sessions.js";
 import { resetAgentRunContextForTest } from "../infra/agent-events.js";
 import { drainSystemEvents, peekSystemEvents } from "../infra/system-events.js";
 import { rawDataToString } from "../infra/ws.js";
+import { resetLogger, setLoggerOverride } from "../logging.js";
+import {
+  GATEWAY_CLIENT_MODES,
+  GATEWAY_CLIENT_NAMES,
+} from "../utils/message-channel.js";
 import { PROTOCOL_VERSION } from "./protocol/index.js";
 import type { GatewayServerOptions } from "./server.js";
 
@@ -255,8 +261,10 @@ vi.mock("../config/config.js", async () => {
         return { defaults };
       })(),
       bindings: testState.bindingsConfig,
-      whatsapp: {
-        allowFrom: testState.allowFrom,
+      channels: {
+        whatsapp: {
+          allowFrom: testState.allowFrom,
+        },
       },
       session: {
         mainKey: "main",
@@ -336,13 +344,14 @@ vi.mock("../commands/agent.js", () => ({
   agentCommand,
 }));
 
-process.env.CLAWDBOT_SKIP_PROVIDERS = "1";
+process.env.CLAWDBOT_SKIP_CHANNELS = "1";
 
 let previousHome: string | undefined;
 let tempHome: string | undefined;
 
 export function installGatewayTestHooks() {
   beforeEach(async () => {
+    setLoggerOverride({ level: "silent", consoleLevel: "silent" });
     previousHome = process.env.HOME;
     tempHome = await fs.mkdtemp(
       path.join(os.tmpdir(), "clawdbot-gateway-home-"),
@@ -373,7 +382,7 @@ export function installGatewayTestHooks() {
     embeddedRunMock.abortCalls = [];
     embeddedRunMock.waitCalls = [];
     embeddedRunMock.waitResults.clear();
-    drainSystemEvents();
+    drainSystemEvents(resolveMainSessionKeyFromConfig());
     resetAgentRunContextForTest();
     const mod = await import("./server.js");
     mod.__resetModelCatalogCacheForTest();
@@ -383,17 +392,54 @@ export function installGatewayTestHooks() {
   }, 60_000);
 
   afterEach(async () => {
+    resetLogger();
     process.env.HOME = previousHome;
     if (tempHome) {
-      await fs.rm(tempHome, { recursive: true, force: true });
+      await fs.rm(tempHome, {
+        recursive: true,
+        force: true,
+        maxRetries: 20,
+        retryDelay: 25,
+      });
       tempHome = undefined;
     }
   });
 }
 
+let nextTestPortOffset = 0;
+
 export async function getFreePort(): Promise<number> {
+  const workerIdRaw =
+    process.env.VITEST_WORKER_ID ?? process.env.VITEST_POOL_ID ?? "";
+  const workerId = Number.parseInt(workerIdRaw, 10);
+  const shard = Number.isFinite(workerId)
+    ? Math.max(0, workerId)
+    : Math.abs(process.pid);
+
+  // Avoid flaky "get a free port then bind later" races by allocating from a
+  // deterministic per-worker port range. Still probe for EADDRINUSE to avoid
+  // collisions with external processes.
+  const rangeSize = 1000;
+  const shardCount = 30;
+  const base = 30_000 + (Math.abs(shard) % shardCount) * rangeSize; // <= 59_999
+
+  for (let attempt = 0; attempt < rangeSize; attempt++) {
+    const port = base + (nextTestPortOffset++ % rangeSize);
+    // eslint-disable-next-line no-await-in-loop
+    const ok = await new Promise<boolean>((resolve) => {
+      const server = createServer();
+      server.once("error", () => resolve(false));
+      server.listen(port, "127.0.0.1", () => {
+        server.close(() => resolve(true));
+      });
+    });
+    if (ok) return port;
+  }
+
+  // Fallback: let the OS pick a port.
   return await new Promise((resolve, reject) => {
     const server = createServer();
+    server.once("error", reject);
     server.listen(0, "127.0.0.1", () => {
       const port = (server.address() as AddressInfo).port;
       server.close((err) => (err ? reject(err) : resolve(port)));
@@ -453,14 +499,29 @@ export async function startServerWithClient(
   token?: string,
   opts?: GatewayServerOptions,
 ) {
-  const port = await getFreePort();
+  let port = await getFreePort();
   const prev = process.env.CLAWDBOT_GATEWAY_TOKEN;
   if (token === undefined) {
     delete process.env.CLAWDBOT_GATEWAY_TOKEN;
   } else {
     process.env.CLAWDBOT_GATEWAY_TOKEN = token;
   }
-  const server = await startGatewayServer(port, opts);
+
+  let server: Awaited<ReturnType<typeof startGatewayServer>> | null = null;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    try {
+      server = await startGatewayServer(port, opts);
+      break;
+    } catch (err) {
+      const code = (err as { cause?: { code?: string } }).cause?.code;
+      if (code !== "EADDRINUSE") throw err;
+      port = await getFreePort();
+    }
+  }
+  if (!server) {
+    throw new Error("failed to start gateway server after retries");
+  }
+
   const ws = new WebSocket(`ws://127.0.0.1:${port}`);
   await new Promise<void>((resolve) => ws.once("open", resolve));
   return { server, ws, port, prevToken: prev };
@@ -482,10 +543,13 @@ export async function connectReq(
     minProtocol?: number;
     maxProtocol?: number;
     client?: {
-      name: string;
+      id: string;
+      displayName?: string;
       version: string;
       platform: string;
       mode: string;
+      deviceFamily?: string;
+      modelIdentifier?: string;
       instanceId?: string;
     };
   },
@@ -501,10 +565,10 @@ export async function connectReq(
         minProtocol: opts?.minProtocol ?? PROTOCOL_VERSION,
         maxProtocol: opts?.maxProtocol ?? PROTOCOL_VERSION,
         client: opts?.client ?? {
-          name: "test",
+          id: GATEWAY_CLIENT_NAMES.TEST,
           version: "1.0.0",
           platform: "test",
-          mode: "test",
+          mode: GATEWAY_CLIENT_MODES.TEST,
         },
         caps: [],
         auth:
@@ -553,9 +617,10 @@ export async function rpcReq<T = unknown>(
 }
 
 export async function waitForSystemEvent(timeoutMs = 2000) {
+  const sessionKey = resolveMainSessionKeyFromConfig();
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const events = peekSystemEvents();
+    const events = peekSystemEvents(sessionKey);
     if (events.length > 0) return events;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }

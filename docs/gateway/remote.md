@@ -5,15 +5,29 @@ read_when:
 ---
 # Remote access (SSH, tunnels, and tailnets)
 
-This repo supports “remote over SSH” by keeping a single Gateway (the master) running on a host (e.g., your Mac Studio) and connecting clients to it.
+This repo supports “remote over SSH” by keeping a single Gateway (the master) running on a dedicated host (desktop/server) and connecting clients to it.
 
 - For **operators (you / the macOS app)**: SSH tunneling is the universal fallback.
-- For **nodes (iOS/Android and future devices)**: prefer the Gateway **Bridge** when on the same LAN/tailnet (see [`docs/discovery.md`](/gateway/discovery)).
+- For **nodes (iOS/Android and future devices)**: prefer the Gateway **Bridge** when on the same LAN/tailnet (see [Discovery](/gateway/discovery)).
 
 ## The core idea
 
 - The Gateway WebSocket binds to **loopback** on your configured port (defaults to 18789).
 - For remote use, you forward that loopback port over SSH (or use a tailnet/VPN and tunnel less).
+
+## Command flow (what runs where)
+
+One gateway daemon owns state + channels. Nodes are peripherals.
+
+Flow example (Telegram → node):
+- Telegram message arrives at the **Gateway**.
+- Gateway runs the **agent** and decides whether to call a node tool.
+- Gateway calls the **node** over the Bridge (`node.*` RPC).
+- Node returns the result; Gateway replies back out to Telegram.
+
+Notes:
+- **Nodes do not run the gateway daemon.** Only one gateway should run per host.
+- macOS app “node mode” is just a node client over the Bridge.
 
 ## SSH tunnel (CLI + tools)
 
@@ -58,4 +72,4 @@ WebChat no longer uses a separate HTTP port. The SwiftUI chat UI connects direct
 
 The macOS menu bar app can drive the same setup end-to-end (remote status checks, WebChat, and Voice Wake forwarding).
 
-Runbook: [`docs/mac/remote.md`](/platforms/mac/remote).
+Runbook: [macOS remote access](/platforms/mac/remote).

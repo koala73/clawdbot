@@ -6,6 +6,7 @@ import {
   buildAllowedModelSet,
   modelKey,
   parseModelRef,
+  resolveAllowedModelRef,
   resolveHooksGmailModel,
 } from "./model-selection.js";
 
@@ -61,6 +62,41 @@ describe("buildAllowedModelSet", () => {
       true,
     );
   });
+
+  it("allows explicit custom providers from models.providers", () => {
+    const cfg = {
+      agents: {
+        defaults: {
+          models: {
+            "moonshot/kimi-k2-0905-preview": { alias: "kimi" },
+          },
+        },
+      },
+      models: {
+        mode: "merge",
+        providers: {
+          moonshot: {
+            baseUrl: "https://api.moonshot.ai/v1",
+            apiKey: "x",
+            api: "openai-completions",
+            models: [{ id: "kimi-k2-0905-preview", name: "Kimi" }],
+          },
+        },
+      },
+    } as ClawdbotConfig;
+
+    const allowed = buildAllowedModelSet({
+      cfg,
+      catalog: [],
+      defaultProvider: "anthropic",
+      defaultModel: "claude-opus-4-5",
+    });
+
+    expect(allowed.allowAny).toBe(false);
+    expect(
+      allowed.allowedKeys.has(modelKey("moonshot", "kimi-k2-0905-preview")),
+    ).toBe(true);
+  });
 });
 
 describe("parseModelRef", () => {
@@ -69,6 +105,24 @@ describe("parseModelRef", () => {
     expect(ref).toEqual({
       provider: "anthropic",
       model: "claude-opus-4-5",
+    });
+  });
+
+  it("normalizes google gemini 3 models to preview ids", () => {
+    expect(parseModelRef("google/gemini-3-pro", "anthropic")).toEqual({
+      provider: "google",
+      model: "gemini-3-pro-preview",
+    });
+    expect(parseModelRef("google/gemini-3-flash", "anthropic")).toEqual({
+      provider: "google",
+      model: "gemini-3-flash-preview",
+    });
+  });
+
+  it("normalizes default-provider google models", () => {
+    expect(parseModelRef("gemini-3-pro", "google")).toEqual({
+      provider: "google",
+      model: "gemini-3-pro-preview",
     });
   });
 });
@@ -140,6 +194,65 @@ describe("resolveHooksGmailModel", () => {
     expect(result).toEqual({
       provider: "anthropic",
       model: "claude-haiku-3-5",
+    });
+  });
+});
+
+describe("resolveAllowedModelRef", () => {
+  it("resolves aliases when allowed", () => {
+    const cfg = {
+      agents: {
+        defaults: {
+          models: {
+            "anthropic/claude-sonnet-4-1": { alias: "Sonnet" },
+          },
+        },
+      },
+    } satisfies ClawdbotConfig;
+    const resolved = resolveAllowedModelRef({
+      cfg,
+      catalog: [
+        {
+          provider: "anthropic",
+          id: "claude-sonnet-4-1",
+          name: "Sonnet",
+        },
+      ],
+      raw: "Sonnet",
+      defaultProvider: "anthropic",
+      defaultModel: "claude-opus-4-5",
+    });
+    expect("error" in resolved).toBe(false);
+    if ("ref" in resolved) {
+      expect(resolved.ref).toEqual({
+        provider: "anthropic",
+        model: "claude-sonnet-4-1",
+      });
+    }
+  });
+
+  it("rejects disallowed models", () => {
+    const cfg = {
+      agents: {
+        defaults: {
+          models: {
+            "openai/gpt-4": { alias: "GPT4" },
+          },
+        },
+      },
+    } satisfies ClawdbotConfig;
+    const resolved = resolveAllowedModelRef({
+      cfg,
+      catalog: [
+        { provider: "openai", id: "gpt-4", name: "GPT-4" },
+        { provider: "anthropic", id: "claude-sonnet-4-1", name: "Sonnet" },
+      ],
+      raw: "anthropic/claude-sonnet-4-1",
+      defaultProvider: "openai",
+      defaultModel: "gpt-4",
+    });
+    expect(resolved).toEqual({
+      error: "model not allowed: anthropic/claude-sonnet-4-1",
     });
   });
 });

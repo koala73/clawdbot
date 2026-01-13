@@ -81,6 +81,18 @@ describe("routeReply", () => {
     expect(mocks.sendMessageSlack).not.toHaveBeenCalled();
   });
 
+  it("drops payloads that start with the silent token", async () => {
+    mocks.sendMessageSlack.mockClear();
+    const res = await routeReply({
+      payload: { text: `${SILENT_REPLY_TOKEN} -- (why am I here?)` },
+      channel: "slack",
+      to: "channel:C123",
+      cfg: {} as never,
+    });
+    expect(res.ok).toBe(true);
+    expect(mocks.sendMessageSlack).not.toHaveBeenCalled();
+  });
+
   it("applies responsePrefix when routing", async () => {
     mocks.sendMessageSlack.mockClear();
     const cfg = {
@@ -99,7 +111,7 @@ describe("routeReply", () => {
     );
   });
 
-  it("derives responsePrefix from agent identity when routing", async () => {
+  it("does not derive responsePrefix from agent identity when routing", async () => {
     mocks.sendMessageSlack.mockClear();
     const cfg = {
       agents: {
@@ -121,7 +133,7 @@ describe("routeReply", () => {
     });
     expect(mocks.sendMessageSlack).toHaveBeenCalledWith(
       "channel:C123",
-      "[Richbot] hi",
+      "hi",
       expect.any(Object),
     );
   });
@@ -214,8 +226,10 @@ describe("routeReply", () => {
   it("routes MS Teams via proactive sender", async () => {
     mocks.sendMessageMSTeams.mockClear();
     const cfg = {
-      msteams: {
-        enabled: true,
+      channels: {
+        msteams: {
+          enabled: true,
+        },
       },
     } as unknown as ClawdbotConfig;
     await routeReply({
@@ -224,11 +238,12 @@ describe("routeReply", () => {
       to: "conversation:19:abc@thread.tacv2",
       cfg,
     });
-    expect(mocks.sendMessageMSTeams).toHaveBeenCalledWith({
-      cfg,
-      to: "conversation:19:abc@thread.tacv2",
-      text: "hi",
-      mediaUrl: undefined,
-    });
+    expect(mocks.sendMessageMSTeams).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cfg,
+        to: "conversation:19:abc@thread.tacv2",
+        text: "hi",
+      }),
+    );
   });
 });

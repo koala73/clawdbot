@@ -1,3 +1,5 @@
+import { getChannelDock } from "../../channels/dock.js";
+import { normalizeChannelId } from "../../channels/registry.js";
 import type { ClawdbotConfig } from "../../config/config.js";
 import type { ReplyToMode } from "../../config/types.js";
 import type { OriginatingChannelType } from "../templating.js";
@@ -6,17 +8,15 @@ import type { ReplyPayload } from "../types.js";
 export function resolveReplyToMode(
   cfg: ClawdbotConfig,
   channel?: OriginatingChannelType,
+  accountId?: string | null,
 ): ReplyToMode {
-  switch (channel) {
-    case "telegram":
-      return cfg.telegram?.replyToMode ?? "first";
-    case "discord":
-      return cfg.discord?.replyToMode ?? "off";
-    case "slack":
-      return cfg.slack?.replyToMode ?? "off";
-    default:
-      return "all";
-  }
+  const provider = normalizeChannelId(channel);
+  if (!provider) return "all";
+  const resolved = getChannelDock(provider)?.threading?.resolveReplyToMode?.({
+    cfg,
+    accountId,
+  });
+  return resolved ?? "all";
 }
 
 export function createReplyToModeFilter(
@@ -43,7 +43,11 @@ export function createReplyToModeFilterForChannel(
   mode: ReplyToMode,
   channel?: OriginatingChannelType,
 ) {
+  const provider = normalizeChannelId(channel);
+  const allowTagsWhenOff = provider
+    ? Boolean(getChannelDock(provider)?.threading?.allowTagsWhenOff)
+    : false;
   return createReplyToModeFilter(mode, {
-    allowTagsWhenOff: channel === "slack",
+    allowTagsWhenOff,
   });
 }

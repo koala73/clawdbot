@@ -2,6 +2,12 @@ import fs from "node:fs/promises";
 import type { Command } from "commander";
 import { callGateway, randomIdempotencyKey } from "../gateway/call.js";
 import { defaultRuntime } from "../runtime.js";
+import { formatDocsLink } from "../terminal/links.js";
+import { theme } from "../terminal/theme.js";
+import {
+  GATEWAY_CLIENT_MODES,
+  GATEWAY_CLIENT_NAMES,
+} from "../utils/message-channel.js";
 import {
   type CameraFacing,
   cameraTempPath,
@@ -150,8 +156,8 @@ const callGatewayCli = async (
         method,
         params,
         timeoutMs: Number(opts.timeout ?? 10_000),
-        clientName: "cli",
-        mode: "cli",
+        clientName: GATEWAY_CLIENT_NAMES.CLI,
+        mode: GATEWAY_CLIENT_MODES.CLI,
       }),
   );
 
@@ -351,7 +357,15 @@ function validateA2UIJsonl(jsonl: string) {
 export function registerNodesCli(program: Command) {
   const nodes = program
     .command("nodes")
-    .description("Manage gateway-owned node pairing");
+    .description("Manage gateway-owned node pairing")
+    .addHelpText(
+      "after",
+      () =>
+        `\n${theme.muted("Docs:")} ${formatDocsLink(
+          "/nodes",
+          "docs.clawd.bot/nodes",
+        )}\n`,
+    );
 
   nodesCallOpts(
     nodes

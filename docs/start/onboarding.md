@@ -17,7 +17,7 @@ wizard, and let the agent bootstrap itself.
 3) **Auth (Anthropic OAuth)** — local only
 4) **Setup Wizard** (Gateway‑driven)
 5) **Permissions** (TCC prompts)
-6) **CLI helper** (optional)
+6) **CLI** (optional)
 7) **Onboarding chat** (dedicated session)
 8) Ready
 
@@ -32,7 +32,8 @@ Where does the **Gateway** run?
 - **Configure later:** skip setup and leave the app unconfigured.
 
 Gateway auth tip:
-- If you only use Clawdbot locally (loopback), auth can be **Off**.
+- The wizard now generates a **token** even for loopback, so local WS clients must authenticate.
+- If you disable auth, any local process can connect; use that only on fully trusted machines.
 - Use a **token** for multi‑machine access or non‑loopback binds.
 
 ## 2) Local-only auth (Anthropic OAuth)
@@ -61,10 +62,10 @@ Onboarding requests TCC permissions needed for:
 - Microphone / Speech Recognition
 - Automation (AppleScript)
 
-## 5) CLI helper (optional)
+## 5) CLI (optional)
 
-The app can symlink the bundled `clawdbot` CLI into `/usr/local/bin` and
-`/opt/homebrew/bin` so terminal workflows work out of the box.
+The app can install the global `clawdbot` CLI via npm/pnpm so terminal
+workflows and launchd tasks work out of the box.
 
 ## 6) Onboarding chat (dedicated session)
 

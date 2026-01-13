@@ -1,8 +1,17 @@
-import { resolveEffectiveMessagesConfig } from "../agents/identity.js";
+import {
+  resolveEffectiveMessagesConfig,
+  resolveHumanDelayConfig,
+} from "../agents/identity.js";
 import { chunkText, resolveTextChunkLimit } from "../auto-reply/chunk.js";
 import { hasControlCommand } from "../auto-reply/command-detection.js";
 import { formatAgentEnvelope } from "../auto-reply/envelope.js";
 import { dispatchReplyFromConfig } from "../auto-reply/reply/dispatch-from-config.js";
+import {
+  buildHistoryContextFromMap,
+  clearHistoryEntries,
+  DEFAULT_GROUP_HISTORY_LIMIT,
+  type HistoryEntry,
+} from "../auto-reply/reply/history.js";
 import {
   buildMentionRegexes,
   matchesMentionPatterns,
@@ -12,16 +21,16 @@ import type { ReplyPayload } from "../auto-reply/types.js";
 import type { ClawdbotConfig } from "../config/config.js";
 import { loadConfig } from "../config/config.js";
 import {
-  resolveProviderGroupPolicy,
-  resolveProviderGroupRequireMention,
+  resolveChannelGroupPolicy,
+  resolveChannelGroupRequireMention,
 } from "../config/group-policy.js";
 import { resolveStorePath, updateLastRoute } from "../config/sessions.js";
 import { danger, logVerbose, shouldLogVerbose } from "../globals.js";
 import { mediaKindFromMime } from "../media/constants.js";
 import { buildPairingReply } from "../pairing/pairing-messages.js";
 import {
-  readProviderAllowFromStore,
-  upsertProviderPairingRequest,
+  readChannelAllowFromStore,
+  upsertChannelPairingRequest,
 } from "../pairing/pairing-store.js";
 import { resolveAgentRoute } from "../routing/resolve-route.js";
 import type { RuntimeEnv } from "../runtime.js";
@@ -137,6 +146,13 @@ export async function monitorIMessageProvider(
     accountId: opts.accountId,
   });
   const imessageCfg = accountInfo.config;
+  const historyLimit = Math.max(
+    0,
+    imessageCfg.historyLimit ??
+      cfg.messages?.groupChat?.historyLimit ??
+      DEFAULT_GROUP_HISTORY_LIMIT,
+  );
+  const groupHistories = new Map<string, HistoryEntry[]>();
   const textLimit = resolveTextChunkLimit(
     cfg,
     "imessage",
@@ -173,9 +189,9 @@ export async function monitorIMessageProvider(
 
     const groupIdCandidate = chatId !== undefined ? String(chatId) : undefined;
     const groupListPolicy = groupIdCandidate
-      ? resolveProviderGroupPolicy({
+      ? resolveChannelGroupPolicy({
           cfg,
-          provider: "imessage",
+          channel: "imessage",
           accountId: accountInfo.accountId,
           groupId: groupIdCandidate,
         })
@@ -200,7 +216,7 @@ export async function monitorIMessageProvider(
     if (isGroup && !chatId) return;
 
     const groupId = isGroup ? groupIdCandidate : undefined;
-    const storeAllowFrom = await readProviderAllowFromStore("imessage").catch(
+    const storeAllowFrom = await readChannelAllowFromStore("imessage").catch(
       () => [],
     );
     const effectiveDmAllowFrom = Array.from(
@@ -266,8 +282,8 @@ export async function monitorIMessageProvider(
       if (!dmAuthorized) {
         if (dmPolicy === "pairing") {
           const senderId = normalizeIMessageHandle(sender);
-          const { code, created } = await upsertProviderPairingRequest({
-            provider: "imessage",
+          const { code, created } = await upsertChannelPairingRequest({
+            channel: "imessage",
             id: senderId,
             meta: {
               sender: senderId,
@@ -280,7 +296,7 @@ export async function monitorIMessageProvider(
               await sendMessageIMessage(
                 sender,
                 buildPairingReply({
-                  provider: "imessage",
+                  channel: "imessage",
                   idLine: `Your iMessage sender id: ${senderId}`,
                   code,
                 }),
@@ -308,7 +324,7 @@ export async function monitorIMessageProvider(
 
     const route = resolveAgentRoute({
       cfg,
-      provider: "imessage",
+      channel: "imessage",
       accountId: accountInfo.accountId,
       peer: {
         kind: isGroup ? "group" : "dm",
@@ -322,9 +338,9 @@ export async function monitorIMessageProvider(
     const mentioned = isGroup
       ? matchesMentionPatterns(messageText, mentionRegexes)
       : true;
-    const requireMention = resolveProviderGroupRequireMention({
+    const requireMention = resolveChannelGroupRequireMention({
       cfg,
-      provider: "imessage",
+      channel: "imessage",
       accountId: accountInfo.accountId,
       groupId,
       requireMentionOverride: opts.requireMention,
@@ -383,15 +399,44 @@ export async function monitorIMessageProvider(
       ? Date.parse(message.created_at)
       : undefined;
     const body = formatAgentEnvelope({
-      provider: "iMessage",
+      channel: "iMessage",
       from: fromLabel,
       timestamp: createdAt,
       body: bodyText,
     });
+    let combinedBody = body;
+    const historyKey = isGroup
+      ? String(chatId ?? chatGuid ?? chatIdentifier ?? "unknown")
+      : undefined;
+    if (isGroup && historyKey && historyLimit > 0) {
+      combinedBody = buildHistoryContextFromMap({
+        historyMap: groupHistories,
+        historyKey,
+        limit: historyLimit,
+        entry: {
+          sender: normalizeIMessageHandle(sender),
+          body: bodyText,
+          timestamp: createdAt,
+          messageId: message.id ? String(message.id) : undefined,
+        },
+        currentMessage: combinedBody,
+        formatEntry: (entry) =>
+          formatAgentEnvelope({
+            channel: "iMessage",
+            from: fromLabel,
+            timestamp: entry.timestamp,
+            body: `${entry.sender}: ${entry.body}${
+              entry.messageId ? ` [id:${entry.messageId}]` : ""
+            }`,
+          }),
+      });
+    }
 
     const imessageTo = chatTarget || `imessage:${sender}`;
     const ctxPayload = {
-      Body: body,
+      Body: combinedBody,
+      RawBody: bodyText,
+      CommandBody: bodyText,
       From: isGroup ? `group:${chatId}` : `imessage:${sender}`,
       To: imessageTo,
       SessionKey: route.sessionKey,
@@ -427,7 +472,7 @@ export async function monitorIMessageProvider(
         await updateLastRoute({
           storePath,
           sessionKey: route.mainSessionKey,
-          provider: "imessage",
+          channel: "imessage",
           to,
           accountId: route.accountId,
         });
@@ -441,9 +486,11 @@ export async function monitorIMessageProvider(
       );
     }
 
+    let didSendReply = false;
     const dispatcher = createReplyDispatcher({
       responsePrefix: resolveEffectiveMessagesConfig(cfg, route.agentId)
         .responsePrefix,
+      humanDelay: resolveHumanDelayConfig(cfg, route.agentId),
       deliver: async (payload) => {
         await deliverReplies({
           replies: [payload],
@@ -454,6 +501,7 @@ export async function monitorIMessageProvider(
           maxBytes: mediaMaxBytes,
           textLimit,
         });
+        didSendReply = true;
       },
       onError: (err, info) => {
         runtime.error?.(
@@ -473,7 +521,15 @@ export async function monitorIMessageProvider(
             : undefined,
       },
     });
-    if (!queuedFinal) return;
+    if (!queuedFinal) {
+      if (isGroup && historyKey && historyLimit > 0 && didSendReply) {
+        clearHistoryEntries({ historyMap: groupHistories, historyKey });
+      }
+      return;
+    }
+    if (isGroup && historyKey && historyLimit > 0 && didSendReply) {
+      clearHistoryEntries({ historyMap: groupHistories, historyKey });
+    }
   };
 
   const client = await createIMessageRpcClient({

@@ -4,7 +4,6 @@ import {
   intro,
   isCancel,
   multiselect,
-  note,
   type Option,
   outro,
   select,
@@ -12,6 +11,7 @@ import {
   text,
 } from "@clack/prompts";
 import { createCliProgress } from "../cli/progress.js";
+import { note as emitNote } from "../terminal/note.js";
 import {
   stylePromptHint,
   stylePromptMessage,
@@ -38,7 +38,7 @@ export function createClackPrompter(): WizardPrompter {
       outro(stylePromptTitle(message) ?? message);
     },
     note: async (message, title) => {
-      note(message, stylePromptTitle(title));
+      emitNote(message, title);
     },
     select: async (params) =>
       guardCancel(

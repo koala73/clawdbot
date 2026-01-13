@@ -1,11 +1,6 @@
-import type { PairingProvider } from "./pairing-store.js";
+import { requirePairingAdapter } from "../channels/plugins/pairing.js";
+import type { PairingChannel } from "./pairing-store.js";
 
-export const PROVIDER_ID_LABELS: Record<PairingProvider, string> = {
-  telegram: "telegramUserId",
-  discord: "discordUserId",
-  slack: "slackUserId",
-  signal: "signalNumber",
-  imessage: "imessageSenderId",
-  whatsapp: "whatsappSenderId",
-  msteams: "msteamsUserId",
-};
+export function resolvePairingIdLabel(channel: PairingChannel): string {
+  return requirePairingAdapter(channel).idLabel;
+}

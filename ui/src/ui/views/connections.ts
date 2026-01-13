@@ -1,7 +1,16 @@
 import { html, nothing } from "lit";
 
 import { formatAgo } from "../format";
-import type { ProvidersStatusSnapshot } from "../types";
+import type {
+  ChannelAccountSnapshot,
+  ChannelsStatusSnapshot,
+  DiscordStatus,
+  IMessageStatus,
+  SignalStatus,
+  SlackStatus,
+  TelegramStatus,
+  WhatsAppStatus,
+} from "../types";
 import type {
   DiscordActionForm,
   DiscordForm,
@@ -41,7 +50,7 @@ const slackActionOptions = [
 export type ConnectionsProps = {
   connected: boolean;
   loading: boolean;
-  snapshot: ProvidersStatusSnapshot | null;
+  snapshot: ChannelsStatusSnapshot | null;
   lastError: string | null;
   lastSuccessAt: number | null;
   whatsappMessage: string | null;
@@ -84,13 +93,18 @@ export type ConnectionsProps = {
 };
 
 export function renderConnections(props: ConnectionsProps) {
-  const whatsapp = props.snapshot?.whatsapp;
-  const telegram = props.snapshot?.telegram;
-  const discord = props.snapshot?.discord ?? null;
-  const slack = props.snapshot?.slack ?? null;
-  const signal = props.snapshot?.signal ?? null;
-  const imessage = props.snapshot?.imessage ?? null;
-  const providerOrder: ProviderKey[] = [
+  const channels = props.snapshot?.channels as Record<string, unknown> | null;
+  const whatsapp = (channels?.whatsapp ?? undefined) as
+    | WhatsAppStatus
+    | undefined;
+  const telegram = (channels?.telegram ?? undefined) as
+    | TelegramStatus
+    | undefined;
+  const discord = (channels?.discord ?? null) as DiscordStatus | null;
+  const slack = (channels?.slack ?? null) as SlackStatus | null;
+  const signal = (channels?.signal ?? null) as SignalStatus | null;
+  const imessage = (channels?.imessage ?? null) as IMessageStatus | null;
+  const channelOrder: ChannelKey[] = [
     "whatsapp",
     "telegram",
     "discord",
@@ -98,10 +112,10 @@ export function renderConnections(props: ConnectionsProps) {
     "signal",
     "imessage",
   ];
-  const orderedProviders = providerOrder
+  const orderedChannels = channelOrder
     .map((key, index) => ({
       key,
-      enabled: providerEnabled(key, props),
+      enabled: channelEnabled(key, props),
       order: index,
     }))
     .sort((a, b) => {
@@ -111,14 +125,15 @@ export function renderConnections(props: ConnectionsProps) {
 
   return html`
     <section class="grid grid-cols-2">
-      ${orderedProviders.map((provider) =>
-        renderProvider(provider.key, props, {
+      ${orderedChannels.map((channel) =>
+        renderChannel(channel.key, props, {
           whatsapp,
           telegram,
           discord,
           slack,
           signal,
           imessage,
+          channelAccounts: props.snapshot?.channelAccounts ?? null,
         }),
       )}
     </section>
@@ -127,7 +142,7 @@ export function renderConnections(props: ConnectionsProps) {
       <div class="row" style="justify-content: space-between;">
         <div>
           <div class="card-title">Connection health</div>
-          <div class="card-sub">Provider status snapshots from the gateway.</div>
+          <div class="card-sub">Channel status snapshots from the gateway.</div>
         </div>
         <div class="muted">${props.lastSuccessAt ? formatAgo(props.lastSuccessAt) : "n/a"}</div>
       </div>
@@ -153,7 +168,7 @@ function formatDuration(ms?: number | null) {
   return `${hr}h`;
 }
 
-type ProviderKey =
+type ChannelKey =
   | "whatsapp"
   | "telegram"
   | "discord"
@@ -161,43 +176,71 @@ type ProviderKey =
   | "signal"
   | "imessage";
 
-function providerEnabled(key: ProviderKey, props: ConnectionsProps) {
+function channelEnabled(key: ChannelKey, props: ConnectionsProps) {
   const snapshot = props.snapshot;
-  if (!snapshot) return false;
+  const channels = snapshot?.channels as Record<string, unknown> | null;
+  if (!snapshot || !channels) return false;
+  const whatsapp = channels.whatsapp as WhatsAppStatus | undefined;
+  const telegram = channels.telegram as TelegramStatus | undefined;
+  const discord = (channels.discord ?? null) as DiscordStatus | null;
+  const slack = (channels.slack ?? null) as SlackStatus | null;
+  const signal = (channels.signal ?? null) as SignalStatus | null;
+  const imessage = (channels.imessage ?? null) as IMessageStatus | null;
   switch (key) {
     case "whatsapp":
       return (
-        snapshot.whatsapp.configured ||
-        snapshot.whatsapp.linked ||
-        snapshot.whatsapp.running
+        Boolean(whatsapp?.configured) ||
+        Boolean(whatsapp?.linked) ||
+        Boolean(whatsapp?.running)
       );
     case "telegram":
-      return snapshot.telegram.configured || snapshot.telegram.running;
+      return Boolean(telegram?.configured) || Boolean(telegram?.running);
     case "discord":
-      return Boolean(snapshot.discord?.configured || snapshot.discord?.running);
+      return Boolean(discord?.configured || discord?.running);
     case "slack":
-      return Boolean(snapshot.slack?.configured || snapshot.slack?.running);
+      return Boolean(slack?.configured || slack?.running);
     case "signal":
-      return Boolean(snapshot.signal?.configured || snapshot.signal?.running);
+      return Boolean(signal?.configured || signal?.running);
     case "imessage":
-      return Boolean(snapshot.imessage?.configured || snapshot.imessage?.running);
+      return Boolean(imessage?.configured || imessage?.running);
     default:
       return false;
   }
 }
 
-function renderProvider(
-  key: ProviderKey,
+function getChannelAccountCount(
+  key: ChannelKey,
+  channelAccounts?: Record<string, ChannelAccountSnapshot[]> | null,
+): number {
+  return channelAccounts?.[key]?.length ?? 0;
+}
+
+function renderChannelAccountCount(
+  key: ChannelKey,
+  channelAccounts?: Record<string, ChannelAccountSnapshot[]> | null,
+) {
+  const count = getChannelAccountCount(key, channelAccounts);
+  if (count < 2) return nothing;
+  return html`<div class="account-count">Accounts (${count})</div>`;
+}
+
+function renderChannel(
+  key: ChannelKey,
   props: ConnectionsProps,
   data: {
-    whatsapp?: ProvidersStatusSnapshot["whatsapp"];
-    telegram?: ProvidersStatusSnapshot["telegram"];
-    discord?: ProvidersStatusSnapshot["discord"] | null;
-    slack?: ProvidersStatusSnapshot["slack"] | null;
-    signal?: ProvidersStatusSnapshot["signal"] | null;
-    imessage?: ProvidersStatusSnapshot["imessage"] | null;
+    whatsapp?: WhatsAppStatus;
+    telegram?: TelegramStatus;
+    discord?: DiscordStatus | null;
+    slack?: SlackStatus | null;
+    signal?: SignalStatus | null;
+    imessage?: IMessageStatus | null;
+    channelAccounts?: Record<string, ChannelAccountSnapshot[]> | null;
   },
 ) {
+  const accountCountLabel = renderChannelAccountCount(
+    key,
+    data.channelAccounts,
+  );
   switch (key) {
     case "whatsapp": {
       const whatsapp = data.whatsapp;
@@ -205,6 +248,7 @@ function renderProvider(
         <div class="card">
           <div class="card-title">WhatsApp</div>
           <div class="card-sub">Link WhatsApp Web and monitor connection health.</div>
+          ${accountCountLabel}
 
           <div class="status-list" style="margin-top: 16px;">
             <div>
@@ -301,33 +345,78 @@ function renderProvider(
     }
     case "telegram": {
       const telegram = data.telegram;
+      const telegramAccounts = data.channelAccounts?.telegram ?? [];
+      const hasMultipleAccounts = telegramAccounts.length > 1;
+      
+      const renderAccountCard = (account: ChannelAccountSnapshot) => {
+        const probe = account.probe as { bot?: { username?: string } } | undefined;
+        const botUsername = probe?.bot?.username;
+        const label = account.name || account.accountId;
+        return html`
+          <div class="account-card">
+            <div class="account-card-header">
+              <div class="account-card-title">
+                ${botUsername ? `@${botUsername}` : label}
+              </div>
+              <div class="account-card-id">${account.accountId}</div>
+            </div>
+            <div class="status-list account-card-status">
+              <div>
+                <span class="label">Running</span>
+                <span>${account.running ? "Yes" : "No"}</span>
+              </div>
+              <div>
+                <span class="label">Configured</span>
+                <span>${account.configured ? "Yes" : "No"}</span>
+              </div>
+              <div>
+                <span class="label">Last inbound</span>
+                <span>${account.lastInboundAt ? formatAgo(account.lastInboundAt) : "n/a"}</span>
+              </div>
+              ${account.lastError ? html`
+                <div class="account-card-error">
+                  ${account.lastError}
+                </div>
+              ` : nothing}
+            </div>
+          </div>
+        `;
+      };
+      
       return html`
         <div class="card">
           <div class="card-title">Telegram</div>
           <div class="card-sub">Bot token and delivery options.</div>
+          ${accountCountLabel}
 
-          <div class="status-list" style="margin-top: 16px;">
-            <div>
-              <span class="label">Configured</span>
-              <span>${telegram?.configured ? "Yes" : "No"}</span>
+          ${hasMultipleAccounts ? html`
+            <div class="account-card-list">
+              ${telegramAccounts.map((account) => renderAccountCard(account))}
             </div>
-            <div>
-              <span class="label">Running</span>
-              <span>${telegram?.running ? "Yes" : "No"}</span>
+          ` : html`
+            <div class="status-list" style="margin-top: 16px;">
+              <div>
+                <span class="label">Configured</span>
+                <span>${telegram?.configured ? "Yes" : "No"}</span>
+              </div>
+              <div>
+                <span class="label">Running</span>
+                <span>${telegram?.running ? "Yes" : "No"}</span>
+              </div>
+              <div>
+                <span class="label">Mode</span>
+                <span>${telegram?.mode ?? "n/a"}</span>
+              </div>
+              <div>
+                <span class="label">Last start</span>
+                <span>${telegram?.lastStartAt ? formatAgo(telegram.lastStartAt) : "n/a"}</span>
+              </div>
+              <div>
+                <span class="label">Last probe</span>
+                <span>${telegram?.lastProbeAt ? formatAgo(telegram.lastProbeAt) : "n/a"}</span>
+              </div>
             </div>
-            <div>
-              <span class="label">Mode</span>
-              <span>${telegram?.mode ?? "n/a"}</span>
-            </div>
-            <div>
-              <span class="label">Last start</span>
-              <span>${telegram?.lastStartAt ? formatAgo(telegram.lastStartAt) : "n/a"}</span>
-            </div>
-            <div>
-              <span class="label">Last probe</span>
-              <span>${telegram?.lastProbeAt ? formatAgo(telegram.lastProbeAt) : "n/a"}</span>
-            </div>
-          </div>
+          `}
 
           ${telegram?.lastError
             ? html`<div class="callout danger" style="margin-top: 12px;">
@@ -357,9 +446,24 @@ function renderProvider(
               />
             </label>
             <label class="field">
+              <span>Apply default group rules</span>
+              <select
+                .value=${props.telegramForm.groupsWildcardEnabled ? "yes" : "no"}
+                @change=${(e: Event) =>
+                  props.onTelegramChange({
+                    groupsWildcardEnabled:
+                      (e.target as HTMLSelectElement).value === "yes",
+                  })}
+              >
+                <option value="no">No</option>
+                <option value="yes">Yes (allow all groups)</option>
+              </select>
+            </label>
+            <label class="field">
               <span>Require mention in groups</span>
               <select
                 .value=${props.telegramForm.requireMention ? "yes" : "no"}
+                ?disabled=${!props.telegramForm.groupsWildcardEnabled}
                 @change=${(e: Event) =>
                   props.onTelegramChange({
                     requireMention: (e.target as HTMLSelectElement).value === "yes",
@@ -377,7 +481,7 @@ function renderProvider(
                   props.onTelegramChange({
                     allowFrom: (e.target as HTMLInputElement).value,
                   })}
-                placeholder="123456789, @team"
+                placeholder="123456789, @team, tg:123"
               />
             </label>
             <label class="field">
@@ -426,9 +530,30 @@ function renderProvider(
             </label>
           </div>
 
+          <div class="callout" style="margin-top: 12px;">
+            Allow from supports numeric user IDs (recommended) or @usernames. DM the bot
+            to get your ID, or run /whoami.
+          </div>
+
           ${props.telegramTokenLocked
             ? html`<div class="callout" style="margin-top: 12px;">
                 TELEGRAM_BOT_TOKEN is set in the environment. Config edits will not override it.
+              </div>`
+            : nothing}
+
+          ${props.telegramForm.groupsWildcardEnabled
+            ? html`<div class="callout danger" style="margin-top: 12px;">
+                This writes telegram.groups["*"] and allows all groups. Remove it
+                if you only want specific groups.
+                <div class="row" style="margin-top: 8px;">
+                  <button
+                    class="btn"
+                    @click=${() =>
+                      props.onTelegramChange({ groupsWildcardEnabled: false })}
+                  >
+                    Remove wildcard
+                  </button>
+                </div>
               </div>`
             : nothing}
 
@@ -460,6 +585,7 @@ function renderProvider(
         <div class="card">
           <div class="card-title">Discord</div>
           <div class="card-sub">Bot connection and probe status.</div>
+          ${accountCountLabel}
 
           <div class="status-list" style="margin-top: 16px;">
             <div>
@@ -984,6 +1110,7 @@ function renderProvider(
         <div class="card">
           <div class="card-title">Slack</div>
           <div class="card-sub">Socket mode status and bot details.</div>
+          ${accountCountLabel}
 
           <div class="status-list" style="margin-top: 16px;">
             <div>
@@ -1365,6 +1492,7 @@ function renderProvider(
         <div class="card">
           <div class="card-title">Signal</div>
           <div class="card-sub">REST daemon status and probe details.</div>
+          ${accountCountLabel}
 
           <div class="status-list" style="margin-top: 16px;">
             <div>
@@ -1594,6 +1722,7 @@ function renderProvider(
         <div class="card">
           <div class="card-title">iMessage</div>
           <div class="card-sub">imsg CLI and database availability.</div>
+          ${accountCountLabel}
 
           <div class="status-list" style="margin-top: 16px;">
             <div>

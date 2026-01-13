@@ -15,8 +15,8 @@ Goal: small, hard-to-misuse tool set so agents can list sessions, fetch history,
 - `sessions_spawn`
 
 ## Key Model
-- Main direct chat bucket is always the literal key `"main"`.
-- Group chats use `<provider>:group:<id>` or `<provider>:channel:<id>`.
+- Main direct chat bucket is always the literal key `"main"` (resolved to the current agent’s main key).
+- Group chats use `agent:<agentId>:<channel>:group:<id>` or `agent:<agentId>:<channel>:channel:<id>` (pass the full key).
 - Cron jobs use `cron:<job.id>`.
 - Hooks use `hook:<uuid>` unless explicitly set.
 - Node bridge uses `node-<nodeId>` unless explicitly set.
@@ -40,14 +40,14 @@ Behavior:
 Row shape (JSON):
 - `key`: session key (string)
 - `kind`: `main | group | cron | hook | node | other`
-- `provider`: `whatsapp | telegram | discord | signal | imessage | webchat | internal | unknown`
+- `channel`: `whatsapp | telegram | discord | signal | imessage | webchat | internal | unknown`
 - `displayName` (group display label if available)
 - `updatedAt` (ms)
 - `sessionId`
 - `model`, `contextTokens`, `totalTokens`
 - `thinkingLevel`, `verboseLevel`, `systemSent`, `abortedLastRun`
 - `sendPolicy` (session override if set)
-- `lastProvider`, `lastTo`
+- `lastChannel`, `lastTo`
 - `transcriptPath` (best-effort path derived from store dir + sessionId)
 - `messages?` (only when `messageLimit > 0`)
 
@@ -76,6 +76,7 @@ Behavior:
 - `timeoutSeconds > 0`: wait up to N seconds for completion, then return `{ runId, status: "ok", reply }`.
 - If wait times out: `{ runId, status: "timeout", error }`. Run continues; call `sessions_history` later.
 - If the run fails: `{ runId, status: "error", error }`.
+- Announce delivery runs after the primary run completes and is best-effort; `status: "ok"` does not guarantee the announce was delivered.
 - Waits via gateway `agent.wait` (server-side) so reconnects don't drop the wait.
 - Agent-to-agent message context is injected for the primary run.
 - After the primary run completes, Clawdbot runs a **reply-back loop**:
@@ -84,17 +85,17 @@ Behavior:
   - Max turns is `session.agentToAgent.maxPingPongTurns` (0–5, default 5).
 - Once the loop ends, Clawdbot runs the **agent‑to‑agent announce step** (target agent only):
   - Reply exactly `ANNOUNCE_SKIP` to stay silent.
-  - Any other reply is sent to the target provider.
+  - Any other reply is sent to the target channel.
   - Announce step includes the original request + round‑1 reply + latest ping‑pong reply.
 
-## Provider Field
-- For groups, `provider` is the provider recorded on the session entry.
-- For direct chats, `provider` maps from `lastProvider`.
-- For cron/hook/node, `provider` is `internal`.
-- If missing, `provider` is `unknown`.
+## Channel Field
+- For groups, `channel` is the channel recorded on the session entry.
+- For direct chats, `channel` maps from `lastChannel`.
+- For cron/hook/node, `channel` is `internal`.
+- If missing, `channel` is `unknown`.
 
 ## Security / Send Policy
-Policy-based blocking by provider/chat type (not per session id).
+Policy-based blocking by channel/chat type (not per session id).
 
 ```json
 {
@@ -102,7 +103,7 @@ Policy-based blocking by provider/chat type (not per session id).
     "sendPolicy": {
       "rules": [
         {
-          "match": { "provider": "discord", "chatType": "group" },
+          "match": { "channel": "discord", "chatType": "group" },
           "action": "deny"
         }
       ],
@@ -121,7 +122,7 @@ Enforcement points:
 - auto-reply delivery logic
 
 ## sessions_spawn
-Spawn a sub-agent run in an isolated session and announce the result back to the requester chat provider.
+Spawn a sub-agent run in an isolated session and announce the result back to the requester chat channel.
 
 Parameters:
 - `task` (required)
@@ -142,7 +143,7 @@ Behavior:
 - Sub-agents default to the full tool set **minus session tools** (configurable via `tools.subagents.tools`).
 - Sub-agents are not allowed to call `sessions_spawn` (no sub-agent → sub-agent spawning).
 - Always non-blocking: returns `{ status: "accepted", runId, childSessionKey }` immediately.
-- After completion, Clawdbot runs a sub-agent **announce step** and posts the result to the requester chat provider.
+- After completion, Clawdbot runs a sub-agent **announce step** and posts the result to the requester chat channel.
 - Reply exactly `ANNOUNCE_SKIP` during the announce step to stay silent.
 - Sub-agent sessions are auto-archived after `agents.defaults.subagents.archiveAfterMinutes` (default: 60).
 - Announce replies include a stats line (runtime, tokens, sessionKey/sessionId, transcript path, and optional cost).

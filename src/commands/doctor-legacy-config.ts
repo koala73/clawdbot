@@ -1,8 +1,6 @@
 import os from "node:os";
 import path from "node:path";
 
-import { note as clackNote } from "@clack/prompts";
-
 import type { ClawdbotConfig } from "../config/config.js";
 import {
   CONFIG_PATH_CLAWDBOT,
@@ -12,11 +10,8 @@ import {
   writeConfigFile,
 } from "../config/config.js";
 import type { RuntimeEnv } from "../runtime.js";
-import { stylePromptTitle } from "../terminal/prompt-style.js";
+import { note } from "../terminal/note.js";
 import { resolveUserPath } from "../utils.js";
-
-const note = (message: string, title?: string) =>
-  clackNote(message, stylePromptTitle(title));
 
 function resolveLegacyConfigPath(env: NodeJS.ProcessEnv): string {
   const override = env.CLAWDIS_CONFIG_PATH?.trim();
@@ -248,6 +243,42 @@ export function normalizeLegacyConfigValues(cfg: ClawdbotConfig): {
           list: nextList,
         },
       };
+    }
+  }
+
+  const legacyAckReaction = cfg.messages?.ackReaction?.trim();
+  if (legacyAckReaction) {
+    const hasWhatsAppAck = cfg.channels?.whatsapp?.ackReaction !== undefined;
+    if (!hasWhatsAppAck) {
+      const legacyScope = cfg.messages?.ackReactionScope ?? "group-mentions";
+      let direct = true;
+      let group: "always" | "mentions" | "never" = "mentions";
+      if (legacyScope === "all") {
+        direct = true;
+        group = "always";
+      } else if (legacyScope === "direct") {
+        direct = true;
+        group = "never";
+      } else if (legacyScope === "group-all") {
+        direct = false;
+        group = "always";
+      } else if (legacyScope === "group-mentions") {
+        direct = false;
+        group = "mentions";
+      }
+      next = {
+        ...next,
+        channels: {
+          ...next.channels,
+          whatsapp: {
+            ...next.channels?.whatsapp,
+            ackReaction: { emoji: legacyAckReaction, direct, group },
+          },
+        },
+      };
+      changes.push(
+        `Copied messages.ackReaction → channels.whatsapp.ackReaction (scope: ${legacyScope}).`,
+      );
     }
   }
 

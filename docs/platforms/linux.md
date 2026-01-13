@@ -6,7 +6,8 @@ read_when:
 ---
 # Linux App
 
-The Gateway is fully supported on Linux. The core is written in TypeScript, so it runs anywhere Node or Bun runs.
+The Gateway is fully supported on Linux. **Node is the recommended runtime**.
+Bun is not recommended for the Gateway (WhatsApp/Telegram bugs).
 
 Native Linux companion apps are planned. Contributions are welcome if you want to help build one.
 
@@ -23,7 +24,7 @@ Step-by-step VPS guide: [exe.dev](/platforms/exe-dev)
 ## Install
 - [Getting Started](/start/getting-started)
 - [Install & updates](/install/updating)
-- Optional flows: [Bun](/install/bun), [Nix](/install/nix), [Docker](/install/docker)
+- Optional flows: [Bun (experimental)](/install/bun), [Nix](/install/nix), [Docker](/install/docker)
 
 ## Gateway
 - [Gateway runbook](/gateway)
@@ -64,11 +65,11 @@ live in the [Gateway runbook](/gateway).
 
 Minimal setup:
 
-Create `~/.config/systemd/user/clawdbot-gateway.service`:
+Create `~/.config/systemd/user/clawdbot-gateway[-<profile>].service`:
 
 ```
 [Unit]
-Description=Clawdbot Gateway
+Description=Clawdbot Gateway (profile: <profile>, v<version>)
 After=network-online.target
 Wants=network-online.target
 
@@ -84,5 +85,5 @@ WantedBy=default.target
 Enable it:
 
 ```
-systemctl --user enable --now clawdbot-gateway.service
+systemctl --user enable --now clawdbot-gateway[-<profile>].service
 ```
