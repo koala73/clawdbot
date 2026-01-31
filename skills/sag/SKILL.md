@@ -1,93 +1,87 @@
 ---
 name: sag
-description: ElevenLabs text-to-speech with mac-style say UX. Send voice notes via Telegram.
+description: ElevenLabs text-to-speech with mac-style say UX.
 homepage: https://sag.sh
-metadata: {"openclaw":{"emoji":"🗣️","requires":{"bins":["sag"],"env":["ELEVENLABS_API_KEY"]},"primaryEnv":"ELEVENLABS_API_KEY","install":[{"id":"brew","kind":"brew","formula":"steipete/tap/sag","bins":["sag"],"label":"Install sag (brew)"}]}}
+metadata:
+  {
+    "openclaw":
+      {
+        "emoji": "🗣️",
+        "requires": { "bins": ["sag"], "env": ["ELEVENLABS_API_KEY"] },
+        "primaryEnv": "ELEVENLABS_API_KEY",
+        "install":
+          [
+            {
+              "id": "brew",
+              "kind": "brew",
+              "formula": "steipete/tap/sag",
+              "bins": ["sag"],
+              "label": "Install sag (brew)",
+            },
+          ],
+      },
+  }
 ---
 
-# SAG - ElevenLabs TTS CLI
+# sag
 
-**The way to send Elie voice notes.** Simple, fast, high quality.
+Use `sag` for ElevenLabs TTS with local playback.
 
-## Quick Start
+API key (required)
 
-```bash
-# Basic voice note (female voice by ID, 1.3x faster)
-sag -v "EXAVITQu4vr4xnSDxMaL" -o /tmp/voice.opus "Hey Elie, quick update on the project."
+- `ELEVENLABS_API_KEY` (preferred)
+- `SAG_API_KEY` also supported by the CLI
 
-# List available voices
-sag voices
-```
+Quick start
 
-## Send to Elie (Telegram)
+- `sag "Hello there"`
+- `sag speak -v "Roger" "Hello"`
+- `sag voices`
+- `sag prompting` (model-specific tips)
 
-```bash
-# Generate voice (1.3x faster = --rate 175)
-# Use VOICE ID for reliable matching (names can fail)
-sag -v "EXAVITQu4vr4xnSDxMaL" --rate 175 -o /tmp/voice.opus "Your message here"
+Model notes
 
-# Send via message tool
-message action=send media=/tmp/voice.opus target=733180662
-```
+- Default: `eleven_v3` (expressive)
+- Stable: `eleven_multilingual_v2`
+- Fast: `eleven_flash_v2_5`
 
-## Speed Options
+Pronunciation + delivery rules
 
-| Speed | Rate Flag | Use Case |
-|-------|-----------|----------|
-| Normal | `--rate 100` | Default |
-| **1.3x faster** | `--rate 175` | **Elie's preferred** |
-| 2x faster | `--rate 300` | Quick updates |
+- First fix: respell (e.g. "key-note"), add hyphens, adjust casing.
+- Numbers/units/URLs: `--normalize auto` (or `off` if it harms names).
+- Language bias: `--lang en|de|fr|...` to guide normalization.
+- v3: SSML `<break>` not supported; use `[pause]`, `[short pause]`, `[long pause]`.
+- v2/v2.5: SSML `<break time="1.5s" />` supported; `<phoneme>` not exposed in `sag`.
 
-```bash
-# Elie's preferred: Sarah (voice ID), 1.3x faster
-sag -v "EXAVITQu4vr4xnSDxMaL" --rate 175 -o /tmp/voice.opus "Quick update: [short pause] All systems operational."
-```
+v3 audio tags (put at the entrance of a line)
 
-## Available Female Voices (by ID)
+- `[whispers]`, `[shouts]`, `[sings]`
+- `[laughs]`, `[starts laughing]`, `[sighs]`, `[exhales]`
+- `[sarcastic]`, `[curious]`, `[excited]`, `[crying]`, `[mischievously]`
+- Example: `sag "[whispers] keep this quiet. [short pause] ok?"`
 
-| Voice ID | Name | Style |
-|----------|------|-------|
-| `EXAVITQu4vr4xnSDxMaL` | **Sarah** | Mature, Reassuring, Confident ✅ **Default** |
-| `FGY2WhTYpPnrIDTdsKH5` | Laura | Enthusiast, Quirky |
-| `Xb7hH8MSUJpSbSDYk0k2` | Alice | Clear, Engaging Educator |
+Voice defaults
 
-**Always use VOICE ID** — names can fail due to fuzzy matching.
+- `ELEVENLABS_VOICE_ID` or `SAG_VOICE_ID`
 
-## Audio Tags (v3 only)
+Confirm voice + speaker before long output.
 
-Add at start of lines for expression:
+## Chat voice responses
 
-```
-[whispers]   [shouts]   [sings]
-[laughs]     [sighs]    [excited]
-[sarcastic]  [curious]  [crying]
-[short pause] [long pause]
-```
-
-Example:
-```bash
-sag "[whispers] I found something interesting. [short pause] Look at this data."
-```
-
-## Best Practices
-
-1. **Keep messages under 2 minutes** — longer = longer generation time
-2. **Add pauses** — `[short pause]` for breathing room
-3. **Exaggerate emotion** — ElevenLabs v3 is expressive
-4. **SSML-free** — use `[pause]` tags instead of `<break>`
-
-## Elie's Preferred (1.3x faster, Female voice by ID)
+When Peter asks for a "voice" reply (e.g., "crazy scientist voice", "explain in voice"), generate audio and send it:
 
 ```bash
-# Quick update voice note (Sarah, voice ID, 1.3x faster)
-sag -v "EXAVITQu4vr4xnSDxMaL" --rate 175 -o /tmp/voice.opus "Quick update: [short pause] All systems operational."
+# Generate audio file
+sag -v Clawd -o /tmp/voice-reply.mp3 "Your message here"
 
-# Report style (Laura, female)
-sag -v "FGY2WhTYpPnrIDTdsKH5" --rate 175 -o /tmp/report.opus "Daily report: [short pause] Three critical signals detected."
+# Then include in reply:
+# MEDIA:/tmp/voice-reply.mp3
 ```
 
-## Troubleshooting
+Voice character tips:
 
-- **Slow generation?** Use `--model eleven_flash_v2_5` for speed
-- **Wrong pronunciation?** Add hyphens: "elie-HAB-ib" not "Elie Habib"
-- **Not working?** Check `echo $ELEVENLABS_API_KEY` is set
+- Crazy scientist: Use `[excited]` tags, dramatic pauses `[short pause]`, vary intensity
+- Calm: Use `[whispers]` or slower pacing
+- Dramatic: Use `[sings]` or `[shouts]` sparingly
+
+Default voice for Clawd: `lj2rcrvANS3gaWWnczSX` (or just `-v Clawd`)
