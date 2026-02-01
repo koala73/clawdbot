@@ -486,6 +486,10 @@ export function formatAssistantErrorText(
 
   const invalidRequest = raw.match(/"type":"invalid_request_error".*?"message":"([^"]+)"/);
   if (invalidRequest?.[1]) {
+    // Don't leak internal tool-call IDs to the user
+    if (/tool.?id.*not found|tool_use_id|tool result/i.test(invalidRequest[1])) {
+      return "Something went wrong (internal tool-call sync error). Please try again.";
+    }
     return `LLM request rejected: ${invalidRequest[1]}`;
   }
 
@@ -631,6 +635,8 @@ const ERROR_PATTERNS = {
     "tool_use_id",
     "messages.1.content.1.tool_use.id",
     "invalid request format",
+    /tool result'?s? tool.?id.*not found/i,
+    /tool.?id\(.*\) not found/i,
   ],
 } as const;
 
