@@ -11,6 +11,7 @@ import { resolveContinuityRollupPath } from "../continuity/rollup.js";
 import { setVerbose } from "../globals.js";
 import { getMemorySearchManager, type MemorySearchManagerResult } from "../memory/index.js";
 import { listMemoryFiles, normalizeExtraMemoryPaths } from "../memory/internal.js";
+import { sanitizeAgentId } from "../routing/session-key.js";
 import { defaultRuntime } from "../runtime.js";
 import { formatDocsLink } from "../terminal/links.js";
 import { colorize, isRich, theme } from "../terminal/theme.js";
@@ -779,36 +780,47 @@ export function registerMemoryCli(program: Command) {
       }
     });
 
-  const ROLLUP_CRON_JOB_NAME = "Memory continuity distiller";
-  const ROLLUP_DISTILLER_PROMPT = `You are a memory distiller. Your job is to create a concise continuity rollup.
+  const ROLLUP_CRON_JOB_BASE_NAME = "Memory continuity distiller";
 
-TASK:
+  function buildRollupCronJobName(agentId: string): string {
+    return `${ROLLUP_CRON_JOB_BASE_NAME} (${agentId})`;
+  }
+
+  function buildRollupDistillerPrompt(params: { rollupPath: string }): string {
+    return `You are a memory distiller. Your job is to create a concise continuity rollup.
+
+TARGET FILE
+Write your result to this exact path using the write tool:
+${params.rollupPath}
+
+TASK
 1. Use memory_search to find recent important items:
    - "important decisions made today"
    - "action items and todos"
    - "key context and ongoing work"
 2. Synthesize into a brief rollup (max 2000 chars) with sections:
-   - **Active Context**: What we're working on right now
-   - **Recent Decisions**: Key choices made (with dates)
-   - **Pending Actions**: Open items needing attention
-3. Write the rollup to the ROLLUP.md path using the write tool
+   - Active Context: What we're working on right now
+   - Recent Decisions: Key choices made (with dates)
+   - Pending Actions: Open items needing attention
+3. Write the rollup file (overwrite).
 
-OUTPUT FORMAT (write this exact structure):
----
+OUTPUT FORMAT (write this exact structure, no YAML front matter)
 # Continuity Rollup
-Updated: [current timestamp]
+Updated: <ISO timestamp>
 
 ## Active Context
-[1-3 bullet points of current focus]
+- <bullet>
 
 ## Recent Decisions
-[2-5 bullet points with dates]
+- <YYYY-MM-DD>: <decision>
 
 ## Pending Actions
-- [ ] [action item]
----
+- [ ] <action>
 
-Keep it concise. This file is injected into every session for continuity.`;
+Notes
+- Keep it short and concrete.
+- Do not add leading/trailing "---" lines.`;
+  }
 
   addGatewayClientOptions(
     rollup
@@ -822,8 +834,11 @@ Keep it concise. This file is injected into every session for continuity.`;
       .option("--json", "Output JSON", false)
       .action(async (opts: Record<string, unknown>) => {
         const cfg = loadConfig();
-        const agentId = resolveAgent(cfg, opts.agent as string | undefined);
+        const agentIdRaw = resolveAgent(cfg, opts.agent as string | undefined);
+        const agentId = sanitizeAgentId(agentIdRaw);
         const rollupPath = resolveContinuityRollupPath(agentId);
+        const cronJobName = buildRollupCronJobName(agentId);
+        const distillerPrompt = buildRollupDistillerPrompt({ rollupPath });
 
         const everyRaw = String(opts.every ?? "1h");
         const everyMs = parseDurationToMs(everyRaw);
@@ -840,10 +855,10 @@ Keep it concise. This file is injected into every session for continuity.`;
           const listRes = (await callGatewayFromCli("cron.list", opts, {
             includeDisabled: true,
           })) as { jobs?: Array<{ id: string; name: string }> };
-          const existing = listRes.jobs?.find((job) => job.name === ROLLUP_CRON_JOB_NAME);
+          const existing = listRes.jobs?.find((job) => job.name === cronJobName);
 
           const jobPayload = {
-            name: ROLLUP_CRON_JOB_NAME,
+            name: cronJobName,
             description: `Distill memory into ${shortenHomePath(rollupPath)} for session continuity`,
             enabled: true,
             agentId,
@@ -856,7 +871,7 @@ Keep it concise. This file is injected into every session for continuity.`;
             wakeMode: "now" as const,
             payload: {
               kind: "agentTurn" as const,
-              message: ROLLUP_DISTILLER_PROMPT,
+              message: distillerPrompt,
               model: opts.model ? String(opts.model) : undefined,
               thinking: opts.thinking ? String(opts.thinking) : "off",
               timeoutSeconds,
@@ -875,7 +890,7 @@ Keep it concise. This file is injected into every session for continuity.`;
             if (opts.json) {
               defaultRuntime.log(JSON.stringify(result, null, 2));
             } else {
-              defaultRuntime.log(`Updated cron job: ${ROLLUP_CRON_JOB_NAME} (${existing.id})`);
+              defaultRuntime.log(`Updated cron job: ${cronJobName} (${existing.id})`);
             }
           } else {
             result = await callGatewayFromCli("cron.add", opts, jobPayload);
@@ -883,7 +898,7 @@ Keep it concise. This file is injected into every session for continuity.`;
               defaultRuntime.log(JSON.stringify(result, null, 2));
             } else {
               const jobId = (result as { id?: string })?.id ?? "unknown";
-              defaultRuntime.log(`Created cron job: ${ROLLUP_CRON_JOB_NAME} (${jobId})`);
+              defaultRuntime.log(`Created cron job: ${cronJobName} (${jobId})`);
             }
           }
 
@@ -903,19 +918,24 @@ Keep it concise. This file is injected into every session for continuity.`;
       .command("remove")
       .alias("uninstall")
       .description("Remove the continuity distiller cron job")
+      .option("--agent <id>", "Agent id (default: main)")
       .option("--json", "Output JSON", false)
       .action(async (opts: Record<string, unknown>) => {
+        const cfg = loadConfig();
+        const agentIdRaw = resolveAgent(cfg, opts.agent as string | undefined);
+        const agentId = sanitizeAgentId(agentIdRaw);
+        const cronJobName = buildRollupCronJobName(agentId);
         try {
           const listRes = (await callGatewayFromCli("cron.list", opts, {
             includeDisabled: true,
           })) as { jobs?: Array<{ id: string; name: string }> };
-          const existing = listRes.jobs?.find((job) => job.name === ROLLUP_CRON_JOB_NAME);
+          const existing = listRes.jobs?.find((job) => job.name === cronJobName);
 
           if (!existing) {
             if (opts.json) {
               defaultRuntime.log(JSON.stringify({ removed: false, reason: "not found" }, null, 2));
             } else {
-              defaultRuntime.log(`No cron job named "${ROLLUP_CRON_JOB_NAME}" found.`);
+              defaultRuntime.log(`No cron job named "${cronJobName}" found.`);
             }
             return;
           }
@@ -924,7 +944,7 @@ Keep it concise. This file is injected into every session for continuity.`;
           if (opts.json) {
             defaultRuntime.log(JSON.stringify(result, null, 2));
           } else {
-            defaultRuntime.log(`Removed cron job: ${ROLLUP_CRON_JOB_NAME} (${existing.id})`);
+            defaultRuntime.log(`Removed cron job: ${cronJobName} (${existing.id})`);
           }
         } catch (err) {
           defaultRuntime.error(`Failed to remove rollup job: ${formatErrorMessage(err)}`);
@@ -937,17 +957,22 @@ Keep it concise. This file is injected into every session for continuity.`;
     rollup
       .command("run")
       .description("Run the continuity distiller now (one-shot)")
+      .option("--agent <id>", "Agent id (default: main)")
       .option("--json", "Output JSON", false)
       .action(async (opts: Record<string, unknown>) => {
+        const cfg = loadConfig();
+        const agentIdRaw = resolveAgent(cfg, opts.agent as string | undefined);
+        const agentId = sanitizeAgentId(agentIdRaw);
+        const cronJobName = buildRollupCronJobName(agentId);
         try {
           const listRes = (await callGatewayFromCli("cron.list", opts, {
             includeDisabled: true,
           })) as { jobs?: Array<{ id: string; name: string }> };
-          const existing = listRes.jobs?.find((job) => job.name === ROLLUP_CRON_JOB_NAME);
+          const existing = listRes.jobs?.find((job) => job.name === cronJobName);
 
           if (!existing) {
             defaultRuntime.error(
-              `No cron job named "${ROLLUP_CRON_JOB_NAME}" found. Run "openclaw memory rollup install" first.`,
+              `No cron job named "${cronJobName}" found. Run "openclaw memory rollup install --agent ${agentId}" first.`,
             );
             process.exitCode = 1;
             return;
@@ -960,7 +985,7 @@ Keep it concise. This file is injected into every session for continuity.`;
           if (opts.json) {
             defaultRuntime.log(JSON.stringify(result, null, 2));
           } else {
-            defaultRuntime.log(`Triggered: ${ROLLUP_CRON_JOB_NAME}`);
+            defaultRuntime.log(`Triggered: ${cronJobName}`);
           }
         } catch (err) {
           defaultRuntime.error(`Failed to run rollup job: ${formatErrorMessage(err)}`);

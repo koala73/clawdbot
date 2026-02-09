@@ -32,9 +32,11 @@ openclaw memory status --agent main
 openclaw memory index --agent main --verbose
 
 # Continuity rollups
-openclaw memory rollup install          # Install hourly distiller cron job
-openclaw memory rollup install --every 30m  # Custom interval
-openclaw memory rollup run              # Run distiller now
+openclaw memory rollup install               # Install hourly distiller cron job (main agent)
+openclaw memory rollup install --every 30m   # Custom interval
+openclaw memory rollup install --agent reviewer  # Install for a specific agent
+openclaw memory rollup run                   # Run distiller now (main agent)
+openclaw memory rollup run --agent reviewer  # Run for a specific agent
 openclaw memory rollup show             # View current rollup
 openclaw memory rollup path             # Print rollup file path
 openclaw memory rollup clear            # Delete rollup file
@@ -68,7 +70,7 @@ The rollup system provides **session continuity** by periodically distilling imp
 
 ### How it works
 
-1. **Install**: `openclaw memory rollup install` creates a cron job that runs hourly
+1. **Install**: `openclaw memory rollup install [--agent <id>]` creates a cron job that runs hourly
 2. **Distill**: The job uses `memory_search` to find recent decisions, todos, and context
 3. **Write**: Results are written to `~/.openclaw/agents/<agent>/continuity/ROLLUP.md`
 4. **Inject**: On each session start, the rollup content is included in the system prompt

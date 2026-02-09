@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import type { OpenClawConfig } from "../config/config.js";
 import type { EmbeddedContextFile } from "./pi-embedded-helpers.js";
 import { resolveContinuityRollupPath } from "../continuity/rollup.js";
-import { isGroupChannelSessionKey } from "../routing/session-key.js";
+import { isGroupChannelSessionKey, isSubagentSessionKey } from "../routing/session-key.js";
 import { applyBootstrapHookOverrides } from "./bootstrap-hooks.js";
 import { buildBootstrapContextFiles, resolveBootstrapMaxChars } from "./pi-embedded-helpers.js";
 import {
@@ -62,7 +62,11 @@ export async function resolveBootstrapFilesForRun(params: {
   const sessionKey = params.sessionKey ?? params.sessionId;
   let bootstrapFiles = await loadWorkspaceBootstrapFiles(params.workspaceDir);
 
-  if (params.agentId && !isGroupChannelSessionKey(sessionKey)) {
+  if (
+    params.agentId &&
+    !isGroupChannelSessionKey(sessionKey) &&
+    !isSubagentSessionKey(sessionKey)
+  ) {
     const rollup = await loadContinuityRollupFile(params.agentId);
     if (rollup) {
       bootstrapFiles = injectContinuityRollup(bootstrapFiles, rollup);
